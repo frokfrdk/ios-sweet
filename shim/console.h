@@ -1,10 +1,28 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
-#define FB_W		1080
-#define FB_H		2400
-#define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+/*
+ * Framebuffer = ABL's continuous-splash surface (reserved-memory cont_splash_region,
+ * 0x9c000000 on both sweet and sunfish). The geometry below is the board default;
+ * panel_detect() replaces it with what the MDP source pipe is actually scanning out.
+ */
+#define FB_DEF_BASE	0x9c000000UL
+#define FB_DEF_W	1080
+#ifdef BOARD_SUNFISH
+#define FB_DEF_H	2340		/* Pixel 4a, sofef01 cmd-mode panel */
+#else
+#define FB_DEF_H	2400		/* sweet, DSC video-mode panel */
+#endif
+#define FB_MAX_BYTES	0x1700000	/* size of cont_splash_region */
+
+#define FB_BASE		fb_base
+#define FB_W		((int)fb_w)
+#define FB_H		((int)fb_h)
+#define FB_STRIDE	((int)fb_stride)	/* bytes per line */
+#define FB_BPP		((int)fb_bpp)	/* bytes per pixel: 4 = a8r8g8b8, 3 = r8g8b8 */
+
+extern uintptr_t fb_base;
+extern uint32_t fb_w, fb_h, fb_stride, fb_bpp;
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

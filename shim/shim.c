@@ -10,6 +10,7 @@
 #include "console.h"
 #include "mmu.h"
 #include "loader.h"
+#include "panel.h"
 #include "ufs.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -373,11 +374,28 @@ static uint32_t to_us(uint64_t ticks)
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+	struct panel_info pi;
+
+	/* Find ABL's splash surface and keep a cmd-mode panel showing it. */
+	stage = "panel";
+	panel_detect(&pi);
+	panel_keep_refreshing(&pi);
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
+#ifdef BOARD_SUNFISH
+	con_str("SHIM", "sunfish milestone A: xnu loader");
+#else
 	con_str("SHIM", "sweet milestone 4: xnu loader");
+#endif
+	con_hex2("SSPP", "pipe=", pi.sspp, "addr=", pi.src_addr);
+	con_hex2("SRC", "size=", pi.src_size, "pitch=", pi.ystride);
+	con_hex2("FB", "w=", fb_w, "h=", fb_h);
+	con_hex2("FB", "stride=", fb_stride, "fmt=", pi.format);
+	con_hex2("PP", "te=", pi.pp_te, "ar_abl=", pi.pp_ar_before);
+	con_hex("CTL kick", pi.ctl_kicked);
+	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
@@ -405,7 +423,11 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
+#ifdef BOARD_SUNFISH
+	con_str("SHIM", "sunfish milestone A: probe");
+#else
 	con_str("SHIM", "sweet milestone 3");
+#endif
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

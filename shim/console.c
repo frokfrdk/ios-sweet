@@ -11,17 +11,30 @@
 #define MARGIN		24
 #define LABEL_COLS	8
 
-volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+uintptr_t fb_base = FB_DEF_BASE;
+uint32_t fb_w = FB_DEF_W, fb_h = FB_DEF_H, fb_stride = FB_DEF_W * 4, fb_bpp = 4;
+volatile uint32_t *con_fb = (volatile uint32_t *)FB_DEF_BASE;
 static uint32_t con_bg;
 static int row;
 
+/* One pixel; r8g8b8 stores byte-wise (B, G, R in memory, like a8r8g8b8 without A). */
+static inline void put_px(int x, int y, uint32_t c)
+{
+	if (FB_BPP == 4) {
+		con_fb[y * (FB_STRIDE / 4) + x] = c;
+		return;
+	}
+	volatile uint8_t *p = (volatile uint8_t *)con_fb + y * FB_STRIDE + x * 3;
+	p[0] = c;
+	p[1] = c >> 8;
+	p[2] = c >> 16;
+}
+
 void con_clear(uint32_t bg)
 {
-	for (int y = 0; y < FB_H; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+	for (int y = 0; y < FB_H; y++)
 		for (int x = 0; x < FB_W; x++)
-			line[x] = bg;
-	}
+			put_px(x, y, bg);
 	con_bg = bg;
 	row = 0;
 }
@@ -37,12 +50,9 @@ static void put_char(int col, char ch, uint32_t fg)
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-						       + x0 + gx * SCALE;
+			for (int sy = 0; sy < SCALE; sy++)
 				for (int sx = 0; sx < SCALE; sx++)
-					p[sx] = c;
-			}
+					put_px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
 		}
 }
 

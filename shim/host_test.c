@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include "console.h"
 
-static uint32_t host_fb[FB_H * FB_STRIDE / 4];
+static uint32_t host_fb[FB_MAX_BYTES / 4];
 
 int main(void)
 {
