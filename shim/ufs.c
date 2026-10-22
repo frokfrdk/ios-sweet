@@ -132,8 +132,19 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		return 2;
 	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
 		return 3;
+	if (*status_out == 2) {
+		/* CHECK CONDITION: fixed-format sense data follows the length at bytes 32-33. */
+		const uint8_t *s = ucd.resp + 34;
+		*status_out = 2u << 24 | (s[2] & 0xfu) << 16 | (uint32_t)s[12] << 8 | s[13];
+	}
 	return *status_out ? 4 : 0;
 }
+
+/* status word from scsi(): [31:24] SCSI status, then sense key, ASC, ASCQ on CHECK CONDITION */
+#define SENSE_KEY(st)	(((st) >> 16) & 0xf)
+#define SK_NOT_READY	0x2
+#define SK_UNIT_ATTN	0x6
+#define UPIU_LUN_UFS_DEVICE	0xd0	/* well-known LU "UFS Device" (power mode) */
 
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
@@ -233,21 +244,37 @@ void test_ufs(void)
 	/* A first command may report a unit attention; retry a few times. */
 	for (int i = 0; i < 3; i++) {
 		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
-		if (!rc)
+		con_hex2("UFS TUR", "rc=", rc, (ocs ? "ocs=" : "st/sense="), ocs ? ocs : st);
+		if (!rc || (rc == 4 && SENSE_KEY(st) != SK_UNIT_ATTN))
 			break;
+	}
+	/*
+	 * NOT READY: ABL may leave the device in a low-power mode. Do what Linux
+	 * ufshcd does at init: START STOP UNIT, power condition ACTIVE, on the
+	 * UFS Device W-LU. No data phase; nothing is written to storage.
+	 */
+	if (rc == 4 && SENSE_KEY(st) == SK_NOT_READY) {
+		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10 /* ACTIVE */, 0 };
+		rc = scsi(UPIU_LUN_UFS_DEVICE, ssu, sizeof(ssu), 0, 0, &ocs, &st);
+		con_hex2("UFS SSU", "rc=", rc, (ocs ? "ocs=" : "st/sense="), ocs ? ocs : st);
+		for (int i = 0; i < 3; i++) {
+			rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+			con_hex2("UFS TUR", "rc=", rc, (ocs ? "ocs=" : "st/sense="), ocs ? ocs : st);
+			if (!rc)
+				break;
+		}
 	}
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
 	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
+	con_hex2("UFS CAP", "rc=", rc, (ocs ? "ocs=" : "st/sense="), ocs ? ocs : st);
 	if (!rc)
 		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
 
 	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
 	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
 	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
+	con_hex2("UFS READ", "rc=", rc, (ocs ? "ocs=" : "st/sense="), ocs ? ocs : st);
 	if (rc)
 		return;
 	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
