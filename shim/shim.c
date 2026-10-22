@@ -8,6 +8,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "fdt.h"
 #include "mmu.h"
 #include "loader.h"
 #include "panel.h"
@@ -396,6 +397,13 @@ void shim_main(uint64_t dtb)
 	con_hex2("PP", "te=", pi.pp_te, "ar_abl=", pi.pp_ar_before);
 	con_hex("CTL kick", pi.ctl_kicked);
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
+	{
+		struct fdt_range mem[12];
+		int n = fdt_memory(dtb, mem, 12);
+		con_hex("MEM n", n);
+		for (int i = 0; i < n; i++)	/* base, size in MiB */
+			con_hex2("MEM", "base=", mem[i].base >> 20, "MiB=", mem[i].size >> 20);
+	}
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
