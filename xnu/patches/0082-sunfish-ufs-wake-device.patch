@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -141,6 +141,8 @@
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++#define UFS_WLUN_UFS_DEVICE     0xd0    /* well-known LU for power mode (UPIU LUN field) */
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -624,6 +626,20 @@
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
++		/*
++		 * The Pixel 4a (sunfish) bootloader hands over with the device powered
++		 * down: every command answers NOT READY. Like Linux ufshcd at init, ask
++		 * the UFS Device well-known LU for the ACTIVE power condition first
++		 * (no data phase; a no-op on a device that is already active).
++		 */
++		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		uint8_t lun = su.lun;
++		su.lun = UFS_WLUN_UFS_DEVICE;
++		int ssu_error = ufs_scsi(ssu, sizeof(ssu), 0, false);
++		su.lun = lun;
++		printf("SWEET UFS: START STOP UNIT (active) on W-LU 0x%x: %d\n", UFS_WLUN_UFS_DEVICE, ssu_error);
++	}
++	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
