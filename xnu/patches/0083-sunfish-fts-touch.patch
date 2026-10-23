@@ -1,0 +1,234 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -38,6 +38,26 @@
+ #define GOODIX_HEAD_LEN  8u
+ #define GOODIX_POINT_LEN 8u
+ 
++/*
++ * Pixel 4a (sunfish, boot-arg sweetfts=1): STMicro FTM5 at 0x49 on the same
++ * SE7 / qup11 pins (TLMM 6/7) and reset/IRQ pins (TLMM 8/9) as the GT9896.
++ * Protocol from Google's kernel/msm-modules/fts_touch (I2C build): the FIFO
++ * read command 0x86 returns 8-byte events, byte 7 = events still queued;
++ * a reset pulse is answered by EVT_ID_CONTROLLER_READY; scanning starts with
++ * scan mode ACTIVE {0xA0, 0x00, 0xFF}. TLMM 72 selects the bus owner (low = AP).
++ * Power is PM6150 GPIO4 on this board; nothing here drives it.
++ */
++#define FTS5_ADDR       0x49u
++#define FTS5_FIFO_READ  0x86u
++#define FTS5_EVENT_LEN  8u
++#define FTS5_BATCH      11u     /* 88 bytes: touch_msg reads at most 90 */
++#define FTS5_EVT_READY  0x03u
++#define FTS5_EVT_ENTER  0x13u
++#define FTS5_EVT_MOTION 0x23u
++#define FTS5_EVT_LEAVE  0x33u
++#define FTS5_MAX_X      1079
++#define FTS5_MAX_Y      2339    /* st,max-coords <1079 2339> */
++
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+ #define SE_FW           0x068u
+@@ -74,7 +94,7 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
+-	int kind, irq_hint;
++	int kind, irq_hint, fts5;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -487,6 +507,133 @@
+ 	return 0;
+ }
+ 
++/* Read the next FTM5 events: the first one, then as many queued ones as fit. */
++static int
++touch_fts5_read(uint8_t *buf, unsigned *count)
++{
++	*count = 0;
++	int err = touch_read(FTS5_ADDR, FTS5_FIFO_READ, false, buf, FTS5_EVENT_LEN);
++	if (err || buf[0] == 0) {
++		return err;     /* 0x00 = EVT_ID_NOEVENT */
++	}
++	unsigned more = MIN(buf[7] & 0x1fu, FTS5_BATCH - 1u);
++	if (more) {
++		err = touch_read(FTS5_ADDR, FTS5_FIFO_READ, false, buf + FTS5_EVENT_LEN,
++		    more * FTS5_EVENT_LEN);
++		if (err) {
++			more = 0;
++		}
++	}
++	*count = 1u + more;
++	return 0;
++}
++
++static void
++touch_fts5_dump(const char *what, const uint8_t *e)
++{
++	printf("SWEET FTS: %s %02x %02x %02x %02x %02x %02x %02x %02x\n", what,
++	    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++}
++
++static int
++touch_fts5(void)
++{
++	static unsigned logged;
++	uint8_t buf[FTS5_EVENT_LEN * FTS5_BATCH];
++	unsigned n;
++	int err = touch_fts5_read(buf, &n);
++	if (err || !n) {
++		return err;
++	}
++	uint32_t mask = st.active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	memcpy(x, st.x, sizeof(x));
++	memcpy(y, st.y, sizeof(y));
++	for (unsigned i = 0; i < n; ++i) {
++		const uint8_t *e = buf + i * FTS5_EVENT_LEN;
++		unsigned id = e[1] >> 4, type = e[1] & 15u;
++		if (logged < 40) {
++			++logged;
++			touch_fts5_dump("event", e);
++		}
++		switch (e[0]) {
++		case FTS5_EVT_ENTER:
++		case FTS5_EVT_MOTION:
++			/* type 0 = hover/invalid; finger, glove, stylus, palm all count */
++			if (id >= TOUCH_MAX || type == 0) {
++				break;
++			}
++			x[id] = MIN((int)(((e[3] & 15u) << 8) | e[2]), FTS5_MAX_X);
++			y[id] = MIN((int)((e[4] << 4) | (e[3] >> 4)), FTS5_MAX_Y);
++			mask |= 1u << id;
++			break;
++		case FTS5_EVT_LEAVE:
++			if (id < TOUCH_MAX) {
++				mask &= ~(1u << id);
++			}
++			break;
++		case 0:
++			i = n;  /* EVT_ID_NOEVENT ends the batch */
++			break;
++		default:
++			break;  /* status/user/debug/error events: dumped above */
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* Pins, reset pulse, controller-ready, scan on. False: no usable IC. */
++static bool
++touch_fts5_bringup(void)
++{
++	printf("SWEET FTS: TLMM reset cfg=%#x io=%#x irq cfg=%#x io=%#x switch cfg=%#x io=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(8)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(9)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(72)), touch_rd(st.gpio, TOUCH_GPIO_IO(72)));
++	touch_gpio(72, 0, 0, 0, true, false);   /* bus switch: AP, not SLPI */
++	touch_gpio(9, 0, 0, 0, false, false);   /* IRQ input, no pull (DT bias-disable) */
++	touch_gpio(6, 1, 0, 0, false, false);   /* qup11 SDA/SCL, 2 mA */
++	touch_gpio(7, 1, 0, 0, false, false);
++	/* Linux fts_system_reset with a reset GPIO: low 10 ms, then high. */
++	touch_gpio(8, 0, 0, 0, true, false);
++	touch_wait(10);
++	touch_gpio(8, 0, 0, 0, true, true);
++	uint8_t ev[FTS5_EVENT_LEN * FTS5_BATCH];
++	bool ready = false;
++	int err = 0;
++	unsigned nacks = 0;
++	st.probing = true;      /* log the first transfer in full */
++	for (unsigned t = 0; t < 100 && !ready && !st.dead; ++t) {
++		touch_wait(10);
++		unsigned n = 0;
++		err = touch_fts5_read(ev, &n);
++		st.probing = false;
++		if (err) {
++			if (err == ENXIO && ++nacks == 50) {
++				printf("SWEET FTS: no ACK at 0x49 for 500 ms: IC unpowered? (PM6150 GPIO4)\n");
++				return false;
++			}
++			continue;
++		}
++		for (unsigned i = 0; i < n; ++i) {
++			const uint8_t *e = ev + i * FTS5_EVENT_LEN;
++			touch_fts5_dump("boot event", e);
++			if (e[0] == FTS5_EVT_READY) {
++				ready = true;
++			}
++		}
++	}
++	printf("SWEET FTS: controller ready=%d last err=%d nacks=%u\n", ready, err, nacks);
++	if (st.dead || (!ready && err)) {
++		return false;
++	}
++	const uint8_t scan[3] = {0xa0, 0x00, 0xff};   /* SCAN_MODE_ACTIVE, all sensing */
++	err = touch_msg(FTS5_ADDR, scan, sizeof(scan), NULL, 0, false);
++	printf("SWEET FTS: scan mode active err=%d\n", err);
++	return err == 0;
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -569,6 +716,29 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (st.fts5) {
++		if (!touch_fts5_bringup()) {
++			goto out;
++		}
++		printf("SWEET FTS: FTM5 1080x2340, poll=10ms\n");
++		unsigned fts_errors = 0;
++		while (!st.dead) {
++			int err = touch_fts5();
++			if (err) {
++				if ((fts_errors++ % 100u) == 0) {
++					printf("SWEET FTS: read err=%d irq=%#x\n", err, st.irq_status);
++				}
++				if (fts_errors == 10) {
++					touch_report(0, st.x, st.y);
++				}
++			} else {
++				fts_errors = 0;
++			}
++			touch_wait(10);
++		}
++		touch_report(0, st.x, st.y);
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -646,6 +816,7 @@
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweetfts", &st.fts5, sizeof(st.fts5));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -434,10 +434,17 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/* Panel = the boot framebuffer: 1080x2400 on sweet, 1080x2340 on sunfish. */
++	PE_Video video = {};
++	int panelW = 1080, panelH = 2400;
++	if (PE_current_console(&video) == 0 && video.v_width && video.v_height) {
++		panelW = (int)video.v_width;
++		panelH = (int)video.v_height;
++	}
++	fLogicalW = native ? panelW : 1125;
++	fLogicalH = native ? panelH : 2436;
++	fOffX = (fLogicalW - panelW) / 2;
++	fOffY = (fLogicalH - panelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
