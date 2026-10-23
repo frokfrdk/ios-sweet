@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +/*
 + * SM7150 CPU frequency: request a fixed OSM performance level (boot-arg
 + * sweetcpufreq=1: the top level; sweetcpufreqidx=N: LUT row N instead).
@@ -30,6 +30,7 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
