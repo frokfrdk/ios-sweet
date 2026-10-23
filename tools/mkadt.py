@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--sunfish]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--sunfish] [--scale2]
 """
 import hashlib, os, struct, sys
 
@@ -35,6 +35,12 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # (live /memory: 0x80000000 + 3 GiB and 0x140000000 + 0xbcc00000, both ending at
 # 0x1fcc00000); only the panel differs: sofef01, 1080x2340.
 SUNFISH_FB_H = 2340
+# --scale2: present the iPhone X's 375x812 points at @2x (750x1624, 55% fewer pixels for
+# CoreAnimation's CPU renderer than 1125x2436 @3x); the kernel scales it to the panel.
+# MobileGestalt caches screen facts per IOPlatformUUID, so this mode also uses its own
+# synthetic ECID (the other mode's cache stays valid for switching back).
+SCALE2_CANVAS = (750, 1624)
+SCALE2_ECID = SWEET_ECID + 1
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -78,7 +84,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, fb_h=FB_H):
+def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -109,13 +115,13 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(2 if scale2 else 3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', SCALE2_ECID if scale2 else SWEET_ECID)),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -189,8 +195,8 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(SCALE2_CANVAS[0] if scale2 else 1125)),
+            ('canvas-height', u32(SCALE2_CANVAS[1] if scale2 else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -247,7 +253,8 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 fb_h=SUNFISH_FB_H if '--sunfish' in sys.argv else FB_H)
+                 fb_h=SUNFISH_FB_H if '--sunfish' in sys.argv else FB_H,
+                 scale2='--scale2' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

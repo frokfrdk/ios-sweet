@@ -1,0 +1,125 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,6 +104,9 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* canvas < panel: upscale on present */
++	uint16_t     *fXMap, *fYMap;            /* panel pixel -> canvas pixel */
++	uint32_t     *fRow;                     /* one scaled panel row (cached memory) */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -203,6 +206,35 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * A canvas smaller than the panel (mkadt.py --scale2: 750x1624, the
++	 * iPhone X points at @2x) is shown scaled to the whole panel: CA's CPU
++	 * renderer draws 55% fewer pixels than at 1125x2436.
++	 */
++	OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
++	OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
++	uint32_t canvasW = 0, canvasH = 0;
++	if (cw != NULL && ch != NULL && cw->getLength() == 4 && ch->getLength() == 4) {
++		memcpy(&canvasW, cw->getBytesNoCopy(), 4);
++		memcpy(&canvasH, ch->getBytesNoCopy(), 4);
++	}
++	if (!native && canvasW != 0 && canvasH != 0 && canvasW < fWidth && canvasH < fHeight) {
++		fXMap = (uint16_t *)IOMallocData(fWidth * sizeof(uint16_t));
++		fYMap = (uint16_t *)IOMallocData(fHeight * sizeof(uint16_t));
++		fRow = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++		if (fXMap != NULL && fYMap != NULL && fRow != NULL) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fXMap[x] = (uint16_t)((uint64_t)x * canvasW / fWidth);
++			}
++			for (uint32_t y = 0; y < fHeight; y++) {
++				fYMap[y] = (uint16_t)((uint64_t)y * canvasH / fHeight);
++			}
++			fScaled = true;
++			fLogicalW = canvasW;
++			fLogicalH = canvasH;
++			fOffX = fOffY = 0;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -229,8 +261,8 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fScaled ? " (scaled)" : "");
+ 	return true;
+ }
+ 
+@@ -382,6 +414,30 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (fScaled) {
++			/* Nearest-neighbour upscale of the whole canvas; one cached row per source row. */
++			uint64_t need = (uint64_t)s->offset + (uint64_t)(fLogicalH - 1) * s->bytesPerRow +
++			    (uint64_t)fLogicalW * 4;
++			if (src != 0 && bpe == 4 && s->width >= fLogicalW && s->height >= fLogicalH &&
++			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
++			    need <= s->memory->getLength()) {
++				const uint8_t *base = (const uint8_t *)(src + s->offset);
++				uint32_t last = 0xffffffffu;
++				for (uint32_t y = 0; y < fHeight; y++) {
++					if (fYMap[y] != last) {
++						last = fYMap[y];
++						const uint32_t *srow = (const uint32_t *)(base + (uint64_t)last * s->bytesPerRow);
++						for (uint32_t x = 0; x < fWidth; x++) {
++							fRow[x] = srow[fXMap[x]];
++						}
++					}
++					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fRow, (size_t)fWidth * 4);
++				}
++				sweet_fb_stat_bytes += (uint64_t)fWidth * 4 * fHeight;
++			}
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -18,6 +18,7 @@
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
+@@ -444,8 +445,22 @@
+ 	}
+ 	fPanelW = panelW;
+ 	fPanelH = panelH;
+-	fLogicalW = native ? panelW : 1125;
+-	fLogicalH = native ? panelH : 2436;
++	/* Scaled canvas (SweetFramebuffer.cpp): the digitizer covers the whole display, no crop. */
++	bool scaled = false;
++	IORegistryEntry *disp = IORegistryEntry::fromPath("/arm-io/disp0", gIODTPlane);
++	if (disp != NULL) {
++		OSData *cw = OSDynamicCast(OSData, disp->getProperty("canvas-width"));
++		OSData *ch = OSDynamicCast(OSData, disp->getProperty("canvas-height"));
++		uint32_t canvasW = 0, canvasH = 0;
++		if (cw != NULL && ch != NULL && cw->getLength() == 4 && ch->getLength() == 4) {
++			memcpy(&canvasW, cw->getBytesNoCopy(), 4);
++			memcpy(&canvasH, ch->getBytesNoCopy(), 4);
++		}
++		scaled = canvasW != 0 && canvasH != 0 && (int)canvasW < panelW && (int)canvasH < panelH;
++		disp->release();
++	}
++	fLogicalW = (native || scaled) ? panelW : 1125;
++	fLogicalH = (native || scaled) ? panelH : 2436;
+ 	fOffX = (fLogicalW - panelW) / 2;
+ 	fOffY = (fLogicalH - panelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
