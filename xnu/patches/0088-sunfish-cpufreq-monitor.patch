@@ -1,0 +1,122 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -12,16 +12,22 @@
+  * CORE_DCVS_CTRL (0xbc) bit 0 is set, else core 0 only. OSM firmware does
+  * the PLL and CPR voltage changes; the LMh block still throttles on heat.
+  * Each domain's cycle counter (0x9c0 + 4 * n) is sampled over 100 ms
+- * before and after, so the log shows what the clock really did.
++ * before and after, so the log shows what the clock really did, and a
++ * monitor thread repeats one summary line every 10 s (the one-shot lines
++ * scroll away under launchd's console output; also shows throttling).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
+ void sweet_cpufreq_init(void);
+ 
+ #define OSM_ENABLE              0x000u
+@@ -44,6 +50,15 @@
+ 	{ "gold", 0x18325800u, 2 },
+ };
+ 
++#define OSM_DOMAINS     (sizeof(osm_domains) / sizeof(osm_domains[0]))
++
++/* What init found, for the monitor thread. */
++static struct {
++	vm_offset_t base;
++	unsigned khz[OSM_LUT_ROWS], levels;
++} osm_state[3];
++static int osm_sleep_chan;
++
+ static uint32_t
+ osm_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -76,25 +91,67 @@
+ 	return (unsigned)((uint32_t)(b - a) / 100000u);
+ }
+ 
++static void
++osm_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&osm_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Every 10 s: requested level and cycle-counter MHz (100 ms window, sleeping) per domain. */
++static void
++osm_monitor(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	for (;;) {
++		osm_sleep_ms(10000);
++		char line[160];
++		int n = snprintf(line, sizeof(line), "SWEET CPUFREQ:");
++		for (unsigned d = 0; d < OSM_DOMAINS && n > 0 && (size_t)n < sizeof(line); ++d) {
++			vm_offset_t base = osm_state[d].base;
++			if (!base) {
++				continue;
++			}
++			uint32_t st = osm_rd(base, OSM_PERF_STATE(0));
++			uint32_t c0 = osm_rd(base, OSM_CYCLES(0));
++			uint64_t t0 = mach_absolute_time();
++			osm_sleep_ms(100);
++			uint32_t c1 = osm_rd(base, OSM_CYCLES(0));
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			unsigned mhz = ns ? (unsigned)((uint64_t)(uint32_t)(c1 - c0) * 1000u / ns) : 0u;
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " %s %u/%u req %u meas %u MHz;",
++			    osm_domains[d].name, st, osm_state[d].levels,
++			    st < osm_state[d].levels ? osm_state[d].khz[st] / 1000u : 0u, mhz);
++		}
++		printf("%s\n", line);
++	}
++}
++
+ void
+ sweet_cpufreq_init(void)
+ {
+ 	int mode = 0, pick = -1;
+ 	(void)PE_parse_boot_argn("sweetcpufreq", &mode, sizeof(mode));
+ 	(void)PE_parse_boot_argn("sweetcpufreqidx", &pick, sizeof(pick));
+-	for (unsigned d = 0; d < sizeof(osm_domains) / sizeof(osm_domains[0]); ++d) {
++	for (unsigned d = 0; d < OSM_DOMAINS; ++d) {
+ 		vm_offset_t base = ml_io_map(osm_domains[d].pa, 0x1000);
+ 		if (!base) {
+ 			printf("SWEET CPUFREQ: %s: mapping failed\n", osm_domains[d].name);
+ 			continue;
+ 		}
+-		unsigned khz[OSM_LUT_ROWS], levels = 0;
++		unsigned *khz = osm_state[d].khz, levels = 0;
+ 		for (; levels < OSM_LUT_ROWS; ++levels) {
+ 			khz[levels] = osm_khz(osm_rd(base, OSM_FREQ_LUT + OSM_LUT_ROW * levels));
+ 			if (levels && khz[levels] == khz[levels - 1]) {
+ 				break;
+ 			}
+ 		}
++		osm_state[d].base = base;
++		osm_state[d].levels = levels;
+ 		uint32_t enable = osm_rd(base, OSM_ENABLE), ctrl = osm_rd(base, OSM_CORE_DCVS_CTRL);
+ 		uint32_t now = osm_rd(base, OSM_PERF_STATE(0));
+ 		bool per_core = ctrl & 1u;
+@@ -114,5 +171,9 @@
+ 		    osm_domains[d].name, idx, khz[idx] / 1000u, per_core ? " per-core" : "",
+ 		    osm_rd(base, OSM_PERF_STATE(0)), osm_measured_mhz(base));
+ 	}
++	thread_t thread;
++	if (kernel_thread_start(osm_monitor, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
