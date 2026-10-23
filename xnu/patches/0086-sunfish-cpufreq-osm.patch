@@ -1,0 +1,148 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,117 @@
++/*
++ * SM7150 CPU frequency: request a fixed OSM performance level (boot-arg
++ * sweetcpufreq=1: the top level; sweetcpufreqidx=N: LUT row N instead).
++ * Without it the cores stay at whatever ABL left; nothing else in this
++ * kernel scales CPU clocks.
++ *
++ * OSM blocks (sdmmagpie.dtsi qcom,clk-cpu-osm-sdmmagpie; Linux clk-cpu-osm.c):
++ * L3 0x18321000, silver (6 x A55) 0x18323000, gold (2 x A76) 0x18325800.
++ * LUT row i at 0x110 + 32 * i: bits 31:30 source (0 = 300 MHz boot clock),
++ * bits 7:0 L-value (rate = 19.2 MHz * L); the table ends at the first repeat.
++ * Request: DCVS_PERF_STATE_DESIRED(n) = 0x920 + 4 * n, per core when
++ * CORE_DCVS_CTRL (0xbc) bit 0 is set, else core 0 only. OSM firmware does
++ * the PLL and CPR voltage changes; the LMh block still throttles on heat.
++ * Each domain's cycle counter (0x9c0 + 4 * n) is sampled over 100 ms
++ * before and after, so the log shows what the clock really did.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define OSM_ENABLE              0x000u
++#define OSM_FREQ_LUT            0x110u
++#define OSM_LUT_ROW             32u
++#define OSM_LUT_ROWS            40u
++#define OSM_CORE_DCVS_CTRL      0x0bcu
++#define OSM_PERF_STATE(n)       (0x920u + 4u * (n))
++#define OSM_CYCLES(n)           (0x9c0u + 4u * (n))
++#define OSM_XO_KHZ              19200u
++#define OSM_BOOT_KHZ            300000u
++
++static const struct {
++	const char *name;
++	uint32_t pa;
++	unsigned cores;
++} osm_domains[] = {
++	{ "l3", 0x18321000u, 1 },
++	{ "silver", 0x18323000u, 6 },
++	{ "gold", 0x18325800u, 2 },
++};
++
++static uint32_t
++osm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++osm_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static unsigned
++osm_khz(uint32_t row)
++{
++	return (row >> 30) ? OSM_XO_KHZ * (row & 0xffu) : OSM_BOOT_KHZ;
++}
++
++/* Cycle counter delta over 100 ms, as MHz (assumes one count per cycle). */
++static unsigned
++osm_measured_mhz(vm_offset_t base)
++{
++	uint32_t a = osm_rd(base, OSM_CYCLES(0));
++	delay(100000);
++	uint32_t b = osm_rd(base, OSM_CYCLES(0));
++	return (unsigned)((uint32_t)(b - a) / 100000u);
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	int mode = 0, pick = -1;
++	(void)PE_parse_boot_argn("sweetcpufreq", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("sweetcpufreqidx", &pick, sizeof(pick));
++	for (unsigned d = 0; d < sizeof(osm_domains) / sizeof(osm_domains[0]); ++d) {
++		vm_offset_t base = ml_io_map(osm_domains[d].pa, 0x1000);
++		if (!base) {
++			printf("SWEET CPUFREQ: %s: mapping failed\n", osm_domains[d].name);
++			continue;
++		}
++		unsigned khz[OSM_LUT_ROWS], levels = 0;
++		for (; levels < OSM_LUT_ROWS; ++levels) {
++			khz[levels] = osm_khz(osm_rd(base, OSM_FREQ_LUT + OSM_LUT_ROW * levels));
++			if (levels && khz[levels] == khz[levels - 1]) {
++				break;
++			}
++		}
++		uint32_t enable = osm_rd(base, OSM_ENABLE), ctrl = osm_rd(base, OSM_CORE_DCVS_CTRL);
++		uint32_t now = osm_rd(base, OSM_PERF_STATE(0));
++		bool per_core = ctrl & 1u;
++		printf("SWEET CPUFREQ: %s enable=%#x dcvs=%#x levels=%u state=%u (%u MHz) range %u-%u MHz measured %u MHz\n",
++		    osm_domains[d].name, enable, ctrl, levels, now,
++		    now < levels ? khz[now] / 1000u : 0u, khz[0] / 1000u,
++		    levels ? khz[levels - 1] / 1000u : 0u, osm_measured_mhz(base));
++		if (mode != 1 || !(enable & 1u) || levels == 0) {
++			continue;
++		}
++		unsigned idx = (pick >= 0 && (unsigned)pick < levels) ? (unsigned)pick : levels - 1u;
++		for (unsigned c = 0; c < (per_core ? osm_domains[d].cores : 1u); ++c) {
++			osm_wr(base, OSM_PERF_STATE(c), idx);
++		}
++		delay(1000);
++		printf("SWEET CPUFREQ: %s -> level %u (%u MHz)%s, now state=%u measured %u MHz\n",
++		    osm_domains[d].name, idx, khz[idx] / 1000u, per_core ? " per-core" : "",
++		    osm_rd(base, OSM_PERF_STATE(0)), osm_measured_mhz(base));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_cpufreq_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -675,6 +676,7 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_cpufreq_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
