@@ -41,8 +41,12 @@ SUNFISH_FB_H = 2340
 # points at @2x) has no UIKit status bar visual provider: red "rdar:45025538" bar.
 # MobileGestalt caches screen facts per IOPlatformUUID, so each canvas gets its own
 # synthetic ECID (the other modes' caches stay valid for switching back).
-SCALE2_CANVASES = {(750, 1624): SWEET_ECID + 1, (828, 1792): SWEET_ECID + 2}
+SCALE2_CANVASES = {(750, 1624): SWEET_ECID + 1, (828, 1792): SWEET_ECID + 3}
 SCALE2_DEFAULT = (828, 1792)
+# /product overrides per canvas. Boot F2 (828x1792 with the iPhone X's artwork identity:
+# subtype 2436, scale factor 3) still had no status bar provider: UIKit's Split828 wants
+# the iPhone XR/11 artwork class. (ECID ...03 was F2's; ...04 drops that cached identity.)
+SCALE2_PRODUCT = {(828, 1792): {'artwork-device-subtype': 1792, 'artwork-scale-factor': 2}}
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -233,6 +237,9 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=None):
     ])
 
     product_props = d22ap_product()
+    overrides = SCALE2_PRODUCT.get(scale2, {}) if scale2 else {}
+    if product_props and overrides:
+        product_props = [(k, u32(overrides[k]) if k in overrides else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the

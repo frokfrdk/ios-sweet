@@ -1,0 +1,120 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -107,6 +107,9 @@
+ 	bool          fScaled;                  /* canvas < panel: upscale on present */
+ 	uint16_t     *fXMap, *fYMap;            /* panel pixel -> canvas pixel */
+ 	uint32_t     *fRow;                     /* one scaled panel row (cached memory) */
++	bool          fFilter;                  /* bilinear instead of nearest */
++	uint8_t      *fXFrac, *fYFrac;          /* bilinear weights of the next pixel/row (0..255) */
++	uint32_t     *fRowA, *fRowB;            /* horizontally scaled canvas rows y0, y0 + 1 */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -233,6 +236,32 @@
+ 			fLogicalW = canvasW;
+ 			fLogicalH = canvasH;
+ 			fOffX = fOffY = 0;
++			int filter = 0;
++			PE_parse_boot_argn("sweetfb_filter", &filter, sizeof(filter));
++			if (filter != 0) {
++				fXFrac = (uint8_t *)IOMallocData(fWidth);
++				fYFrac = (uint8_t *)IOMallocData(fHeight);
++				fRowA = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++				fRowB = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++			}
++			if (fXFrac != NULL && fYFrac != NULL && fRowA != NULL && fRowB != NULL) {
++				/* Pixel centres: src = (dst + 0.5) * canvas / panel - 0.5, in 8.8 fixed point. */
++				for (uint32_t x = 0; x < fWidth; x++) {
++					int64_t f = ((int64_t)(2 * x + 1) * canvasW * 128) / fWidth - 128;
++					f = f < 0 ? 0 : f;
++					uint64_t i = (uint64_t)f >> 8;
++					fXMap[x] = (uint16_t)(i < canvasW - 1 ? i : canvasW - 1);
++					fXFrac[x] = fXMap[x] == canvasW - 1 ? 0 : (uint8_t)f;
++				}
++				for (uint32_t y = 0; y < fHeight; y++) {
++					int64_t f = ((int64_t)(2 * y + 1) * canvasH * 128) / fHeight - 128;
++					f = f < 0 ? 0 : f;
++					uint64_t i = (uint64_t)f >> 8;
++					fYMap[y] = (uint16_t)(i < canvasH - 1 ? i : canvasH - 1);
++					fYFrac[y] = fYMap[y] == canvasH - 1 ? 0 : (uint8_t)f;
++				}
++				fFilter = true;
++			}
+ 		}
+ 	}
+ 	fLock = IOLockAlloc();
+@@ -262,7 +291,8 @@
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fScaled ? " (scaled)" : "");
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fScaled ? (fFilter ? " (scaled, bilinear)" : " (scaled)") : "");
+ 	return true;
+ }
+ 
+@@ -372,6 +402,26 @@
+ 	}
+ }
+ 
++/* a + (b - a) * f / 256 per 8-bit channel, two channels per multiply (no carry between lanes). */
++static inline uint32_t
++sweet_fb_lerp(uint32_t a, uint32_t b, uint32_t f)
++{
++	uint32_t g = 256 - f;
++	uint32_t rb = (((a & 0x00ff00ffu) * g + (b & 0x00ff00ffu) * f) >> 8) & 0x00ff00ffu;
++	uint32_t ag = (((a >> 8) & 0x00ff00ffu) * g + ((b >> 8) & 0x00ff00ffu) * f) & 0xff00ff00u;
++	return rb | ag;
++}
++
++/* One canvas row scaled horizontally to the panel width. */
++static void
++sweet_fb_hscale(uint32_t *dst, const uint32_t *src, const uint16_t *x0, const uint8_t *fx, uint32_t w)
++{
++	for (uint32_t x = 0; x < w; x++) {
++		uint32_t i = x0[x];
++		dst[x] = fx[x] ? sweet_fb_lerp(src[i], src[i + 1], fx[x]) : src[i];
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -423,7 +473,36 @@
+ 			    need <= s->memory->getLength()) {
+ 				const uint8_t *base = (const uint8_t *)(src + s->offset);
+ 				uint32_t last = 0xffffffffu;
+-				for (uint32_t y = 0; y < fHeight; y++) {
++				if (fFilter) {
++					/* Bilinear: rows y0 and y0+1 scaled horizontally once, then blended per panel row. */
++					uint32_t have = 0xffffffffu;    /* canvas row held in fRowA */
++					for (uint32_t y = 0; y < fHeight; y++) {
++						uint32_t y0 = fYMap[y], y1 = y0 + 1 < fLogicalH ? y0 + 1 : fLogicalH - 1;
++						if (y0 != have) {
++							if (y0 == have + 1) {
++								uint32_t *t = fRowA;    /* old y0+1 is the new y0 */
++								fRowA = fRowB;
++								fRowB = t;
++							} else {
++								sweet_fb_hscale(fRowA, (const uint32_t *)(base + (uint64_t)y0 * s->bytesPerRow),
++								    fXMap, fXFrac, fWidth);
++							}
++							sweet_fb_hscale(fRowB, (const uint32_t *)(base + (uint64_t)y1 * s->bytesPerRow),
++							    fXMap, fXFrac, fWidth);
++							have = y0;
++						}
++						uint32_t fy = fYFrac[y];
++						if (fy == 0) {
++							memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fRowA, (size_t)fWidth * 4);
++							continue;
++						}
++						for (uint32_t x = 0; x < fWidth; x++) {
++							fRow[x] = sweet_fb_lerp(fRowA[x], fRowB[x], fy);
++						}
++						memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fRow, (size_t)fWidth * 4);
++					}
++				}
++				for (uint32_t y = 0; !fFilter && y < fHeight; y++) {
+ 					if (fYMap[y] != last) {
+ 						last = fYMap[y];
+ 						const uint32_t *srow = (const uint32_t *)(base + (uint64_t)last * s->bytesPerRow);
