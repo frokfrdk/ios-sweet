@@ -1,0 +1,273 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -58,6 +58,20 @@
+ #define FTS5_MAX_X      1079
+ #define FTS5_MAX_Y      2339    /* st,max-coords <1079 2339> */
+ 
++/*
++ * Touch power on sunfish: PM6150 (SID 0) GPIO4, DT touch_power_default
++ * (function normal, output-high, power-source 1, drive 2, bias-disable).
++ * SPMI PMIC arbiter v5 (sdmmagpie.dtsi spmi_bus): reads through the observer
++ * channel like sweet_keys.c; the optional write (boot-arg sweetftspower=1)
++ * uses the apps-owned RW channel, 0x10000 per APID.
++ */
++#define FTS5_PWR_PPID   0x0c3u
++#define SPMI_CORE_PA    0x0c440000u
++#define SPMI_CHNLS_PA   0x0c600000u
++#define SPMI_OBS_PA     0x0e600000u
++#define SPMI_CNFG_PA    0x0c40a000u
++#define SPMI_NO_APID    0xffffu
++
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+ #define SE_FW           0x068u
+@@ -94,7 +108,9 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
+-	int kind, irq_hint, fts5;
++	int kind, irq_hint, fts5, fts5_power;
++	unsigned fts5_reads, fts5_events, fts5_nacks;
++	int fts5_err;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -507,14 +523,22 @@
+ 	return 0;
+ }
+ 
++static bool touch_se_init(void);
++
+ /* Read the next FTM5 events: the first one, then as many queued ones as fit. */
+ static int
+ touch_fts5_read(uint8_t *buf, unsigned *count)
+ {
+ 	*count = 0;
++	++st.fts5_reads;
+ 	int err = touch_read(FTS5_ADDR, FTS5_FIFO_READ, false, buf, FTS5_EVENT_LEN);
+-	if (err || buf[0] == 0) {
+-		return err;     /* 0x00 = EVT_ID_NOEVENT */
++	if (err) {
++		st.fts5_err = err;
++		st.fts5_nacks += (err == ENXIO);
++		return err;
++	}
++	if (buf[0] == 0) {
++		return 0;       /* 0x00 = EVT_ID_NOEVENT */
+ 	}
+ 	unsigned more = MIN(buf[7] & 0x1fu, FTS5_BATCH - 1u);
+ 	if (more) {
+@@ -525,6 +549,7 @@
+ 		}
+ 	}
+ 	*count = 1u + more;
++	st.fts5_events += *count;
+ 	return 0;
+ }
+ 
+@@ -634,6 +659,163 @@
+ 	return err == 0;
+ }
+ 
++static struct {
++	vm_offset_t core, cnfg, obs, chnl;
++	uint16_t apid;
++	uint32_t owner, status;
++	uint8_t reg[8];
++	bool read_ok;
++	int write_err;
++} fp = { .apid = SPMI_NO_APID, .write_err = -1 };
++/* subtype, status1, mode, vin, pull, out source, out ctl, enable */
++static const uint8_t fp_regs[8] = {0x05, 0x08, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46};
++
++static bool
++fp_read(uint8_t reg, uint8_t *out)
++{
++	uint32_t off = 0x80u * fp.apid;         /* observer, EE 0 */
++	touch_wr(fp.obs, off, (1u << 27) | ((uint32_t)reg << 4));      /* EXT_READL, 1 byte */
++	for (unsigned i = 0; i < 1000; ++i) {
++		fp.status = touch_rd(fp.obs, off + 0x08u);
++		if (fp.status & 1u) {
++			if (fp.status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)touch_rd(fp.obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++fp_write(uint8_t reg, uint8_t val)
++{
++	touch_wr(fp.chnl, 0x10u, val);                          /* WDATA0 */
++	touch_wr(fp.chnl, 0x00u, ((uint32_t)reg << 4));         /* EXT_WRITEL (opcode 0), 1 byte */
++	for (unsigned i = 0; i < 1000; ++i) {
++		fp.status = touch_rd(fp.chnl, 0x08u);
++		if (fp.status & 1u) {
++			return !(fp.status & 0x0eu);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++fp_dump(const char *when)
++{
++	fp.read_ok = fp.apid != SPMI_NO_APID;
++	for (unsigned i = 0; i < sizeof(fp_regs) && fp.read_ok; ++i) {
++		fp.read_ok = fp_read(fp_regs[i], &fp.reg[i]);
++	}
++	printf("SWEET FTS: pwr %s apid=%u owner=%u ok=%d sub=%#x st1=%#x mode=%#x vin=%#x pull=%#x src=%#x out=%#x en=%#x\n",
++	    when, fp.apid, fp.owner, fp.read_ok, fp.reg[0], fp.reg[1], fp.reg[2], fp.reg[3],
++	    fp.reg[4], fp.reg[5], fp.reg[6], fp.reg[7]);
++}
++
++/* Find PM6150 GPIO4 on the arbiter and read it; optionally drive it high. */
++static void
++touch_fts5_power(void)
++{
++	fp.core = ml_io_map(SPMI_CORE_PA, 0x2000);
++	fp.cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++	fp.obs = ml_io_map(SPMI_OBS_PA, 0x10000);
++	if (!fp.core || !fp.cnfg || !fp.obs) {
++		printf("SWEET FTS: SPMI mapping failed\n");
++		return;
++	}
++	uint32_t ver = touch_rd(fp.core, 0), count = touch_rd(fp.core, 4) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || count == 0 || count > 512) {
++		printf("SWEET FTS: unsupported SPMI arbiter %#x apids=%u\n", ver, count);
++		return;
++	}
++	/* Same rule as sweet_keys.c: prefer the apps-owned (EE 0) mapping. */
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = touch_rd(fp.core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != FTS5_PWR_PPID) {
++			continue;
++		}
++		uint32_t owner = touch_rd(fp.cnfg, 0x700u + 4u * i) & 7u;
++		if (fp.apid == SPMI_NO_APID || owner == 0) {
++			fp.apid = (uint16_t)i;
++			fp.owner = owner;
++		}
++	}
++	fp_dump("before");
++	if (!st.fts5_power) {
++		return;
++	}
++	unsigned sub = fp.reg[0];
++	if (!fp.read_ok || fp.owner != 0 || sub < 0x10u || sub > 0x13u) {
++		printf("SWEET FTS: pwr write refused (ok=%d owner=%u subtype=%#x)\n",
++		    fp.read_ok, fp.owner, sub);
++		return;
++	}
++	fp.chnl = ml_io_map(SPMI_CHNLS_PA + 0x10000u * fp.apid, 0x1000);
++	if (!fp.chnl) {
++		return;
++	}
++	/* Linux pinctrl-spmi-gpio, LV/MV subtype: vin, pull, mode=digital out,
++	 * output high (invert bit with constant source), CMOS drive 2, enable. */
++	static const uint8_t seq[][2] = {
++		{0x41, 0x01}, {0x42, 0x05}, {0x40, 0x01}, {0x44, 0x80}, {0x45, 0x02}, {0x46, 0x80},
++	};
++	fp.write_err = 0;
++	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); ++i) {
++		if (!fp_write(seq[i][0], seq[i][1])) {
++			fp.write_err = (int)i + 1;
++			break;
++		}
++	}
++	touch_wait(50);         /* rail settle before reset */
++	printf("SWEET FTS: pwr write err=%d status=%#x\n", fp.write_err, fp.status);
++	fp_dump("after");
++}
++
++/*
++ * The sunfish path never stops quietly: whatever fails, one status line every
++ * 5 s keeps the reason on the (fast-scrolling) console.
++ */
++static void
++touch_fts5_main(void)
++{
++	const char *stage = "clocks";
++	bool bus = touch_clocks();
++	if (bus) {
++		stage = "se7";
++		bus = touch_se_init();
++	}
++	touch_fts5_power();
++	bool up = false;
++	for (unsigned round = 0; !st.dead; ++round) {
++		if (bus && !up && (round % 6u) == 0) {  /* retry bring-up every 30 s */
++			stage = "bringup";
++			up = touch_fts5_bringup();
++			stage = up ? "running" : "no-ic";
++		}
++		if (up) {
++			for (unsigned i = 0; i < 500 && !st.dead; ++i) {
++				int err = touch_fts5();
++				if (err && st.active) {
++					touch_report(0, st.x, st.y);
++				}
++				touch_wait(10);
++			}
++		} else {
++			touch_wait(5000);
++		}
++		printf("SWEET FTS: [%s] se7 fw=%#x bus=%d reads=%u nacks=%u events=%u err=%d active=%#x tlmm8/9/72=%x/%x/%x pwr en=%#x src=%#x w=%d\n",
++		    stage, touch_rd(st.se, SE_FW), bus, st.fts5_reads, st.fts5_nacks, st.fts5_events,
++		    st.fts5_err, st.active, touch_rd(st.gpio, TOUCH_GPIO_IO(8)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(9)), touch_rd(st.gpio, TOUCH_GPIO_IO(72)),
++		    fp.reg[7], fp.reg[5], fp.write_err);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -713,30 +895,11 @@
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
++	if (st.fts5) {
++		touch_fts5_main();
+ 		goto out;
+ 	}
+-	if (st.fts5) {
+-		if (!touch_fts5_bringup()) {
+-			goto out;
+-		}
+-		printf("SWEET FTS: FTM5 1080x2340, poll=10ms\n");
+-		unsigned fts_errors = 0;
+-		while (!st.dead) {
+-			int err = touch_fts5();
+-			if (err) {
+-				if ((fts_errors++ % 100u) == 0) {
+-					printf("SWEET FTS: read err=%d irq=%#x\n", err, st.irq_status);
+-				}
+-				if (fts_errors == 10) {
+-					touch_report(0, st.x, st.y);
+-				}
+-			} else {
+-				fts_errors = 0;
+-			}
+-			touch_wait(10);
+-		}
+-		touch_report(0, st.x, st.y);
++	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+@@ -817,6 +980,7 @@
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	(void)PE_parse_boot_argn("sweetfts", &st.fts5, sizeof(st.fts5));
++	(void)PE_parse_boot_argn("sweetftspower", &st.fts5_power, sizeof(st.fts5_power));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
