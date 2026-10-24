@@ -24,6 +24,22 @@ for com.apple.widgetkit-extension" (MIInstaller Code=59, Preflight stage failed)
 -[_EXDefaults enforceXPCCacheCodeSigning] = os_feature_enabled(ExtensionKit,
 enforce_xpc_cache_code_signing) && !(amfi bootarg state & 0x86).
 
+SpringBoard feature flags Autobahn* -> off (the iOS 16 poster lock screen).
+Posters need Metal: the device's default poster, AegirPoster (Astronomy),
+aborts in -[NUNIAegirRenderer getOrCreateUniformBufferforFrameBufferIndex:]
+(nil MTLBuffer), and PosterBoard's home screen snapshots render through
++[CARenderer rendererWithMTLTexture:], so lock and home screen stay black.
+With Autobahn off SpringBoard uses the PaperBoardUI legacy wallpaper path,
+which draws plain images with CoreAnimation.
+
+--wallpaper IMAGE: legacy wallpaper for lock and home screen. PaperBoardUI's
+directory data store reads ~mobile/Library/SpringBoard/{Lock,Home}Background
+.cpbitmap and falls back to ImageIO when the data is not a CPBitmap, so a PNG
+or JPEG works. Needed because the stock default (WallpaperKit 7400 "WWDC
+2022") only ships 375w/393w/430w @3x variants, none for the 414w-896h@2x
+screen class of the 828xr ADT, and a failed default restore leaves the
+SBLockScreenWallpapers/SBHomeScreenWallpapers entries empty (black).
+
 --migrate-once: let DataMigration run on the next boot. The staged system apps
 (/var/staged_system_apps: Calculator, Books, ...; "Waiting..." placeholders)
 are installed by SystemAppMigrator.migrator, which only runs during migration;
@@ -39,6 +55,7 @@ import os, plistlib, sys
 
 root = sys.argv[1]
 migrate_once = '--migrate-once' in sys.argv[2:]
+wallpaper = sys.argv[sys.argv.index('--wallpaper') + 1] if '--wallpaper' in sys.argv else None
 
 PREFS = {'CUIAllowDebugPrefs': True, 'CUIAllowHardwareRendering': False}
 TARGETS = [  # (path, uid, gid)
@@ -71,6 +88,32 @@ with open(path, 'wb') as f:
 os.chown(path, st.st_uid, st.st_gid)
 os.chmod(path, st.st_mode & 0o7777)
 print(f'{rel}: enforce_xpc_cache_code_signing disabled')
+
+rel = 'System/Library/FeatureFlags/Domain/SpringBoard.plist'
+path = os.path.join(root, rel)
+with open(path, 'rb') as f:
+    flags = plistlib.load(f)
+off = [k for k in flags if k.startswith('Autobahn')]
+for k in off:
+    flags[k]['Enabled'] = False
+st = os.stat(path)
+with open(path, 'wb') as f:
+    plistlib.dump(flags, f)
+os.chown(path, st.st_uid, st.st_gid)
+os.chmod(path, st.st_mode & 0o7777)
+print(f'{rel}: {off} disabled')
+
+if wallpaper:
+    sbdir = os.path.join(root, 'private/var/mobile/Library/SpringBoard')
+    with open(wallpaper, 'rb') as f:
+        data = f.read()
+    for name in ('LockBackground.cpbitmap', 'HomeBackground.cpbitmap'):
+        path = os.path.join(sbdir, name)
+        with open(path, 'wb') as f:
+            f.write(data)
+        os.chown(path, 501, 501)
+        os.chmod(path, 0o644)
+    print(f'wallpaper: {wallpaper} -> {sbdir}/{{Lock,Home}}Background.cpbitmap ({len(data)} bytes)')
 
 if migrate_once:
     rel = 'private/var/mobile/Library/Preferences/com.apple.migration.plist'
