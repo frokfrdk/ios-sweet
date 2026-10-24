@@ -32,10 +32,11 @@ aborts in -[NUNIAegirRenderer getOrCreateUniformBufferforFrameBufferIndex:]
 With Autobahn off SpringBoard uses the PaperBoardUI legacy wallpaper path,
 which draws plain images with CoreAnimation.
 
---wallpaper IMAGE: legacy wallpaper for lock and home screen. PaperBoardUI's
+--wallpaper FILE.cpbitmap: legacy wallpaper for lock and home screen. PaperBoardUI's
 directory data store reads ~mobile/Library/SpringBoard/{Lock,Home}Background
-.cpbitmap and falls back to ImageIO when the data is not a CPBitmap, so a PNG
-or JPEG works. Needed because the stock default (WallpaperKit 7400 "WWDC
+.cpbitmap with AppSupport's CPBitmapCreateImagesFromData, which needs a real
+CPBitmap (trailer magic; there is no ImageIO fallback, a PNG stays black):
+convert with tools/sunfish/png2cpbitmap.py. Needed because the stock default (WallpaperKit 7400 "WWDC
 2022") only ships 375w/393w/430w @3x variants, none for the 414w-896h@2x
 screen class of the 828xr ADT, and a failed default restore leaves the
 SBLockScreenWallpapers/SBHomeScreenWallpapers entries empty (black).
@@ -51,7 +52,7 @@ with none of them, and they wait on missing hardware and daemons
 holding the whole boot. App staging also needs the kernel's HFS+ clonefile copy
 fallback (xnu patch 0091).
 """
-import os, plistlib, sys
+import os, plistlib, struct, sys
 
 root = sys.argv[1]
 migrate_once = '--migrate-once' in sys.argv[2:]
@@ -107,6 +108,8 @@ if wallpaper:
     sbdir = os.path.join(root, 'private/var/mobile/Library/SpringBoard')
     with open(wallpaper, 'rb') as f:
         data = f.read()
+    assert struct.unpack('<I', data[-4:])[0] in (0xDCB543A2, 0xCBA43291), \
+        f'{wallpaper}: not a CPBitmap (convert it with png2cpbitmap.py)'
     for name in ('LockBackground.cpbitmap', 'HomeBackground.cpbitmap'):
         path = os.path.join(sbdir, name)
         with open(path, 'wb') as f:
