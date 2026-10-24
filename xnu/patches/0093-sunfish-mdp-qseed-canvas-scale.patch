@@ -1,0 +1,278 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -81,6 +81,63 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++/*
++ * Boot-arg sweetfb_mdpscale=1 (scaled canvas only): the MDP upscales the
++ * canvas instead of the CPU. ABL scans the panel buffer (cont_splash,
++ * 0x9c000000, 23 MB carve-out, unused by XNU) through SSPP VIG0, which has
++ * a QSEED3-Lite scaler (sdmmagpie: qcom,sde-qseed-type "qseedv3lite",
++ * qcom,sde-vig-qseed-off 0xa00). From the first frame on, the canvas is
++ * copied unscaled into a second buffer in the carve-out and VIG0 fetches it
++ * with bilinear scaling to the panel size (as Linux sde_plane.c
++ * _sde_plane_setup_scaler3 + sde_hw_setup_scaler3 do for RGB), then a CTL
++ * flush latches it at the next frame. The CPU copies 5.9 MB per frame and
++ * scales nothing; the kernel console keeps drawing into the panel buffer,
++ * which is no longer shown.
++ */
++#define SWEET_MDP_PA                    0x0ae00000ULL
++#define SWEET_MDP_SIZE                  0x8000
++#define SWEET_MDP_SPLASH_PA             0x9c000000ULL
++#define SWEET_MDP_SPLASH_SIZE           0x1700000
++#define SWEET_MDP_CANVAS_OFF            0xa00000        /* after the 1080x2340 panel buffer */
++#define SWEET_MDP_CTL(i)                (0x2000 + 0x200 * (i))
++#define SWEET_MDP_CTLS                  6
++#define SWEET_MDP_CTL_FLUSH             0x18
++#define SWEET_MDP_CTL_FLUSH_VIG0        (1u << 0)
++#define SWEET_MDP_VIG0                  0x5000
++#define SWEET_MDP_SSPP_SRC_SIZE         0x00
++#define SWEET_MDP_SSPP_SRC_XY           0x08
++#define SWEET_MDP_SSPP_OUT_SIZE         0x0c
++#define SWEET_MDP_SSPP_SRC0_ADDR        0x14
++#define SWEET_MDP_SSPP_SRC_YSTRIDE0     0x24
++#define SWEET_MDP_SSPP_SRC_FORMAT       0x30
++#define SWEET_MDP_SSPP_PIX_EXT(c)       (0x100 + 0x10 * (c))    /* +0 LR, +4 TB, +8 REQ_PIXELS */
++#define SWEET_MDP_QSEED                 (SWEET_MDP_VIG0 + 0xa00)
++#define SWEET_MDP_QSEED_VERSION         0x00
++#define SWEET_MDP_QSEED_OP_MODE         0x04
++#define SWEET_MDP_QSEED_PHASE_STEP(i)   (0x10 + 4 * (i))        /* Y_H, Y_V, UV_H, UV_V */
++#define SWEET_MDP_QSEED_PRELOAD         0x20
++#define SWEET_MDP_QSEED_SRC_SIZE_Y      0x40
++#define SWEET_MDP_QSEED_SRC_SIZE_UV     0x44
++#define SWEET_MDP_QSEED_DST_SIZE        0x48
++#define SWEET_MDP_QSEED_PHASE_INIT(i)   (0x90 + 4 * (i))
++#define SWEET_MDP_QSEED_PRELOAD_DEF     0x03040304      /* QSEED3 h 4, v 3 for both planes */
++#define SWEET_MDP_QSEED_OP_RGB_BIL      ((1u << 0) | (3u << 16) | (1u << 14) | (1u << 31))     /* enable, bilinear, non-DX, blend */
++#define SWEET_MDP_QSEED_OP_ALPHA_BIL    ((1u << 10) | (1u << 29))
++#define SWEET_MDP_SRC_FORMAT_ALPHA      (1u << 8)
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++static inline uint32_t
++sweet_mdp_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++sweet_mdp_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++}
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -110,6 +167,16 @@
+ 	bool          fFilter;                  /* bilinear instead of nearest */
+ 	uint8_t      *fXFrac, *fYFrac;          /* bilinear weights of the next pixel/row (0..255) */
+ 	uint32_t     *fRowA, *fRowB;            /* horizontally scaled canvas rows y0, y0 + 1 */
++	bool          fMdp;                     /* sweetfb_mdpscale: VIG0's scaler upscales the canvas */
++	bool          fMdpOn;                   /* VIG0 switched to the canvas buffer */
++	bool          fMdpLogged;
++	vm_offset_t   fMdpRegs;
++	uint32_t      fMdpCtls;                 /* CTLs staging VIG0, one bit each */
++	uint64_t      fCanvasPhys;
++	uintptr_t     fCanvas;                  /* kernel mapping of the canvas buffer */
++	IOMemoryMap  *fCanvasMap;
++	uintptr_t     fVis;                     /* memory the panel shows: fPixels, or fCanvas once fMdpOn */
++	uint32_t      fVisW, fVisH, fVisRowBytes;
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -128,6 +195,8 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool mdpSetup(void);
++	void mdpSwitch(void);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -268,6 +337,15 @@
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	fVis = fPixels;
++	fVisW = fWidth;
++	fVisH = fHeight;
++	fVisRowBytes = fRowBytes;
++	int mdp = 0;
++	PE_parse_boot_argn("sweetfb_mdpscale", &mdp, sizeof(mdp));
++	if (fScaled && mdp != 0) {
++		fMdp = mdpSetup();
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -292,8 +370,104 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fScaled ? (fFilter ? " (scaled, bilinear)" : " (scaled)") : "");
++	    fScaled ? (fMdp ? " (scaled, MDP)" : fFilter ? " (scaled, bilinear)" : " (scaled)") : "");
+ 	return true;
++}
++
++/* Map the MDP and check that VIG0 scans the panel buffer; the canvas buffer follows it in the carve-out. */
++bool
++AppleCLCD::mdpSetup(void)
++{
++	uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
++	uint64_t canvasBytes = (uint64_t)fLogicalW * 4 * fLogicalH;
++	if (fPhys != SWEET_MDP_SPLASH_PA || panelBytes > SWEET_MDP_CANVAS_OFF ||
++	    SWEET_MDP_CANVAS_OFF + canvasBytes > SWEET_MDP_SPLASH_SIZE) {
++		IOLog("SWEET FB: MDP scaling not used (framebuffer 0x%llx, %llu + %llu bytes)\n",
++		    fPhys, panelBytes, canvasBytes);
++		return false;
++	}
++	fMdpRegs = ml_io_map((vm_offset_t)SWEET_MDP_PA, SWEET_MDP_SIZE);
++	if (fMdpRegs == 0) {
++		return false;
++	}
++	uint32_t ver = sweet_mdp_rd(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_VERSION);
++	uint32_t op = sweet_mdp_rd(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_OP_MODE);
++	uint32_t srcSize = sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_SIZE);
++	uint32_t outSize = sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_OUT_SIZE);
++	uint32_t addr = sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC0_ADDR);
++	uint32_t stride = sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_YSTRIDE0);
++	for (uint32_t i = 0; i < SWEET_MDP_CTLS; i++) {
++		for (uint32_t lm = 0; lm < 4; lm++) {     /* CTL_LAYER(LM0..LM3); VIG0's blend stage is bits 0-2 */
++			if (sweet_mdp_rd(fMdpRegs, SWEET_MDP_CTL(i) + 4 * lm) & 0x7) {
++				fMdpCtls |= 1u << i;
++			}
++		}
++	}
++	IOLog("SWEET FB: MDP qseed ver 0x%x op 0x%x, VIG0 src 0x%x out 0x%x addr 0x%x stride 0x%x, CTLs 0x%x\n",
++	    ver, op, srcSize, outSize, addr, stride, fMdpCtls);
++	if (ver == 0 || ver == 0xffffffffu || addr != (uint32_t)fPhys ||
++	    outSize != ((fHeight << 16) | fWidth) || fMdpCtls == 0) {
++		IOLog("SWEET FB: MDP scaling not used (unexpected VIG0 state)\n");
++		return false;
++	}
++	fCanvasPhys = fPhys + SWEET_MDP_CANVAS_OFF;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fCanvasPhys,
++	    round_page(canvasBytes), kIODirectionInOut);
++	if (md != NULL) {
++		fCanvasMap = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++		md->release();
++	}
++	if (fCanvasMap == NULL) {
++		IOLog("SWEET FB: MDP scaling not used (no canvas mapping)\n");
++		return false;
++	}
++	fCanvas = (uintptr_t)fCanvasMap->getVirtualAddress();
++	return true;
++}
++
++/* VIG0: fetch the canvas buffer, QSEED3-Lite bilinear upscale to the panel; latch with a CTL flush. */
++void
++AppleCLCD::mdpSwitch(void)
++{
++	uint32_t size = (fLogicalH << 16) | fLogicalW;
++	uint32_t stepX = (uint32_t)(((uint64_t)fLogicalW << 21) / fWidth);
++	uint32_t stepY = (uint32_t)(((uint64_t)fLogicalH << 21) / fHeight);
++	uint32_t op = SWEET_MDP_QSEED_OP_RGB_BIL;
++	if (sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_FORMAT) & SWEET_MDP_SRC_FORMAT_ALPHA) {
++		op |= SWEET_MDP_QSEED_OP_ALPHA_BIL;
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_PHASE_INIT(i), 0);
++		sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_PHASE_STEP(i), (i & 1) ? stepY : stepX);
++	}
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_PRELOAD, SWEET_MDP_QSEED_PRELOAD_DEF);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_SRC_SIZE_Y, size);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_SRC_SIZE_UV, size);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_DST_SIZE, (fHeight << 16) | fWidth);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_OP_MODE, op);
++	for (uint32_t c = 0; c < 3; c++) {        /* pixel extension: none, request the whole source */
++		sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_PIX_EXT(c) + 0, 0);
++		sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_PIX_EXT(c) + 4, 0);
++		sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_PIX_EXT(c) + 8, size);
++	}
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_SIZE, size);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_XY, 0);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC_YSTRIDE0, fLogicalW * 4);
++	sweet_mdp_wr(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC0_ADDR, (uint32_t)fCanvasPhys);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < SWEET_MDP_CTLS; i++) {
++		if (fMdpCtls & (1u << i)) {
++			sweet_mdp_wr(fMdpRegs, SWEET_MDP_CTL(i) + SWEET_MDP_CTL_FLUSH, SWEET_MDP_CTL_FLUSH_VIG0);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fVis = fCanvas;
++	fVisW = fLogicalW;
++	fVisH = fLogicalH;
++	fVisRowBytes = fLogicalW * 4;
++	fMdpOn = true;
++	IOLog("SWEET FB: MDP scaling on: VIG0 %ux%u -> %ux%u, op 0x%x, step 0x%x/0x%x\n",
++	    fLogicalW, fLogicalH, fWidth, fHeight, op, stepX, stepY);
+ }
+ 
+ void
+@@ -322,9 +496,9 @@
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
++			for (uint32_t y = 0; y < fb->fVisH; y++) {
++				volatile uint32_t *row = (volatile uint32_t *)(fb->fVis + (uint64_t)y * fb->fVisRowBytes);
++				for (uint32_t x = 0; x < fb->fVisW; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
+@@ -473,7 +647,29 @@
+ 			    need <= s->memory->getLength()) {
+ 				const uint8_t *base = (const uint8_t *)(src + s->offset);
+ 				uint32_t last = 0xffffffffu;
+-				if (fFilter) {
++				if (fMdp) {
++					/* The MDP scales: copy the canvas as is, then switch VIG0 over once. */
++					for (uint32_t y = 0; y < fLogicalH; y++) {
++						memcpy((void *)(fCanvas + (uint64_t)y * fLogicalW * 4),
++						    base + (uint64_t)y * s->bytesPerRow, (size_t)fLogicalW * 4);
++					}
++					__asm__ volatile ("dsb sy" ::: "memory");
++					if (!fMdpOn) {
++						mdpSwitch();
++					} else if (!fMdpLogged) {
++						fMdpLogged = true;
++						uint32_t pend = 0;
++						for (uint32_t i = 0; i < SWEET_MDP_CTLS; i++) {
++							if (fMdpCtls & (1u << i)) {
++								pend |= sweet_mdp_rd(fMdpRegs, SWEET_MDP_CTL(i) + SWEET_MDP_CTL_FLUSH);
++							}
++						}
++						IOLog("SWEET FB: MDP after switch: flush pending 0x%x, VIG0 addr 0x%x qseed op 0x%x\n",
++						    pend, sweet_mdp_rd(fMdpRegs, SWEET_MDP_VIG0 + SWEET_MDP_SSPP_SRC0_ADDR),
++						    sweet_mdp_rd(fMdpRegs, SWEET_MDP_QSEED + SWEET_MDP_QSEED_OP_MODE));
++					}
++					sweet_fb_stat_bytes += (uint64_t)fLogicalW * 4 * fLogicalH;
++				} else if (fFilter) {
+ 					/* Bilinear: rows y0 and y0+1 scaled horizontally once, then blended per panel row. */
+ 					uint32_t have = 0xffffffffu;    /* canvas row held in fRowA */
+ 					for (uint32_t y = 0; y < fHeight; y++) {
+@@ -502,7 +698,7 @@
+ 						memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fRow, (size_t)fWidth * 4);
+ 					}
+ 				}
+-				for (uint32_t y = 0; !fFilter && y < fHeight; y++) {
++				for (uint32_t y = 0; !fFilter && !fMdp && y < fHeight; y++) {
+ 					if (fYMap[y] != last) {
+ 						last = fYMap[y];
+ 						const uint32_t *srow = (const uint32_t *)(base + (uint64_t)last * s->bytesPerRow);
+@@ -512,7 +708,9 @@
+ 					}
+ 					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fRow, (size_t)fWidth * 4);
+ 				}
+-				sweet_fb_stat_bytes += (uint64_t)fWidth * 4 * fHeight;
++				if (!fMdp) {
++					sweet_fb_stat_bytes += (uint64_t)fWidth * 4 * fHeight;
++				}
+ 			}
+ 			s->release();
+ 			continue;
