@@ -100,6 +100,9 @@ User space (`tools/sweetgl/`):
 - **GMU** at 0x506a000 (0x31000):
   - PDC cfg 0xb290000, PDC seq 0xb490000. IRQs: HFI SPI 0x130, GMU SPI 0x131.
   - GMU clock 200 MHz.
+  - Register offsets in the Linux XML (and `xnu/gpu/regs/`) count in dwords from the GPU base 0x5000000,
+    as kgsl does: GMU_CM3_ITCM_START 0x1b400 = 0x506d000. `RSCC_*` count from the RSCC block
+    (0x506a000 + 0x23000), the `A6XX_PDC*` domains from their PDC blocks.
 - **gpucc** at 0x5090000 (0x9000):
   - GDSCs: CX 0x509106c, GX 0x509100c.
   - From downstream `gpucc-sdmmagpie.c`:
@@ -145,12 +148,12 @@ the GPU is untouched, so the everyday H4 behaviour stays the default.
    - Add `--blob NAME=path` to `tools/mkpayload.py`. The blobs go after the ramdisk, and each gets a
      `/chosen/memory-map` property (`GPU-SQE`, `GPU-GMU`, `GPU-ZAP-MDT`, `GPU-ZAP-B02`…, 16 bytes = pa, len),
      as in their 0120.
-   - `tools/sunfish/mkboot.sh` reads them from `~/ios-pixel/gpu-fw/fw/` when present. Boot images with blobs
+   - `tools/sunfish/mkboot.sh` reads them from `~/ios-pixel/gpu-fw/fw/` with `GPUFW=1`. Boot images with blobs
      stay out of git.
 2. **Probe framework.**
    - Add a `bsd/dev/sweet_gpu.c` skeleton: a thread starts about 40 s after boot when `sweetgpu=N`.
-   - Each step logs, then sleeps 2 s before any access that could hang, so the 0047 log (flushed about
-     once a second) holds the last good step.
+   - Each step logs, then sleeps 2 s before any access that could hang, so the 0047 log holds the last
+     good step. It flushes every `ufslogsecs` seconds (default 10), so GPU test boots pass `ufslogsecs=1`.
    - Check that `tools/sweet-log-pull.sh` recovers the log after a deliberate hang.
 3. **Register header.** Generate `a6xx` / `a6xx_gmu` / `adreno_pm4` offsets from Mesa's
    `src/freedreno/registers/adreno/*.xml` (MIT) with a small script. No hand-typed offsets.

@@ -1,0 +1,440 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c		standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_cpufreq_init(void);
++extern void sweet_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -677,6 +678,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_cpufreq_init();
++	sweet_gpu_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_cmddb_dump(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -43,7 +44,10 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_BCM          5u
++#define RH_ARC_LEVELS   16u      /* Linux rpmhpd RPMH_ARC_MAX_LEVELS */
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -354,5 +358,108 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * Read-only cmd-db listing for the GPU port (sweet_gpu.c): every ARC
++ * resource with its level table (aux = u16 vlvl per hlvl, as rpmhpd reads
++ * it), every BCM with its aux {le32 unit, le16 width, u8 vcd}, and the VRM
++ * names on summary lines. Touches only the cmd-db RAM and the RSC id
++ * registers rh_map() always reads; no TCS is written.
++ */
++static void
++rh_entry_id(uint32_t e, char id[9])
++{
++	uint32_t w[2] = { rh_read(rh_db, e), rh_read(rh_db, e + 4) };
++	for (unsigned i = 0; i < 8; ++i) {
++		char c = (char)(w[i / 4] >> (8u * (i % 4)));
++		id[i] = (c >= 0x20 && c < 0x7f) ? c : (c ? '?' : '\0');
++	}
++	id[8] = '\0';
++}
++
++static void
++rh_dump_entry(unsigned slave, uint32_t e, uint32_t aux)
++{
++	char id[9];
++	rh_entry_id(e, id);
++	uint32_t addr = rh_read(rh_db, e + 16);
++	uint32_t len = rh_db16(e + 20), off = aux + rh_db16(e + 22);
++	if (len && (!rh_range(off, len) || (off & 1u))) {
++		printf("SWEET RPMH:   %-8s addr=%#x aux len %u at %#x out of range\n", id, addr, len, off);
++		return;
++	}
++	if (slave == RH_ARC) {
++		char line[128];
++		int n = snprintf(line, sizeof(line), "SWEET RPMH:   ARC %-8s addr=%#x levels:", id, addr);
++		for (unsigned i = 0; i < len / 2u && i < RH_ARC_LEVELS && n > 0 && (size_t)n < sizeof(line); ++i) {
++			unsigned vlvl = rh_db16(off + 2u * i);
++			if (i && !vlvl) {
++				break;
++			}
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " %u", vlvl);
++		}
++		printf("%s\n", line);
++	} else if (slave == RH_BCM) {
++		if (len < 8) {
++			printf("SWEET RPMH:   BCM %-8s addr=%#x aux len %u\n", id, addr, len);
++			return;
++		}
++		uint32_t unit = rh_db16(off) | (uint32_t)rh_db16(off + 2) << 16;
++		printf("SWEET RPMH:   BCM %-8s addr=%#x unit=%u width=%u vcd=%u\n",
++		    id, addr, unit, rh_db16(off + 4), rh_db16(off + 6) & 0xffu);
++	}
++}
++
++int
++sweet_rpmh_cmddb_dump(void)
++{
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	for (unsigned i = 0; !error && i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < RH_ARC || slave > RH_BCM || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			error = EINVAL;
++			break;
++		}
++		printf("SWEET RPMH: cmd-db slave %u (%s) version=%#x entries=%u\n", slave,
++		    slave == RH_ARC ? "ARC" : slave == RH_VRM ? "VRM" : "BCM", rh_db16(h + 8), count);
++		if (slave != RH_VRM) {
++			for (unsigned j = 0; j < count; ++j) {
++				rh_dump_entry(slave, entries + RH_DB_ENTRY * j, aux);
++			}
++			continue;
++		}
++		/* VRM: names only, six to a line (each up to " ldoa10@0x3f000"). */
++		char line[160];
++		int n = 0;
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char id[9];
++			rh_entry_id(e, id);
++			if (j % 6 == 0) {
++				n = snprintf(line, sizeof(line), "SWEET RPMH:   VRM");
++			}
++			if (n > 0 && (size_t)n < sizeof(line)) {
++				n += snprintf(line + n, sizeof(line) - (size_t)n, " %s@%#x", id, rh_read(rh_db, e + 16));
++			}
++			if (j % 6 == 5 || j + 1 == count) {
++				printf("%s\n", line);
++			}
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,279 @@
++/*
++ * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md). Stage 0 only: read-only
++ * groundwork, no GPU, GMU or gpucc register is touched.
++ *
++ * Boot-arg sweetgpu=N (N >= 1) starts a thread sweetgpudelay seconds after
++ * boot (default 40, so the home screen is up first). It
++ *  - finds the firmware blobs mkpayload.py --blob put in /chosen/memory-map
++ *    (GPU-SQE, GPU-GMU, GPU-ZAP-MDT, GPU-ZAP-B02 = <phys, byte length>),
++ *    checks their headers and logs an FNV-1a hash to compare with the one
++ *    tools/sunfish/mkboot.sh prints;
++ *  - dumps the cmd-db ARC and BCM entries (sweet_rpmh.c) that the GPU rail
++ *    votes and the GMU PDC sequence will take their addresses from;
++ *  - reads the GPU speed bin from QFPROM (sdmmagpie-gpu.dtsi:
++ *    qcom,gpu-speed-bin = <0x41a0 0x1fe00000 21> on qfprom 0x780000;
++ *    bin = fmax / 4.8 MHz, 0 selects the default 825 MHz table).
++ * Before every access that could hang the bus it logs and sleeps
++ * SWEET_GPU_PAUSE_MS, so the persistent log (sweetlog=1 ufslogsecs=1) ends
++ * at the last good step. sweetgpuhang=1 then spins with interrupts off on
++ * purpose, to check that tools/sweet-log-pull.sh recovers such a log.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_cmddb_dump(void);
++void sweet_gpu_init(void);
++
++#define SWEET_GPU_DELAY_S       40u
++#define SWEET_GPU_PAUSE_MS      2000u
++#define GPU_BLOB_MAX            0x100000u
++#define GPU_GMU_ITCM_SIZE       0x8000u
++#define QFPROM_PA               0x780000u
++#define QFPROM_GPU_SPEED_BIN    0x41a0u
++#define GPU_SPEED_BIN_MASK      0x1fe00000u
++#define GPU_SPEED_BIN_SHIFT     21
++
++enum { BLOB_SQE, BLOB_GMU, BLOB_ZAP_MDT, BLOB_ZAP_B02, BLOB_COUNT };
++
++static const char *const gpu_blob_names[BLOB_COUNT] = {
++	"GPU-SQE", "GPU-GMU", "GPU-ZAP-MDT", "GPU-ZAP-B02",
++};
++
++static struct {
++	uint64_t pa;
++	uint32_t len;
++	const uint8_t *va;
++} gpu_blobs[BLOB_COUNT];
++
++static int gpu_level, gpu_hang;
++static uint32_t gpu_delay_s = SWEET_GPU_DELAY_S;
++static int gpu_sleep_chan;
++
++static void
++gpu_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Log what comes next, then give the persistent log time to reach the disk. */
++static void
++gpu_pause(const char *next)
++{
++	printf("SWEET GPU: next: %s (in %u ms)\n", next, SWEET_GPU_PAUSE_MS);
++	gpu_sleep_ms(SWEET_GPU_PAUSE_MS);
++}
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* Blob bytes are in RAM; read words without assuming alignment. */
++static uint32_t
++blob32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint32_t
++fnv1a(const uint8_t *p, uint32_t len)
++{
++	uint32_t h = 2166136261u;
++	for (uint32_t i = 0; i < len; ++i) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++static unsigned
++gpu_find_blobs(void)
++{
++	DTEntry chosen, mmap;
++	void const *prop;
++	unsigned int size;
++	uint64_t dram_base = 0, dram_size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "dram-base", &prop, &size) == kSuccess && size == 8) {
++		dram_base = *(uint64_t const *)prop;
++		if (SecureDTGetProperty(chosen, "dram-size", &prop, &size) == kSuccess && size == 8) {
++			dram_size = *(uint64_t const *)prop;
++		}
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap) != kSuccess) {
++		printf("SWEET GPU: no /chosen/memory-map\n");
++		return 0;
++	}
++	unsigned found = 0;
++	for (unsigned i = 0; i < BLOB_COUNT; ++i) {
++		DTMemoryMapRange const *r;
++		if (SecureDTGetProperty(mmap, gpu_blob_names[i], (void const **)&r, &size) != kSuccess) {
++			printf("SWEET GPU: %s: not in the boot payload (mkboot.sh GPUFW=1)\n", gpu_blob_names[i]);
++			continue;
++		}
++		/* mkpayload places blobs page-aligned inside kernel-managed RAM. */
++		if (size != sizeof(*r) || (r->paddr & PAGE_MASK) || r->length == 0 ||
++		    r->length > GPU_BLOB_MAX || r->paddr < dram_base ||
++		    r->paddr + r->length > dram_base + dram_size) {
++			printf("SWEET GPU: %s: bad range size=%u pa=%#lx len=%#lx (dram %#llx+%#llx)\n",
++			    gpu_blob_names[i], size, size == sizeof(*r) ? r->paddr : 0,
++			    size == sizeof(*r) ? r->length : 0, dram_base, dram_size);
++			continue;
++		}
++		gpu_blobs[i].pa = r->paddr;
++		gpu_blobs[i].len = (uint32_t)r->length;
++		vm_offset_t va = ml_static_ptovirt(r->paddr);
++		const uint8_t *p = (const uint8_t *)va;
++		gpu_blobs[i].va = p;
++		printf("SWEET GPU: %s pa=%#llx len=%u fnv1a=%08x words %08x %08x %08x %08x\n",
++		    gpu_blob_names[i], gpu_blobs[i].pa, gpu_blobs[i].len, fnv1a(p, gpu_blobs[i].len),
++		    blob32(p), gpu_blobs[i].len >= 8 ? blob32(p + 4) : 0,
++		    gpu_blobs[i].len >= 12 ? blob32(p + 8) : 0, gpu_blobs[i].len >= 16 ? blob32(p + 12) : 0);
++		++found;
++	}
++	return found;
++}
++
++/* Header checks only; the firmware is not loaded anywhere yet. */
++static void
++gpu_check_blobs(void)
++{
++	const uint8_t *p;
++	uint32_t len;
++
++	if ((p = gpu_blobs[BLOB_SQE].va)) {
++		len = gpu_blobs[BLOB_SQE].len;
++		/* Linux a6xx copies from dword 1 on; dword 0 is not microcode. */
++		bool ok = len >= 16 && !(len & 3u) && blob32(p) == 0;
++		printf("SWEET GPU: SQE %s: %u dwords, version word %#x\n",
++		    ok ? "ok" : "BAD", len / 4u, len >= 8 ? blob32(p + 4) : 0);
++	}
++	if ((p = gpu_blobs[BLOB_GMU].va)) {
++		len = gpu_blobs[BLOB_GMU].len;
++		/* Legacy (a618) image: the whole file goes to the CM3 ITCM; vector table first. */
++		uint32_t sp = len >= 8 ? blob32(p) : 0, reset = len >= 8 ? blob32(p + 4) : 0;
++		bool ok = len >= 8 && len <= GPU_GMU_ITCM_SIZE && !(len & 3u) && (reset & 1u) && reset < len;
++		printf("SWEET GPU: GMU %s: %u bytes, initial sp %#x, reset vector %#x\n",
++		    ok ? "ok" : "BAD", len, sp, reset);
++	}
++	uint32_t load_filesz = 0;
++	if ((p = gpu_blobs[BLOB_ZAP_MDT].va)) {
++		len = gpu_blobs[BLOB_ZAP_MDT].len;
++		uint32_t phoff = len >= 0x34 ? blob32(p + 0x1c) : 0;
++		unsigned phnum = len >= 0x34 ? (p[0x2c] | p[0x2d] << 8) : 0;
++		bool ok = len >= 0x34 && blob32(p) == 0x464c457fu && p[4] == 1 && phnum && phnum <= 8 &&
++		    phoff <= len && phnum * 32u <= len - phoff;
++		printf("SWEET GPU: ZAP-MDT %s: ELF32 phoff %#x phnum %u\n", ok ? "ok" : "BAD", phoff, phnum);
++		for (unsigned i = 0; ok && i < phnum; ++i) {
++			const uint8_t *ph = p + phoff + 32u * i;
++			printf("SWEET GPU:   ph%u type %#x off %#x pa %#x filesz %#x memsz %#x flags %#x\n", i,
++			    blob32(ph), blob32(ph + 4), blob32(ph + 12), blob32(ph + 16), blob32(ph + 20), blob32(ph + 24));
++			if (blob32(ph) == 1) {
++				load_filesz = blob32(ph + 16);
++			}
++		}
++	}
++	if (gpu_blobs[BLOB_ZAP_B02].va) {
++		printf("SWEET GPU: ZAP-B02 %s: %u bytes, MDT LOAD filesz %#x\n",
++		    gpu_blobs[BLOB_ZAP_B02].len == load_filesz ? "ok" : "BAD",
++		    gpu_blobs[BLOB_ZAP_B02].len, load_filesz);
++	}
++}
++
++static void
++gpu_speed_bin(void)
++{
++	gpu_pause("QFPROM speed-bin read at 0x7841a0");
++	vm_offset_t q = ml_io_map(QFPROM_PA + QFPROM_GPU_SPEED_BIN, 4);
++	if (!q) {
++		printf("SWEET GPU: QFPROM mapping failed\n");
++		return;
++	}
++	uint32_t raw = gpu_rd(q, 0);
++	unsigned bin = (raw & GPU_SPEED_BIN_MASK) >> GPU_SPEED_BIN_SHIFT;
++	printf("SWEET GPU: speed bin raw=%#x bin=%u -> %s fmax %u MHz\n", raw, bin,
++	    bin ? "table" : "default table,", bin ? bin * 48u / 10u : 825u);
++}
++
++static void
++gpu_cmddb(void)
++{
++	gpu_pause("cmd-db ARC/BCM dump");
++	for (unsigned tries = 0; tries < 10; ++tries) {
++		int error = sweet_rpmh_cmddb_dump();
++		if (error != EBUSY) {
++			if (error) {
++				printf("SWEET GPU: cmd-db dump failed errno=%d\n", error);
++			}
++			return;
++		}
++		gpu_sleep_ms(500);
++	}
++	printf("SWEET GPU: cmd-db busy (RPMh vote in progress); skipped\n");
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	uint64_t now_ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	uint64_t now_ms = now_ns / NSEC_PER_MSEC, at_ms = (uint64_t)gpu_delay_s * 1000u;
++	if (now_ms < at_ms) {
++		gpu_sleep_ms((unsigned)(at_ms - now_ms));
++	}
++	printf("SWEET GPU: stage 0 (sweetgpu=%d): firmware blobs, cmd-db, speed bin; no GPU registers\n",
++	    gpu_level);
++	if (gpu_level > 1) {
++		printf("SWEET GPU: stages above 0 are not built yet; running stage 0 only\n");
++	}
++	unsigned found = gpu_find_blobs();
++	gpu_check_blobs();
++	printf("SWEET GPU: %u of %u firmware blobs present\n", found, (unsigned)BLOB_COUNT);
++	gpu_cmddb();
++	gpu_speed_bin();
++	printf("SWEET GPU: stage 0 done\n");
++	if (gpu_hang == 1) {
++		gpu_pause("deliberate hang (sweetgpuhang=1): interrupts off, spinning; pull the log from recovery");
++		(void)ml_set_interrupts_enabled(FALSE);
++		for (;;) {
++			__asm__ volatile("wfe");
++		}
++	}
++}
++
++void
++sweet_gpu_init(void)
++{
++	(void)PE_parse_boot_argn("sweetgpu", &gpu_level, sizeof(gpu_level));
++	if (gpu_level <= 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetgpuhang", &gpu_hang, sizeof(gpu_hang));
++	(void)PE_parse_boot_argn("sweetgpudelay", &gpu_delay_s, sizeof(gpu_delay_s));
++	if (gpu_delay_s > 600) {
++		gpu_delay_s = SWEET_GPU_DELAY_S;
++	}
++	thread_t thread;
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET GPU: probe thread starts %u s after boot\n", gpu_delay_s);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
