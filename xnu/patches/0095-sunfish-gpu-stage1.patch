@@ -1,0 +1,472 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,9 +1,9 @@
+ /*
+- * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md). Stage 0 only: read-only
+- * groundwork, no GPU, GMU or gpucc register is touched.
++ * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md), stages 0 and 1.
+  *
+  * Boot-arg sweetgpu=N (N >= 1) starts a thread sweetgpudelay seconds after
+- * boot (default 40, so the home screen is up first). It
++ * boot (default 40, so the home screen is up first). Stage 0 (N >= 1) only
++ * reads; no GPU, GMU or gpucc register is touched. It
+  *  - finds the firmware blobs mkpayload.py --blob put in /chosen/memory-map
+  *    (GPU-SQE, GPU-GMU, GPU-ZAP-MDT, GPU-ZAP-B02 = <phys, byte length>),
+  *    checks their headers and logs an FNV-1a hash to compare with the one
+@@ -13,10 +13,26 @@
+  *  - reads the GPU speed bin from QFPROM (sdmmagpie-gpu.dtsi:
+  *    qcom,gpu-speed-bin = <0x41a0 0x1fe00000 21> on qfprom 0x780000;
+  *    bin = fmax / 4.8 MHz, 0 selects the default 825 MHz table).
++ * Stage 1 (N >= 2) powers the CX side the way the downstream sunfish kernel
++ * does before it boots the GMU (gcc-sdmmagpie.c, gpucc-sdmmagpie.c,
++ * gdsc-regulator.c with sdmmagpie-gdsc.dtsi, and the kgsl GMU clock list):
++ *  - GCC: GPLL0 and GPLL0-div votes for gpucc, then the ddrss_gpu_axi,
++ *    gpu_memnoc_gfx and gpu_snoc_dvm_gfx branches (gpu_cfg_ahb is critical
++ *    and already on; it is what makes gpucc reachable);
++ *  - gpucc: CX GDSC on, GMU RCG to 200 MHz (GPLL0 div / 1.5), then the ahb,
++ *    cxo, cx_gmu, cx_snoc_dvm and cx_apb branches;
++ *  - reads CX-side GMU registers, the GMU always-on counter, the first ITCM
++ *    words and cx_misc.
++ * GX stays off: nothing in the 0x5000000 GPU block is touched, and the gx_*
++ * clocks, the GX GDSC and the GPU PLLs are only read. GMU and cx_misc offsets
++ * come from the generated sweet_gpu_regs.h; GCC and gpucc offsets from the
++ * downstream drivers above. Everything stays on after stage 1.
+  * Before every access that could hang the bus it logs and sleeps
+  * SWEET_GPU_PAUSE_MS, so the persistent log (sweetlog=1 ufslogsecs=1) ends
+- * at the last good step. sweetgpuhang=1 then spins with interrupts off on
+- * purpose, to check that tools/sweet-log-pull.sh recovers such a log.
++ * at the last good step, and every step logs its result: one stuck core does
++ * not stop iOS, so a "next:" line with no result after it marks the hang.
++ * sweetgpuhang=1 then spins with interrupts off on purpose, to check that
++ * tools/sweet-log-pull.sh recovers such a log.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -28,6 +44,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include "sweet_gpu_regs.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_cmddb_dump(void);
+@@ -42,6 +59,54 @@
+ #define GPU_SPEED_BIN_MASK      0x1fe00000u
+ #define GPU_SPEED_BIN_SHIFT     21
+ 
++/* Stage 1. GCC (gcc-sdmmagpie.c) */
++#define GCC_PA                  0x00100000u
++#define GCC_SIZE                0x00080000u
++#define GCC_DDRSS_GPU_AXI_CBCR  0x4452cu
++#define GCC_APCS_CLOCK_VOTE     0x52004u
++#define GCC_VOTE_GPU_GPLL0      (1u << 15)
++#define GCC_VOTE_GPU_GPLL0_DIV  (1u << 16)
++#define GCC_GPU_CFG_AHB_CBCR    0x71004u
++#define GCC_GPU_MEMNOC_GFX_CBCR 0x7100cu
++#define GCC_GPU_SNOC_DVM_CBCR   0x71018u
++#define GCC_GPU_MISC            0x71028u
++/* gpucc (gpucc-sdmmagpie.c, sdmmagpie-gdsc.dtsi) */
++#define GPUCC_PA                0x05090000u
++#define GPUCC_SIZE              0x9000u
++#define GPUCC_PLL0              0x0000u         /* Fabia: +0 MODE, +4 L */
++#define GPUCC_PLL1              0x0100u
++#define GPUCC_GX_GDSCR          0x100cu
++#define GPUCC_CX_GDSCR          0x106cu
++#define GPUCC_AHB_CBCR          0x1078u
++#define GPUCC_CX_APB_CBCR       0x1088u
++#define GPUCC_CX_SNOC_DVM_CBCR  0x108cu
++#define GPUCC_CX_GMU_CBCR       0x1098u
++#define GPUCC_CXO_CBCR          0x109cu
++#define GPUCC_GMU_RCG           0x1120u         /* +0 CMD, +4 CFG */
++#define GPUCC_GX_DOMAIN         0x1508u         /* bit 0: GX clamp_io */
++#define GPUCC_CX_GDS_HW_CTRL    0x1540u         /* hw-ctrl-addr: CX GDSC status */
++/* GMU and cx_misc (sdmmagpie-gpu.dtsi); sweet_gpu_regs.h offsets are dwords from GPU_PA */
++#define GPU_PA                  0x05000000u
++#define GMU_PA                  0x0506a000u
++#define GMU_SIZE                0x31000u
++#define CX_MISC_PA              0x0509e000u
++#define CX_MISC_SIZE            0x1000u
++
++#define CBCR_CLK_OFF            (1u << 31)
++#define CBCR_CLK_ENABLE         (1u << 0)
++#define CBCR_GMU_WAKE_SLEEP     (0xffu << 4)    /* gpucc probe: cx_gmu wake [11:8], sleep [7:4] = 0xf */
++#define GDSC_PWR_ON             (1u << 31)
++#define GDSC_CLK_DIS_WAIT_SHIFT 12
++#define GDSC_CLK_DIS_WAIT_MASK  (0xfu << GDSC_CLK_DIS_WAIT_SHIFT)
++#define GDSC_CX_CLK_DIS_WAIT    8u              /* qcom,clk-dis-wait-val */
++#define GDSC_SW_OVERRIDE        (1u << 2)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_TIMEOUT_US         500u            /* qcom,gds-timeout */
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CFG_MASK            (0x1fu | (7u << 8) | (3u << 12) | (1u << 20))
++#define RCG_CFG_GMU_200MHZ      ((6u << 8) | 2u) /* gpll0_out_main_div (300 MHz), divider 1.5 */
++
+ enum { BLOB_SQE, BLOB_GMU, BLOB_ZAP_MDT, BLOB_ZAP_B02, BLOB_COUNT };
+ 
+ static const char *const gpu_blob_names[BLOB_COUNT] = {
+@@ -83,6 +148,27 @@
+ 	return v;
+ }
+ 
++static void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Poll every 1 us until (reg & mask) == want; false after us tries. */
++static bool
++gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; ++i) {
++		if ((gpu_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (gpu_rd(base, off) & mask) == want;
++}
++
+ /* Blob bytes are in RAM; read words without assuming alignment. */
+ static uint32_t
+ blob32(const uint8_t *p)
+@@ -227,6 +313,241 @@
+ 	printf("SWEET GPU: cmd-db busy (RPMh vote in progress); skipped\n");
+ }
+ 
++struct gpu_branch {
++	const char *name;
++	uint32_t cbcr;
++	bool halt;      /* BRANCH_HALT / BRANCH_VOTED: CLK_OFF must clear. Else BRANCH_HALT_DELAY. */
++};
++
++static const struct gpu_branch gpu_gcc_branches[] = {
++	{ "gcc_ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, true },
++	{ "gcc_gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, true },
++	{ "gcc_gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_CBCR, true },
++};
++
++static const struct gpu_branch gpu_cc_branches[] = {
++	{ "gpu_cc_ahb", GPUCC_AHB_CBCR, false },
++	{ "gpu_cc_cxo", GPUCC_CXO_CBCR, true },
++	{ "gpu_cc_cx_gmu", GPUCC_CX_GMU_CBCR, true },
++	{ "gpu_cc_cx_snoc_dvm", GPUCC_CX_SNOC_DVM_CBCR, false },
++	{ "gpu_cc_cx_apb", GPUCC_CX_APB_CBCR, false },
++};
++
++static bool
++gpu_branch_on(vm_offset_t base, const struct gpu_branch *b)
++{
++	uint32_t before = gpu_rd(base, b->cbcr);
++	if (!(before & CBCR_CLK_ENABLE)) {
++		gpu_wr(base, b->cbcr, before | CBCR_CLK_ENABLE);
++	}
++	bool ok = true;
++	if (b->halt) {
++		ok = gpu_poll(base, b->cbcr, CBCR_CLK_OFF, 0, 200);
++	} else {
++		delay(10);
++	}
++	printf("SWEET GPU:   %-20s cbcr 0x%08x -> 0x%08x %s\n", b->name, before, gpu_rd(base, b->cbcr),
++	    !ok ? "STILL OFF" : b->halt ? "on" : "enabled (no halt status)");
++	return ok;
++}
++
++/* gpucc is reachable only while gcc_gpu_cfg_ahb runs (cc == 0: GCC only). */
++static void
++gpu_log_clocks(vm_offset_t gcc, vm_offset_t cc, const char *when)
++{
++	printf("SWEET GPU: GCC %s: gpu_cfg_ahb 0x%08x ddrss_gpu_axi 0x%08x memnoc_gfx 0x%08x snoc_dvm_gfx 0x%08x "
++	    "vote 0x%08x gpu_misc 0x%08x\n", when, gpu_rd(gcc, GCC_GPU_CFG_AHB_CBCR),
++	    gpu_rd(gcc, GCC_DDRSS_GPU_AXI_CBCR), gpu_rd(gcc, GCC_GPU_MEMNOC_GFX_CBCR),
++	    gpu_rd(gcc, GCC_GPU_SNOC_DVM_CBCR), gpu_rd(gcc, GCC_APCS_CLOCK_VOTE), gpu_rd(gcc, GCC_GPU_MISC));
++	if (!cc) {
++		return;
++	}
++	printf("SWEET GPU: gpucc %s: cx_gdscr 0x%08x hw_ctrl 0x%08x gx_gdscr 0x%08x gx_domain 0x%08x "
++	    "gmu_rcg 0x%08x/0x%08x\n", when, gpu_rd(cc, GPUCC_CX_GDSCR), gpu_rd(cc, GPUCC_CX_GDS_HW_CTRL),
++	    gpu_rd(cc, GPUCC_GX_GDSCR), gpu_rd(cc, GPUCC_GX_DOMAIN), gpu_rd(cc, GPUCC_GMU_RCG),
++	    gpu_rd(cc, GPUCC_GMU_RCG + 4u));
++	printf("SWEET GPU: gpucc %s: ahb 0x%08x cxo 0x%08x cx_gmu 0x%08x cx_snoc_dvm 0x%08x cx_apb 0x%08x "
++	    "pll0 0x%08x L %#x pll1 0x%08x L %#x\n", when, gpu_rd(cc, GPUCC_AHB_CBCR), gpu_rd(cc, GPUCC_CXO_CBCR),
++	    gpu_rd(cc, GPUCC_CX_GMU_CBCR), gpu_rd(cc, GPUCC_CX_SNOC_DVM_CBCR), gpu_rd(cc, GPUCC_CX_APB_CBCR),
++	    gpu_rd(cc, GPUCC_PLL0), gpu_rd(cc, GPUCC_PLL0 + 4u), gpu_rd(cc, GPUCC_PLL1), gpu_rd(cc, GPUCC_PLL1 + 4u));
++}
++
++static bool
++gpu_gcc_on(vm_offset_t gcc)
++{
++	uint32_t vote = gpu_rd(gcc, GCC_APCS_CLOCK_VOTE);
++	gpu_wr(gcc, GCC_APCS_CLOCK_VOTE, vote | GCC_VOTE_GPU_GPLL0 | GCC_VOTE_GPU_GPLL0_DIV);
++	delay(10);      /* BRANCH_HALT_DELAY */
++	printf("SWEET GPU:   gcc vote 0x%08x -> 0x%08x (gpu_gpll0, gpu_gpll0_div)\n", vote,
++	    gpu_rd(gcc, GCC_APCS_CLOCK_VOTE));
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(gpu_gcc_branches) / sizeof(gpu_gcc_branches[0]); ++i) {
++		ok = gpu_branch_on(gcc, &gpu_gcc_branches[i]) && ok;
++	}
++	return ok;
++}
++
++/* gdsc-regulator.c: probe (software sequencing, clk-dis-wait) then enable. */
++static bool
++gpu_cx_gdsc_on(vm_offset_t cc)
++{
++	uint32_t v = gpu_rd(cc, GPUCC_CX_GDSCR), hw = gpu_rd(cc, GPUCC_CX_GDS_HW_CTRL);
++	if ((hw & GDSC_PWR_ON) && !(v & GDSC_SW_COLLAPSE)) {
++		printf("SWEET GPU:   CX GDSC already on: gdscr 0x%08x hw_ctrl 0x%08x\n", v, hw);
++		return true;
++	}
++	uint32_t cfg = (v & ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_CLK_DIS_WAIT_MASK)) |
++	    (GDSC_CX_CLK_DIS_WAIT << GDSC_CLK_DIS_WAIT_SHIFT);
++	gpu_wr(cc, GPUCC_CX_GDSCR, cfg);
++	gpu_wr(cc, GPUCC_CX_GDSCR, cfg & ~GDSC_SW_COLLAPSE);
++	delay(1);       /* 8 XO cycles before the first status read */
++	bool ok = gpu_poll(cc, GPUCC_CX_GDS_HW_CTRL, GDSC_PWR_ON, GDSC_PWR_ON, 2u * GDSC_TIMEOUT_US);
++	printf("SWEET GPU:   CX GDSC gdscr 0x%08x -> 0x%08x, hw_ctrl 0x%08x -> 0x%08x: %s\n", v,
++	    gpu_rd(cc, GPUCC_CX_GDSCR), hw, gpu_rd(cc, GPUCC_CX_GDS_HW_CTRL), ok ? "on" : "TIMEOUT");
++	return ok;
++}
++
++static bool
++gpu_gmu_rcg_200mhz(vm_offset_t cc)
++{
++	uint32_t cmd = gpu_rd(cc, GPUCC_GMU_RCG), cfg = gpu_rd(cc, GPUCC_GMU_RCG + 4u);
++	if ((cfg & RCG_CFG_MASK) == RCG_CFG_GMU_200MHZ) {
++		printf("SWEET GPU:   GMU RCG already 200 MHz: cmd 0x%08x cfg 0x%08x\n", cmd, cfg);
++		return true;
++	}
++	gpu_wr(cc, GPUCC_GMU_RCG + 4u, (cfg & ~RCG_CFG_MASK) | RCG_CFG_GMU_200MHZ);
++	gpu_wr(cc, GPUCC_GMU_RCG, cmd | RCG_CMD_UPDATE);
++	bool ok = gpu_poll(cc, GPUCC_GMU_RCG, RCG_CMD_UPDATE, 0, 500);
++	printf("SWEET GPU:   GMU RCG cmd 0x%08x -> 0x%08x, cfg 0x%08x -> 0x%08x: %s\n", cmd,
++	    gpu_rd(cc, GPUCC_GMU_RCG), cfg, gpu_rd(cc, GPUCC_GMU_RCG + 4u), ok ? "200 MHz" : "UPDATE TIMEOUT");
++	return ok;
++}
++
++static bool
++gpu_cc_on(vm_offset_t cc)
++{
++	gpu_wr(cc, GPUCC_CX_GMU_CBCR, gpu_rd(cc, GPUCC_CX_GMU_CBCR) | CBCR_GMU_WAKE_SLEEP);
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(gpu_cc_branches) / sizeof(gpu_cc_branches[0]); ++i) {
++		ok = gpu_branch_on(cc, &gpu_cc_branches[i]) && ok;
++	}
++	return ok;
++}
++
++/* reg is a dword offset from GPU_PA, as in sweet_gpu_regs.h. */
++static uint32_t
++gmu_rd(vm_offset_t gmu, uint32_t reg)
++{
++	uint32_t off = reg * 4u - (GMU_PA - GPU_PA);
++	if (reg * 4u < GMU_PA - GPU_PA || off >= GMU_SIZE) {
++		printf("SWEET GPU: register %#x is outside the GMU block\n", reg);
++		return 0xffffffffu;
++	}
++	return gpu_rd(gmu, off);
++}
++
++static uint64_t
++gmu_alwayson(vm_offset_t gmu)
++{
++	uint32_t hi = gmu_rd(gmu, REG_A6XX_GMU_ALWAYS_ON_COUNTER_H), lo, hi2;
++	for (;;) {
++		lo = gmu_rd(gmu, REG_A6XX_GMU_ALWAYS_ON_COUNTER_L);
++		hi2 = gmu_rd(gmu, REG_A6XX_GMU_ALWAYS_ON_COUNTER_H);
++		if (hi2 == hi) {
++			return (uint64_t)hi << 32 | lo;
++		}
++		hi = hi2;
++	}
++}
++
++static void
++gpu_gmu_reads(vm_offset_t gmu, vm_offset_t cc)
++{
++	static const struct {
++		const char *name;
++		uint32_t reg;
++	} regs[] = {
++		{ "CM3_SYSRESET", REG_A6XX_GMU_CM3_SYSRESET },
++		{ "CM3_BOOT_CONFIG", REG_A6XX_GMU_CM3_BOOT_CONFIG },
++		{ "CM3_FW_BUSY", REG_A6XX_GMU_CM3_FW_BUSY },
++		{ "CM3_FW_INIT_RESULT", REG_A6XX_GMU_CM3_FW_INIT_RESULT },
++		{ "HFI_CTRL_STATUS", REG_A6XX_GMU_HFI_CTRL_STATUS },
++		{ "HFI_VERSION_INFO", REG_A6XX_GMU_HFI_VERSION_INFO },
++		{ "SPTPRAC_PWR_CLK_STATUS", REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS },
++		{ "CX_GMU_RPMH_POWER_STATE", REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE },
++		{ "AO_GPU_CX_BUSY_STATUS", REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS },
++		{ "AO_AHB_FENCE_CTRL", REG_A6XX_GMU_AO_AHB_FENCE_CTRL },
++		{ "AHB_FENCE_STATUS", REG_A6XX_GMU_AHB_FENCE_STATUS },
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		printf("SWEET GPU:   GMU %-24s [0x%05x] = 0x%08x\n", regs[i].name, regs[i].reg, gmu_rd(gmu, regs[i].reg));
++	}
++	uint32_t sp = gmu_rd(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
++	printf("SWEET GPU:   GX side: HM GDSC %s, HM clock %s, gx_gdscr 0x%08x\n",
++	    (sp & A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF__MASK) ? "off" : "ON",
++	    (sp & A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF__MASK) ? "off" : "ON", gpu_rd(cc, GPUCC_GX_GDSCR));
++	/* XO-clocked: about 19200 ticks per millisecond if it runs. */
++	uint64_t t0 = gmu_alwayson(gmu);
++	delay(1000);
++	uint64_t t1 = gmu_alwayson(gmu);
++	printf("SWEET GPU:   GMU always-on counter %llu -> %llu (+%llu in 1 ms)\n", t0, t1, t1 - t0);
++}
++
++static void
++gpu_stage1(void)
++{
++	printf("SWEET GPU: stage 1 (sweetgpu=%d): CX clocks and GDSC, then CX-side reads; GX untouched\n", gpu_level);
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE), cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE), cxm = ml_io_map(CX_MISC_PA, CX_MISC_SIZE);
++	if (!gcc || !cc || !gmu || !cxm) {
++		printf("SWEET GPU: stage 1 mapping failed\n");
++		return;
++	}
++	bool ahb = !(gpu_rd(gcc, GCC_GPU_CFG_AHB_CBCR) & CBCR_CLK_OFF);
++	gpu_log_clocks(gcc, ahb ? cc : 0, "before");
++	if (!ahb) {
++		static const struct gpu_branch cfg_ahb = { "gcc_gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR, true };
++		gpu_pause("gcc_gpu_cfg_ahb on (it is off, so gpucc is unreachable)");
++		if (!gpu_branch_on(gcc, &cfg_ahb)) {
++			printf("SWEET GPU: stage 1 stopped: gcc_gpu_cfg_ahb\n");
++			return;
++		}
++		gpu_log_clocks(gcc, cc, "with gpu_cfg_ahb");
++	}
++	gpu_pause("GCC GPU branches and GPLL0 votes");
++	if (!gpu_gcc_on(gcc)) {
++		printf("SWEET GPU: stage 1 stopped: GCC branches\n");
++		return;
++	}
++	gpu_pause("CX GDSC on (gpucc 0x509106c)");
++	if (!gpu_cx_gdsc_on(cc)) {
++		printf("SWEET GPU: stage 1 stopped: CX GDSC\n");
++		return;
++	}
++	gpu_pause("GMU RCG to 200 MHz (gpucc 0x5091120)");
++	if (!gpu_gmu_rcg_200mhz(cc)) {
++		printf("SWEET GPU: stage 1 stopped: GMU RCG\n");
++		return;
++	}
++	gpu_pause("gpucc CX branches: ahb, cxo, cx_gmu, cx_snoc_dvm, cx_apb");
++	bool cx = gpu_cc_on(cc);
++	gpu_log_clocks(gcc, cc, "after");
++	if (!cx) {
++		printf("SWEET GPU: stage 1 stopped: gpucc branches\n");
++		return;
++	}
++	gpu_pause("GMU register reads (CX side of 0x506a000)");
++	gpu_gmu_reads(gmu, cc);
++	gpu_pause("GMU ITCM read (0x506d000)");
++	printf("SWEET GPU:   ITCM %08x %08x %08x %08x\n", gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START),
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 1u), gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 2u),
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 3u));
++	gpu_pause("cx_misc read (0x509e000)");
++	printf("SWEET GPU:   cx_misc SYSTEM_CACHE_CNTL_0 0x%08x _1 0x%08x\n",
++	    gpu_rd(cxm, REG_A6XX_SYSTEM_CACHE_CNTL_0 * 4u), gpu_rd(cxm, REG_A6XX_SYSTEM_CACHE_CNTL_1 * 4u));
++	printf("SWEET GPU: stage 1 done; CX clocks and GDSC stay on\n");
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -240,8 +561,8 @@
+ 	}
+ 	printf("SWEET GPU: stage 0 (sweetgpu=%d): firmware blobs, cmd-db, speed bin; no GPU registers\n",
+ 	    gpu_level);
+-	if (gpu_level > 1) {
+-		printf("SWEET GPU: stages above 0 are not built yet; running stage 0 only\n");
++	if (gpu_level > 2) {
++		printf("SWEET GPU: stages above 1 are not built yet; running stages 0 and 1\n");
+ 	}
+ 	unsigned found = gpu_find_blobs();
+ 	gpu_check_blobs();
+@@ -249,6 +570,9 @@
+ 	gpu_cmddb();
+ 	gpu_speed_bin();
+ 	printf("SWEET GPU: stage 0 done\n");
++	if (gpu_level >= 2) {
++		gpu_stage1();
++	}
+ 	if (gpu_hang == 1) {
+ 		gpu_pause("deliberate hang (sweetgpuhang=1): interrupts off, spinning; pull the log from recovery");
+ 		(void)ml_set_interrupts_enabled(FALSE);
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_regs.h
+@@ -0,0 +1,71 @@
++/*
++ * Generated by tools/sunfish/gen-adreno-regs.py --chip 6 --only ^(REG_)?A6XX_(GMU_CM3_(SYSRESET|BOOT_CONFIG|FW_BUSY|FW_INIT_RESULT|ITCM_START|DTCM_START)|GMU_ALWAYS_ON_COUNTER_[LH]|GMU_SPTPRAC_PWR_CLK_STATUS|GMU_HFI_(CTRL_STATUS|VERSION_INFO)|GPU_GMU_CX_GMU_RPMH_POWER_STATE|GMU_AO_AHB_FENCE_CTRL|GMU_AHB_FENCE_STATUS|GPU_GMU_AO_GPU_CX_BUSY_STATUS|SYSTEM_CACHE_CNTL_[01]) --single sweet_gpu_regs.h; do not edit.
++ * Source: a6xx.xml, a6xx_gmu.xml from torvalds/linux 5b0764a53235d3c77e1ed674e836e1b3fe1a4b1f drivers/gpu/drm/msm/registers/adreno
++ *
++ * freedreno register database. Copyright 2013 Rob Clark, Ilia Mirkin and contributors.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE COPYRIGHT OWNER(S) AND/OR ITS SUPPLIERS BE
++ * LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++ * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++ * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++#ifndef SWEET_GPU_REGS_H
++#define SWEET_GPU_REGS_H
++
++/* domain A6XX_CX_MISC */
++#define REG_A6XX_SYSTEM_CACHE_CNTL_0                             0x00001u
++#define REG_A6XX_SYSTEM_CACHE_CNTL_1                             0x00002u
++
++/* domain A6XX */
++#define REG_A6XX_GMU_CM3_ITCM_START                              0x1b400u
++#define REG_A6XX_GMU_CM3_DTCM_START                              0x1c400u
++#define REG_A6XX_GMU_CM3_SYSRESET                                0x1f800u
++#define REG_A6XX_GMU_CM3_BOOT_CONFIG                             0x1f801u
++#define REG_A6XX_GMU_CM3_FW_BUSY                                 0x1f81au
++#define REG_A6XX_GMU_CM3_FW_INIT_RESULT                          0x1f81cu
++#define REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS                      0x1f8d0u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWERING_OFF__MASK 0x00000001u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWERING_OFF__SHIFT 0
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWERING_ON__MASK 0x00000002u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWERING_ON__SHIFT 1
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_OFF__MASK 0x00000004u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_OFF__SHIFT 2
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_ON__MASK 0x00000008u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_ON__SHIFT 3
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SP_CLOCK_OFF__MASK       0x00000010u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SP_CLOCK_OFF__SHIFT      4
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GMU_UP_POWER_STATE__MASK 0x00000020u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GMU_UP_POWER_STATE__SHIFT 5
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF__MASK 0x00000040u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF__SHIFT 6
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF__MASK      0x00000080u
++#define A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF__SHIFT     7
++#define REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE                 0x1f8ecu
++#define REG_A6XX_GMU_ALWAYS_ON_COUNTER_L                         0x1f888u
++#define REG_A6XX_GMU_ALWAYS_ON_COUNTER_H                         0x1f889u
++#define REG_A6XX_GMU_HFI_CTRL_STATUS                             0x1f980u
++#define REG_A6XX_GMU_HFI_VERSION_INFO                            0x1f981u
++#define REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS                   0x23b0cu
++#define A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB__MASK   0x00800000u
++#define A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB__SHIFT  23
++#define REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS2                  0x23b0du
++#define REG_A6XX_GMU_AO_AHB_FENCE_CTRL                           0x23b10u
++#define REG_A6XX_GMU_AHB_FENCE_STATUS                            0x23b13u
++#define REG_A6XX_GMU_AHB_FENCE_STATUS_CLR                        0x23b14u
++
++#endif /* SWEET_GPU_REGS_H */

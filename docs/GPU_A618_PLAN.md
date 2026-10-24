@@ -1,6 +1,7 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **plan only, nothing is built or flashed yet.** The firmware is extracted. The hardware facts
+Status, 2026-10-25: **Stage 0 passed on the phone; Stage 1 is built (patch 0095), not yet booted.** Nothing is
+flashed: every test is a `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
 
@@ -217,6 +218,35 @@ notices a stuck core. For later stages this means:
 
 ✅ Pass when the log shows sane GMU/CX values and the phone keeps running.
 
+**Built (patch 0095, `sweetgpu=2`).** It runs after stage 0, in this order. Each step has its own `next:`
+pause and logs before/after values:
+
+1. If `gcc_gpu_cfg_ahb` (critical in Linux) is off, turn it on. gpucc is unreachable without it.
+2. GCC: set the `gpu_gpll0` and `gpu_gpll0_div` votes (0x52004 bits 15 and 16). Then turn on
+   `ddrss_gpu_axi` (0x4452c), `gpu_memnoc_gfx` (0x7100c) and `gpu_snoc_dvm_gfx` (0x71018) and wait for
+   CLK_OFF to clear.
+3. CX GDSC, following gdsc-regulator.c:
+   - Clear HW_CONTROL and SW_OVERRIDE.
+   - Set CLK_DIS_WAIT to 8.
+   - Clear SW_COLLAPSE.
+   - Poll PWR_ON at the hw-ctrl address 0x5091540 for up to 1 ms.
+4. GMU RCG (0x5091120): CFG = source 6 (GPLL0 div, 300 MHz), divider 1.5 → 200 MHz. Then UPDATE.
+5. Set wake/sleep 0xf on cx_gmu, as gpucc probe does. Then turn on ahb, cxo, cx_gmu, cx_snoc_dvm and
+   cx_apb.
+6. Reads:
+   - GMU CM3/HFI/SPTPRAC/RPMh-state/AO/fence registers.
+   - The always-on counter twice, 1 ms apart (expect ~19200 ticks).
+   - The first 4 ITCM words.
+   - cx_misc SYSTEM_CACHE_CNTL_0/1.
+
+GMU offsets come from `sweet_gpu_regs.h`, a filtered copy made by
+`gen-adreno-regs.py --only … --single sweet_gpu_regs.h`. They count from 0x5000000, as upstream
+`gmu_read()` does; the probe subtracts 0x6a000 for the GMU mapping. GCC and gpucc offsets come from
+gcc-/gpucc-sdmmagpie.c.
+
+GX is never written. Its GDSCR, clamp register and PLLs are only read, through gpucc. Everything stays on
+afterwards, because Stage 2 builds on it.
+
 ### Stage 2: GX power (decision gate)
 
 **2A: GMU-less, host-driven (try first).** Every step reuses what we have and is observable on its own.
@@ -401,4 +431,5 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stage 0 passed, including the hang test. Next is Stage 1: CX clocks and GDSC, and CX-domain reads only.
+Stage 0 passed, including the hang test. Stage 1 is built as patch 0095. Next: boot image G1
+(`sweetgpu=2`), pull the log, and check it against the Stage 1 pass criterion.
