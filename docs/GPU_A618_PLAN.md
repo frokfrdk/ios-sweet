@@ -1,6 +1,7 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2 is next.** Nothing is
+Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A is built (patch
+0097, `sweetgpu=3`) and not yet booted.** Nothing is
 flashed: every test is a `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
@@ -345,6 +346,38 @@ Risks:
 - Levels are abstract corners, so a wrong vote cannot over-volt the rail. The worst case is a hang and
   reboot, which `fastboot boot` makes harmless.
 
+**Built (patch 0097, `sweetgpu=3`).** It runs after stage 1 passes. The order follows the downstream drivers
+(gdsc-regulator.c, clk-alpha-pll.c, clk-rcg2.c) instead of the list above. Each step logs a "next:" line
+first, and the stage stops at the first failure:
+
+| Step | What it writes | Check |
+|---|---|---|
+| 1. `mx.lvl` vote | one ACTIVE TCS command, data = hlvl | TCS completion |
+| 2. `gfx.lvl` vote | the same | TCS completion |
+| 3. PLL0 | L 0x12, FRAC 0xc000 (360 MHz), CAL_L 0x3f, the downstream config/user/test values, even post-divider 2; out of reset, RUN, then the outputs | lock bit within 200 µs |
+| 4. gfx3d RCG (0x509101c) | ROOT_EN, then CFG = crc_div / 1 (180 MHz) and UPDATE | ROOT_OFF clears; UPDATE clears |
+| 5. GX GDSC (0x509100c) | BCR 0x5091008 pulse, GMEM reset pulse and unclamp in 0x5091508, clear SW_COLLAPSE | PWR_ON within 500 µs; on timeout it collapses and clamps again |
+| 6. GX branches | gx_cxo, gx_gmu, gx_gfx3d, cx_gfx3d enable bits | CLK_OFF clears (gx_cxo, gx_gmu) |
+| 7. SPTP | `GMU_GX_SPTPRAC_POWER_CONTROL` = 0x778000 | status & 0x38 == 0x28 |
+| 8. GX reads | none | only if the GMU's GX head-switch and clock bits read on |
+
+How it differs from the plan:
+- Both votes ask for vlvl ≥ 64 (LOW_SVS), mapped to an hlvl the way rpmhpd does it. 64 is what
+  gdsc-regulator.c votes on the GX GDSC's parent. 180 MHz needs MIN_SVS (48), and gfx.lvl has no level
+  below 64. So gfx gets hlvl 2 (vlvl 64), and mx gets hlvl 2 (vlvl 192, its lowest active level). mx is
+  voted first so that it stays ≥ gfx. `sweet_rpmh_arc_vote` accepts only these two resources and vlvl ≤ 64.
+- There is no ARC status read-back from the apps side. The GX GDSC reaching PWR_ON, and the GMU's
+  `GX_HM_GDSC_POWER_OFF` bit clearing, are the evidence that the rail came up.
+- The fence is not written: it already reads 0 (G1b).
+- PLL0 runs at 360 MHz with the even divider at 2. This is the downstream config's own L and alpha, and it
+  sits inside both Fabia VCO ranges. Linux would reach 180 MHz either this way or with the PLL at 180 MHz.
+- No GBIF/VBIF version read: a618 has a GBIF, and the register XML has no version register for it
+  (`VBIF_VERSION` belongs to a630's VBIF). The reads are `RBBM_STATUS`, `STATUS1-3`, `RBBM_CLOCK_CNTL` and
+  the CP always-on counter twice, next to the GMU counter.
+- The gx_* branch registers are read only after the GX GDSC is on.
+- Everything stays on afterwards. The votes are ACTIVE only; iOS never enters the system sleep that would
+  drop them.
+
 **2B: the real GMU path (fallback; it is what mainline Linux does for a618).**
 
 1. Load `a618_gmu.bin` into ITCM (legacy raw image; at most 0x8000 bytes).
@@ -505,6 +538,6 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 ## 9. Next concrete step
 
 Stages 0 and 1 passed on the phone. Stage 1 needed one fix: patch 0096 turns the CX GDSC on before the GCC
-GPU branches. Next is Stage 2, the GX power decision gate; try 2A (host-driven) first. Its first step is the
-`gfx.lvl` ARC vote through the apps RSC, which is the first RPMh rail vote for the GPU, so it needs the owner's
-go-ahead.
+GPU branches. The owner approved Stage 2A. It is built as patch 0097 (`sweetgpu=3`). Next is the test boot
+(image G2), once the owner has seen the patch and approves the boot. If the GX GDSC never reaches PWR_ON
+after the votes, the apps DRV cannot raise `gfx.lvl`, and the fallback is 2B.
