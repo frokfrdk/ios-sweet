@@ -1,0 +1,62 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -367,6 +367,50 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * Policy "AMFI": libamfi's amfi_interface_query_bootarg_state() is
++ * __mac_syscall("AMFI", 0x60, &state). With no policy of that name it fails
++ * with ENOPOLICY, and both installd (-[MIDaemonConfiguration
++ * codeSigningEnforcementIsDisabled]) and ExtensionFoundation
++ * (-[_EXDefaults enforceXPCCacheCodeSigning]) keep enforcement on; they test
++ * (state & 0x86). installd then rejects every staged system app ("Failed to
++ * verify code signature ... 0xe8008001", Verification stage failed) and
++ * leaves an offloaded placeholder. SWEET enforces no code signatures, so
++ * report that (0x4, amfi_get_out_of_my_way). Every other call keeps the
++ * no-policy answer; the first use of each is logged.
++ */
++#define SWEET_AMFI_SYSCALL_QUERY_BOOTARG_STATE  0x60
++#define SWEET_AMFI_BOOTARG_STATE                0x4ULL
++static uint64_t sweet_amfi_call_seen[2];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(sweet_amfi_call_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_call_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s syscall 0x%x\n", name, call);
++	}
++	if (call == SWEET_AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_STATE;
++		return copyout(&state, arg, sizeof(state));
++	}
++	return ENOPOLICY;
++}
++
++static const struct mac_policy_ops sweet_amfi_syscall_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_syscall_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI syscall stand-in",
++	.mpc_ops = &sweet_amfi_syscall_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_syscall_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -379,5 +423,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_syscall_mac_conf, &sweet_amfi_syscall_mac_handle, NULL);
++	printf("SWEET AMFI: syscall stand-in %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
