@@ -115,6 +115,29 @@ User space (`tools/sweetgl/`):
 - **gcc** (`gcc-sdmmagpie.c`): gpu_cfg_ahb 0x71004, gpu_memnoc_gfx 0x7100c, gpu_snoc_dvm_gfx 0x71018,
   ddrss_gpu_axi 0x4452c, gpu_gpll0 / gpll0_div = enable bits 15 / 16 of 0x52004.
 
+**Read on the phone** (Stage 0, boot G0, 2026-10-25):
+
+- Speed bin: QFPROM 0x7841a0 reads 0x12468410 from EL1 without a fault, so **bin 146**. Its DTS table is
+  700/650/565/430/355/267/180 MHz (levels 0–6, bus votes 11/10/9/8/7/6/4), initial level 6 = 180 MHz,
+  ca-target level 4. Bin 0's 825 MHz table does not apply to this phone.
+- cmd-db ARC level tables (hlvl index → RPMh vlvl):
+
+  | Resource | addr | vlvl per hlvl |
+  |---|---|---|
+  | `gfx.lvl` | 0x30050 | 0 16 64 128 192 256 320 384 416 |
+  | `cx.lvl` | 0x30000 | 0 16 64 128 192 256 384 |
+  | `mx.lvl` | 0x30010 | 0 16 192 320 384 |
+  | `lcx.lvl` / `lmx.lvl` | 0x30030 / 0x30040 | 0 16 64 128 256 384 / 0 16 128 256 384 |
+  | `ddr.lvl` / `xo.lvl` | 0x30070 / 0x30090 | 0 32 128 160 / 0 32 80 128 |
+
+  `ebi.lvl` and `mmcx.lvl` exist but have no level table. A second ARC header lists 10 `*.mol` entries
+  (addr 0, one level each; `gfx.mol` 64, `mx.mol` 320).
+- cmd-db BCMs (40): `MC0` 0x50000 (unit 1770000, width 16, vcd 0), `SH0` 0x5003c (unit 2090000, width 32,
+  vcd 1), `ACV` 0x5000c (vcd 11). VRMs (64): `vrm.gfx` = smpa2 0x40600, `vrm.cx` = smpc2 0x42700,
+  `vrm.mx` = smpa3 0x40000, which matches the rails in section 3.
+- The four firmware blobs reach the kernel through `/chosen/memory-map` at the addresses and FNV-1a
+  hashes mkpayload printed.
+
 **Memory:**
 
 - XNU's RAM is 0xb0000000+0x4d000000, or 0x100000000+0xfcc00000 in high-memory mode.
@@ -166,6 +189,10 @@ the GPU is untouched, so the everyday H4 behaviour stays the default.
 
 ✅ Pass when a boot with `sweetgpu=1` logs the blob addresses, the cmd-db table and the speed bin, then
 reaches the home screen as H4 does.
+
+**Result (2026-10-25, commit dab0e56, kernel 0094, image G0):** passed. All four blobs checked out, the
+cmd-db and speed-bin results are in section 4, and the home screen came up as with H4. The deliberate-hang
+log-recovery test (`sweetgpuhang=1`, step 2) has not been run yet.
 
 ### Stage 1: CX side and the GMU block (reads only)
 
@@ -364,5 +391,6 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stage 0: mkpayload blobs, the probe skeleton, generated register headers, the cmd-db ARC/BCM dump and
-the speed-bin read. It is all read-only, and one `fastboot boot` tests it.
+Stage 0 passed except for the deliberate-hang log test (boot with `sweetgpu=1 sweetgpuhang=1`, force
+power-off after the hang, pull the log). Run that before Stage 1, whose CX-side writes can hang the bus.
+Then Stage 1: CX clocks and GDSC, and CX-domain reads only.
