@@ -1,7 +1,8 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A is built (patch
-0097, `sweetgpu=3`) and not yet booted.** Nothing is
+Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A ran on G2 (patch
+0097): both rail votes and PLL0 work, and it stopped at the gfx3d RCG root. Patch 0098 (image G2b) is built
+and not yet booted.** Nothing is
 flashed: every test is a `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
@@ -378,6 +379,35 @@ How it differs from the plan:
 - Everything stays on afterwards. The votes are ACTIVE only; iOS never enters the system sleep that would
   drop them.
 
+**Result on G2 (kernel 0097, booted 10:17:04).** The owner saw the home screen and a stable phone. The log
+(flush #206, 6537 lines) has no panic or fault, and 4394 lines follow the stage's last line. Stage 1 matched
+G1b. Observed in 2A:
+- `mx.lvl` vlvl 64 → hlvl 2 (vlvl 192) and `gfx.lvl` vlvl 64 → hlvl 2 (vlvl 64). Both went through TCS0
+  with cmd-status 0x10101 (issued and completed). This shows RPMh accepted the votes, not that the rail
+  came up.
+- PLL0 locked: mode 0 → 0xd0800005 (LOCK_DET, ACTIVE, RESET_N, OUTCTRL), opmode RUN, USER_CTL 0x107. L
+  0x12, CAL_L 0x3f and FRAC 0xc000 read back.
+- The gfx3d RCG did not turn on: CMD 0x80000000 → 0x80000002. ROOT_EN stuck, but ROOT_OFF stayed set for
+  500 µs, with CFG still 0 (XO). The stage stopped there, so the GX GDSC (gdscr 0x00222001, domain 0x1 =
+  clamped) and SPTP (0xd4) were not touched.
+
+Downstream does not treat this as fatal. The sunfish GX GDSC node (sdmmagpie.dtsi) has
+`qcom,force-enable-root-clk` on `GPU_CC_GX_GFX3D_CLK_SRC`, `parent-supply = <&VDD_GFX_LEVEL>` and
+`qcom,reset-aon-logic`. gdsc_enable then:
+1. sets the parent to LOW_SVS;
+2. calls clk_prepare_enable on the root, which goes through clk_rcg2_set_force_enable. If the root stays
+   off, that function only prints a "rcg didn't turn on" warning and returns 0;
+3. runs the BCR/GMEM/unclamp/un-collapse sequence.
+
+So downstream never waits for this root before the GDSC. The RCG is a `gx_` clock with `vdd_gx`, and GX was
+still clamped. Our guess is that the root, or its status, needs the GX side unclamped. That is not verified.
+
+**Patch 0098 (image G2b).** It follows downstream: the root is forced on, and a root that stays off is
+logged and the stage goes on. Then the GX GDSC (unchanged, reverted on timeout). With GX unclamped, the
+root is checked again, and the switch to 180 MHz (crc_div) happens only once the root runs. The branches
+and SPTP run either way. The GX reads also need the gfx3d root at 180 MHz, on top of the GMU's GX
+power/clock bits.
+
 **2B: the real GMU path (fallback; it is what mainline Linux does for a618).**
 
 1. Load `a618_gmu.bin` into ITCM (legacy raw image; at most 0x8000 bytes).
@@ -538,6 +568,7 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 ## 9. Next concrete step
 
 Stages 0 and 1 passed on the phone. Stage 1 needed one fix: patch 0096 turns the CX GDSC on before the GCC
-GPU branches. The owner approved Stage 2A. It is built as patch 0097 (`sweetgpu=3`). Next is the test boot
-(image G2), once the owner has seen the patch and approves the boot. If the GX GDSC never reaches PWR_ON
-after the votes, the apps DRV cannot raise `gfx.lvl`, and the fallback is 2B.
+GPU branches. The owner approved Stage 2A. On G2 (patch 0097) the rail votes and PLL0 worked, and the stage
+stopped because the gfx3d RCG root stayed off with GX clamped. Patch 0098 goes on to the GX GDSC the way
+downstream gdsc_enable does. Next is the G2b test boot, once the owner approves it. If the GX GDSC never
+reaches PWR_ON after the votes, the apps DRV cannot raise `gfx.lvl`, and the fallback is 2B.

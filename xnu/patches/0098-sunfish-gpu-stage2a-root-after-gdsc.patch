@@ -1,0 +1,112 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -37,15 +37,19 @@
+  *    below 64. mx goes first and stays >= gfx (rpmhpd/GMU rule);
+  *  - PLL0 (Fabia, MX rail, clk-alpha-pll.c): the gpu_cc_pll0_config values
+  *    at 360 MHz with the even post-divider at 2, out of reset, RUN, lock;
+- *  - gfx3d RCG: root forced on (FORCE_ENABLE_RCG), then crc_div (PLL0 even
+- *    = 180 MHz) divider 1;
++ *  - gfx3d RCG root forced on (force-enable-root-clk on the GX GDSC,
++ *    FORCE_ENABLE_RCG). With GX clamped its root stayed off on G2 (0097);
++ *    clk_rcg2_set_force_enable only warns then, and gdsc_enable goes on;
+  *  - GX GDSC (gdsc-regulator.c, toggle_logic with sw-reset, domain-addr and
+  *    reset-aon-logic): BCR pulse, GMEM reset pulse, unclamp, un-collapse,
+  *    poll PWR_ON. On timeout it collapses and clamps again;
++ *  - with GX unclamped: the gfx3d root again, then crc_div (PLL0 even =
++ *    180 MHz) divider 1 once the root runs;
+  *  - gx_cxo, gx_gmu, gx_gfx3d and cx_gfx3d branches;
+  *  - SPTP head switch through the GMU (a6xx_sptprac_enable);
+- *  - only if the GMU sees the GX head switch and its clock on: RBBM_STATUS,
+- *    RBBM_CLOCK_CNTL and the CP always-on counter, the first GX reads.
++ *  - only if the gfx3d root runs at 180 MHz and the GMU sees the GX head
++ *    switch and its clock on: RBBM_STATUS, RBBM_CLOCK_CNTL and the CP
++ *    always-on counter, the first GX reads.
+  * GMU and cx_misc offsets come from the generated sweet_gpu_regs.h; GCC and
+  * gpucc offsets from the downstream drivers above. Everything stays on after
+  * the last stage that runs.
+@@ -713,22 +717,29 @@
+ 	return ok;
+ }
+ 
+-/* __clk_rcg2_set_rate with FORCE_ENABLE_RCG; the root stays forced on for the GX GDSC. */
++/* clk_rcg2_set_force_enable: a root that stays off is a warning there, not an error. */
++static bool
++gpu_gfx3d_root_on(vm_offset_t cc, const char *when)
++{
++	uint32_t cmd = gpu_rd(cc, GPUCC_GX_GFX3D_RCG);
++	gpu_wr(cc, GPUCC_GX_GFX3D_RCG, cmd | RCG_CMD_ROOT_EN);
++	bool on = gpu_poll(cc, GPUCC_GX_GFX3D_RCG, RCG_CMD_ROOT_OFF, 0, 500);
++	printf("SWEET GPU:   gfx3d RCG root %s: cmd 0x%08x -> 0x%08x, cfg 0x%08x: %s\n", when, cmd,
++	    gpu_rd(cc, GPUCC_GX_GFX3D_RCG), gpu_rd(cc, GPUCC_GX_GFX3D_RCG + 4u), on ? "on" : "still off");
++	return on;
++}
++
++/* __clk_rcg2_set_rate once the root runs; the root stays forced on. */
+ static bool
+ gpu_gfx3d_rcg_180mhz(vm_offset_t cc)
+ {
+ 	uint32_t cmd = gpu_rd(cc, GPUCC_GX_GFX3D_RCG), cfg = gpu_rd(cc, GPUCC_GX_GFX3D_RCG + 4u);
+-	gpu_wr(cc, GPUCC_GX_GFX3D_RCG, cmd | RCG_CMD_ROOT_EN);
+-	bool root = gpu_poll(cc, GPUCC_GX_GFX3D_RCG, RCG_CMD_ROOT_OFF, 0, 500);
+-	bool ok = false;
+-	if (root) {
+-		gpu_wr(cc, GPUCC_GX_GFX3D_RCG + 4u, (cfg & ~RCG_CFG_MASK) | RCG_CFG_GFX3D_180MHZ);
+-		gpu_wr(cc, GPUCC_GX_GFX3D_RCG, gpu_rd(cc, GPUCC_GX_GFX3D_RCG) | RCG_CMD_UPDATE);
+-		ok = gpu_poll(cc, GPUCC_GX_GFX3D_RCG, RCG_CMD_UPDATE, 0, 500);
+-	}
++	gpu_wr(cc, GPUCC_GX_GFX3D_RCG + 4u, (cfg & ~RCG_CFG_MASK) | RCG_CFG_GFX3D_180MHZ);
++	gpu_wr(cc, GPUCC_GX_GFX3D_RCG, cmd | RCG_CMD_UPDATE);
++	bool ok = gpu_poll(cc, GPUCC_GX_GFX3D_RCG, RCG_CMD_UPDATE, 0, 500);
+ 	printf("SWEET GPU:   gfx3d RCG cmd 0x%08x -> 0x%08x, cfg 0x%08x -> 0x%08x: %s\n", cmd,
+ 	    gpu_rd(cc, GPUCC_GX_GFX3D_RCG), cfg, gpu_rd(cc, GPUCC_GX_GFX3D_RCG + 4u),
+-	    !root ? "ROOT STILL OFF" : ok ? "180 MHz, root forced on" : "UPDATE TIMEOUT");
++	    ok ? "180 MHz" : "UPDATE TIMEOUT");
+ 	return ok;
+ }
+ 
+@@ -837,11 +848,10 @@
+ 		printf("SWEET GPU: stage 2A stopped: PLL0\n");
+ 		return;
+ 	}
+-	gpu_pause("gfx3d RCG root on, then 180 MHz from PLL0 even (gpucc 0x509101c)");
+-	if (!gpu_gfx3d_rcg_180mhz(cc)) {
+-		gpu_log_gx(cc, gmu, "after RCG", false);
+-		printf("SWEET GPU: stage 2A stopped: gfx3d RCG\n");
+-		return;
++	gpu_pause("gfx3d RCG root forced on, as gdsc_enable does first (gpucc 0x509101c)");
++	bool root = gpu_gfx3d_root_on(cc, "before GDSC");
++	if (!root) {
++		printf("SWEET GPU:   going on: downstream gdsc_enable only warns here (GX is still clamped)\n");
+ 	}
+ 	gpu_pause("GX GDSC on: BCR and GMEM reset pulses, unclamp, un-collapse (gpucc 0x509100c)");
+ 	if (!gpu_gx_gdsc_on(cc)) {
+@@ -850,6 +860,15 @@
+ 		return;
+ 	}
+ 	gpu_log_gx(cc, gmu, "with GX GDSC", true);
++	if (!root) {
++		gpu_pause("gfx3d RCG root again, GX unclamped");
++		root = gpu_gfx3d_root_on(cc, "with GX GDSC");
++	}
++	bool gfx3d = false;
++	if (root) {
++		gpu_pause("gfx3d RCG to 180 MHz from PLL0 even");
++		gfx3d = gpu_gfx3d_rcg_180mhz(cc);
++	}
+ 	gpu_pause("GX branches: gx_cxo, gx_gmu, gx_gfx3d, cx_gfx3d");
+ 	bool clocks = true;
+ 	for (unsigned i = 0; i < sizeof(gpu_gx_branches) / sizeof(gpu_gx_branches[0]); ++i) {
+@@ -863,7 +882,12 @@
+ 	gpu_pause("SPTP head switch on (GMU_GX_SPTPRAC_POWER_CONTROL)");
+ 	bool sptp = gpu_sptprac_on(gmu);
+ 	gpu_log_gx(cc, gmu, "after", true);
+-	uint32_t sp =gmu_rd(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
++	if (!gfx3d) {
++		printf("SWEET GPU: stage 2A stopped: gfx3d %s; no GX reads without the core clock\n",
++		    root ? "RCG update timed out" : "root never turned on");
++		return;
++	}
++	uint32_t sp = gmu_rd(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
+ 	if (sp & (A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF__MASK |
+ 	    A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF__MASK)) {
+ 		printf("SWEET GPU: stage 2A stopped: the GMU sees GX %s (sptprac 0x%08x); no GX reads\n",
