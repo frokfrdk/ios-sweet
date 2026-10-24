@@ -1,6 +1,6 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **Stage 0 passed on the phone; Stage 1 (patches 0095 + 0096) is in testing.** Nothing is
+Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2 is next.** Nothing is
 flashed: every test is a `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
@@ -280,6 +280,46 @@ Steps:
 
 Patch 0096 turns the CX GDSC on first.
 
+**G1b result (0096): ✅ Stage 1 PASSED, 2026-10-25 05:29.** The owner saw the home screen, and the phone stayed
+stable. The log has "stage 1 done", then 16,554 more lines (3,982 of them CPU-frequency and touch heartbeats),
+with no panic or fault. Every step logged its result.
+
+- **CX GDSC:** gdscr 0x00222001 → 0xf8228000, hw_ctrl 0x00005ff4 → 0x80001fe0 (PWR_ON).
+  - Powering the domain alone took gpucc `ahb` and `cxo` from 0x80000001 to on.
+  - It also turned `snoc_dvm_gfx` on, since its enable bit was already set at boot.
+- **GCC:** votes 0x01241d7b → 0x01259d7b. `ddrss_gpu_axi`, `memnoc_gfx` (0x00000221) and `snoc_dvm_gfx` are on.
+- **GMU RCG:** CFG 0 → 0x602 (200 MHz), UPDATE cleared. CMD reads 0 (root on) once `cx_gmu` runs.
+- **gpucc:** `cx_gmu` 0x80004ff0 → 0x00004ff1 on. `ahb` and `cxo` on.
+- **Unexpected:** the `cx_apb` and `cx_snoc_dvm` enable bits read back 0 after the write (0x80000000 and
+  0x00000000). Neither is on the GPU path, so this blocks nothing:
+  - The kgsl GPU node uses `core_clk rbbmtimer_clk mem_clk mem_iface_clk gmu_clk`.
+  - The GMU node uses `gmu_clk cxo_clk axi_clk memnoc_clk`.
+  - gpucc clock 0x08 (`gpu_apb_clk`) is used only by CoreSight funnel@6943000 and tpdm@6940000.
+  - No node uses cx_snoc_dvm.
+- **GMU reads:**
+
+  | Register | Value | Meaning |
+  |---|---|---|
+  | `CM3_SYSRESET` | 1 | CM3 held in reset |
+  | `BOOT_CONFIG` | 0 | |
+  | `FW_BUSY` | 0 | |
+  | `FW_INIT_RESULT` | 0 | |
+  | `HFI_CTRL_STATUS` | 0 | |
+  | `HFI_VERSION_INFO` | 0 | |
+  | `SPTPRAC_PWR_CLK_STATUS` | 0xd4 | SPTP GDSC off, SP clock off, GX HM GDSC off, GX HM clock off |
+  | `CX_GMU_RPMH_POWER_STATE` | 0xf | no firmware has run |
+  | `AO_GPU_CX_BUSY_STATUS` | 0x30000000 | bits 28–29 are not named in the XML |
+  | `AO_AHB_FENCE_CTRL` | 0 | Stage 2A step 2 is already the case |
+  | `AHB_FENCE_STATUS` | 0 | |
+
+- **Always-on counter:** 153803027 at the first read, then +21696 across `delay(1000)`.
+  153803027 / 19.2 MHz = 8.01 s, which is the four 2 s pauses since the CX GDSC came on. So the counter
+  starts at 0 when CX powers up and counts XO at 19.2 MHz. `delay(1000)` overshoots by about 13%.
+- **ITCM:** `2060e473 06510925 e66e14c9 cd804228`. This is uninitialised SRAM, not firmware; the firmware
+  would start with sp 0x43f80, reset 0x9. It reads without a hang.
+- **cx_misc:** `SYSTEM_CACHE_CNTL_0/1` = 0/0.
+- **GX:** `gx_gdscr` 0x00222001 (collapsed), `gx_domain` 0x1 (clamped), PLL0/PLL1 0. All untouched.
+
 ### Stage 2: GX power (decision gate)
 
 **2A: GMU-less, host-driven (try first).** Every step reuses what we have and is observable on its own.
@@ -464,6 +504,7 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stage 0 passed, including the hang test. Stage 1's first boot (G1) stopped cleanly at the GCC step; patch 0096
-reorders it (CX GDSC first). Next: boot image G1b (`sweetgpu=2`), pull the log, and check it against the
-Stage 1 pass criterion.
+Stages 0 and 1 passed on the phone. Stage 1 needed one fix: patch 0096 turns the CX GDSC on before the GCC
+GPU branches. Next is Stage 2, the GX power decision gate; try 2A (host-driven) first. Its first step is the
+`gfx.lvl` ARC vote through the apps RSC, which is the first RPMh rail vote for the GPU, so it needs the owner's
+go-ahead.
