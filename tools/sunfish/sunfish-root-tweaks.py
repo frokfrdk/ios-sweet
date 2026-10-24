@@ -14,14 +14,26 @@ CoreUI builds that context with kCIContextUseSoftwareRenderer =
 Both keys go into the global domain of mobile and root, so every process that
 draws styled CoreUI images uses CoreImage's CPU renderer.
 
+ExtensionKit feature flag enforce_xpc_cache_code_signing -> off. installd's
+appex preflight looks up every extension point in EXExtensionPointCatalog,
+which loads /System/Library/xpc/extensions.plist only if its detached .sig
+validates (trust cache via AMFI, absent here). Otherwise only the 6
+ExtensionKit/ExtensionPoints/*.appexpt are known and every app with a widget,
+intents or notification appex fails: "Extension cache does not have an entry
+for com.apple.widgetkit-extension" (MIInstaller Code=59, Preflight stage failed).
+-[_EXDefaults enforceXPCCacheCodeSigning] = os_feature_enabled(ExtensionKit,
+enforce_xpc_cache_code_signing) && !(amfi bootarg state & 0x86).
+
 --migrate-once: let DataMigration run on the next boot. The staged system apps
 (/var/staged_system_apps: Calculator, Books, ...; "Waiting..." placeholders)
 are installed by SystemAppMigrator.migrator, which only runs during migration;
 sweet-root-tweaks.py pins LastSystemVersion to the current build so migration
-never runs. Here the recorded build is set one lower (an upgrade), and the
-CoreLocation migrator, which waited on locationd for 170+ minutes (no GPS or
-baseband) and held the whole boot, is disabled. App staging also needs the
-kernel's HFS+ clonefile copy fallback (xnu patch 0091).
+never runs. Here the recorded build is set one lower (an upgrade), and every
+migrator except LaunchServices and SystemAppMigrator is disabled: upstream runs
+with none of them, and they wait on missing hardware and daemons
+(CoreLocationMigrator 170+ min on locationd, AirTrafficMigrator 40+ min on atc),
+holding the whole boot. App staging also needs the kernel's HFS+ clonefile copy
+fallback (xnu patch 0091).
 """
 import os, plistlib, sys
 
@@ -48,6 +60,18 @@ for rel, uid, gid in TARGETS:
     os.chmod(path, 0o600)
     print(f'{rel}: {sorted(PREFS)} set ({len(data)} keys)')
 
+rel = 'System/Library/FeatureFlags/Domain/ExtensionKit.plist'
+path = os.path.join(root, rel)
+with open(path, 'rb') as f:
+    flags = plistlib.load(f)
+flags.setdefault('enforce_xpc_cache_code_signing', {})['Enabled'] = False
+st = os.stat(path)
+with open(path, 'wb') as f:
+    plistlib.dump(flags, f)
+os.chown(path, st.st_uid, st.st_gid)
+os.chmod(path, st.st_mode & 0o7777)
+print(f'{rel}: enforce_xpc_cache_code_signing disabled')
+
 if migrate_once:
     rel = 'private/var/mobile/Library/Preferences/com.apple.migration.plist'
     path = os.path.join(root, rel)
@@ -64,8 +88,11 @@ if migrate_once:
     os.chmod(path, st.st_mode & 0o7777)
     print(f'{rel}: LastSystemVersion {build} -> {older}')
 
+    KEEP = {'00LaunchServicesMigrator.migrator', 'SystemAppMigrator.migrator'}
     mdir = os.path.join(root, 'System/Library/DataClassMigrators')
-    src = os.path.join(mdir, 'CoreLocationMigrator.migrator')
-    if os.path.isdir(src):
-        os.rename(src, src + '.disabled')
-        print('DataClassMigrators/CoreLocationMigrator.migrator disabled')
+    disabled = []
+    for name in sorted(os.listdir(mdir)):
+        if name.endswith('.migrator') and name not in KEEP:
+            os.rename(os.path.join(mdir, name), os.path.join(mdir, name + '.disabled'))
+            disabled.append(name)
+    print(f'DataClassMigrators: {len(disabled)} disabled, kept {sorted(KEEP)}')
