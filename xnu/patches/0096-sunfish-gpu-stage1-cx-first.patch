@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -16,11 +16,15 @@
+  * Stage 1 (N >= 2) powers the CX side the way the downstream sunfish kernel
+  * does before it boots the GMU (gcc-sdmmagpie.c, gpucc-sdmmagpie.c,
+  * gdsc-regulator.c with sdmmagpie-gdsc.dtsi, and the kgsl GMU clock list):
++ *  - CX GDSC on first: the GMU's vddcx-supply, powered before its clocks
++ *    (upstream a6xx_gmu_resume: pm_runtime_get_sync, then the clocks).
++ *    gpu_memnoc_gfx and gpu_snoc_dvm_gfx stay at CLK_OFF while it is
++ *    collapsed (seen on G1). gpucc is reachable already: gpu_cfg_ahb is
++ *    critical and on;
+  *  - GCC: GPLL0 and GPLL0-div votes for gpucc, then the ddrss_gpu_axi,
+- *    gpu_memnoc_gfx and gpu_snoc_dvm_gfx branches (gpu_cfg_ahb is critical
+- *    and already on; it is what makes gpucc reachable);
+- *  - gpucc: CX GDSC on, GMU RCG to 200 MHz (GPLL0 div / 1.5), then the ahb,
+- *    cxo, cx_gmu, cx_snoc_dvm and cx_apb branches;
++ *    gpu_memnoc_gfx and gpu_snoc_dvm_gfx branches;
++ *  - gpucc: GMU RCG to 200 MHz (GPLL0 div / 1.5), then the ahb, cxo,
++ *    cx_gmu, cx_snoc_dvm and cx_apb branches;
+  *  - reads CX-side GMU registers, the GMU always-on counter, the first ITCM
+  *    words and cx_misc.
+  * GX stays off: nothing in the 0x5000000 GPU block is touched, and the gx_*
+@@ -514,16 +518,17 @@
+ 		}
+ 		gpu_log_clocks(gcc, cc, "with gpu_cfg_ahb");
+ 	}
+-	gpu_pause("GCC GPU branches and GPLL0 votes");
+-	if (!gpu_gcc_on(gcc)) {
+-		printf("SWEET GPU: stage 1 stopped: GCC branches\n");
+-		return;
+-	}
+ 	gpu_pause("CX GDSC on (gpucc 0x509106c)");
+ 	if (!gpu_cx_gdsc_on(cc)) {
+ 		printf("SWEET GPU: stage 1 stopped: CX GDSC\n");
+ 		return;
+ 	}
++	gpu_log_clocks(gcc, cc, "with CX GDSC");
++	gpu_pause("GCC GPU branches and GPLL0 votes");
++	if (!gpu_gcc_on(gcc)) {
++		printf("SWEET GPU: stage 1 stopped: GCC branches\n");
++		return;
++	}
+ 	gpu_pause("GMU RCG to 200 MHz (gpucc 0x5091120)");
+ 	if (!gpu_gmu_rcg_200mhz(cc)) {
+ 		printf("SWEET GPU: stage 1 stopped: GMU RCG\n");

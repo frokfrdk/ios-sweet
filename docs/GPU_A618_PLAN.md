@@ -1,6 +1,6 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **Stage 0 passed on the phone; Stage 1 is built (patch 0095), not yet booted.** Nothing is
+Status, 2026-10-25: **Stage 0 passed on the phone; Stage 1 (patches 0095 + 0096) is in testing.** Nothing is
 flashed: every test is a `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
@@ -218,18 +218,21 @@ notices a stuck core. For later stages this means:
 
 ✅ Pass when the log shows sane GMU/CX values and the phone keeps running.
 
-**Built (patch 0095, `sweetgpu=2`).** It runs after stage 0, in this order. Each step has its own `next:`
-pause and logs before/after values:
+**Built (patches 0095 + 0096, `sweetgpu=2`).** It runs after stage 0, in this order. Each step has its own
+`next:` pause and logs before/after values:
 
 1. If `gcc_gpu_cfg_ahb` (critical in Linux) is off, turn it on. gpucc is unreachable without it.
-2. GCC: set the `gpu_gpll0` and `gpu_gpll0_div` votes (0x52004 bits 15 and 16). Then turn on
-   `ddrss_gpu_axi` (0x4452c), `gpu_memnoc_gfx` (0x7100c) and `gpu_snoc_dvm_gfx` (0x71018) and wait for
-   CLK_OFF to clear.
-3. CX GDSC, following gdsc-regulator.c:
+2. CX GDSC, following gdsc-regulator.c:
    - Clear HW_CONTROL and SW_OVERRIDE.
    - Set CLK_DIS_WAIT to 8.
    - Clear SW_COLLAPSE.
    - Poll PWR_ON at the hw-ctrl address 0x5091540 for up to 1 ms.
+
+   It comes first, as in upstream `a6xx_gmu_resume()` (power domain before clocks). It is the GMU's
+   `vddcx-supply` in the stock DT.
+3. GCC: set the `gpu_gpll0` and `gpu_gpll0_div` votes (0x52004 bits 15 and 16). Then turn on
+   `ddrss_gpu_axi` (0x4452c), `gpu_memnoc_gfx` (0x7100c) and `gpu_snoc_dvm_gfx` (0x71018) and wait for
+   CLK_OFF to clear.
 4. GMU RCG (0x5091120): CFG = source 6 (GPLL0 div, 300 MHz), divider 1.5 → 200 MHz. Then UPDATE.
 5. Set wake/sleep 0xf on cx_gmu, as gpucc probe does. Then turn on ahb, cxo, cx_gmu, cx_snoc_dvm and
    cx_apb.
@@ -246,6 +249,36 @@ gcc-/gpucc-sdmmagpie.c.
 
 GX is never written. Its GDSCR, clamp register and PLLs are only read, through gpucc. Everything stays on
 afterwards, because Stage 2 builds on it.
+
+**G1 result (0095, GCC before the GDSC), 2026-10-25 05:10.** The phone booted and kept working. The stage
+stopped cleanly at the GCC step.
+
+Before:
+
+| Register | Value | Meaning |
+|---|---|---|
+| `gpu_cfg_ahb` | 0x00000001 | on |
+| `ddrss_gpu_axi` | 0x00000000 | off |
+| `memnoc_gfx` | 0x80000220 | off |
+| `snoc_dvm_gfx` | 0x80000001 | enabled but off |
+| GCC vote | 0x01241d7b | |
+| `gpu_misc` | 0x00010000 | |
+| `cx_gdscr` | 0x00222001 | collapsed |
+| `hw_ctrl` | 0x00005ff4 | PWR_ON clear |
+| `gx_gdscr` | 0x00222001 | |
+| `gx_domain` | 0x1 | clamped |
+| GMU RCG | 0x80000000 / 0 | XO, root off |
+| `cx_gmu` | 0x80004220 | |
+| `ahb`, `cxo` | | on |
+| `cx_snoc_dvm`, `cx_apb` | | off |
+| PLL0/PLL1 mode and L | 0 | |
+
+Steps:
+- The votes took: 0x01241d7b → 0x01259d7b.
+- `ddrss_gpu_axi` came on.
+- `memnoc_gfx` (0x80000221) and `snoc_dvm_gfx` stayed at CLK_OFF, because they feed the collapsed CX domain.
+
+Patch 0096 turns the CX GDSC on first.
 
 ### Stage 2: GX power (decision gate)
 
@@ -431,5 +464,6 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stage 0 passed, including the hang test. Stage 1 is built as patch 0095. Next: boot image G1
-(`sweetgpu=2`), pull the log, and check it against the Stage 1 pass criterion.
+Stage 0 passed, including the hang test. Stage 1's first boot (G1) stopped cleanly at the GCC step; patch 0096
+reorders it (CX GDSC first). Next: boot image G1b (`sweetgpu=2`), pull the log, and check it against the
+Stage 1 pass criterion.
