@@ -41,6 +41,19 @@ convert with tools/sunfish/png2cpbitmap.py. Needed because the stock default (Wa
 screen class of the 828xr ADT, and a failed default restore leaves the
 SBLockScreenWallpapers/SBHomeScreenWallpapers entries empty (black).
 
+PaperBoardUI static wallpaper, two 8-byte patches in dyld_shared_cache_arm64.15 (20H392). With the
+CPBitmap alone the lock and home screen were full white:
+- -[PBUIStaticWallpaperView _setupWallpaperImageFromConfiguration:options:] replaces the raw image
+  with a "treated" one (luminance, dimming, the 1/16 sample) rendered by
+  com.apple.PaperBoardUI.RendererService through a Metal CARenderer. workaround_alwaysForceNoTreatment
+  (file offset 0x115c3bc) -> YES (mov w0, #1; ret) skips the treatment.
+- The result is kept in PBUIWallpaperCache, a disk-backed BSUIMappedImageCache
+  (~mobile/Library/Caches/MappedImageCache/Wallpaper, ASTC-compressed CPBitmap entries), and a cache hit
+  never runs the generator, so the first patch alone still showed white. +[PBUIStaticWallpaperView
+  _canCacheImages] (0x115ba34) -> NO (mov w0, #0; ret) leaves no cache key: the image is generated
+  directly every time (PBUIScrollableStaticWallpaperView already returns NO).
+The kernel accepts the changed cache pages (no AMFI, so no CS_KILL). Already-patched bytes are left alone.
+
 --migrate-once: let DataMigration run on the next boot. The staged system apps
 (/var/staged_system_apps: Calculator, Books, ...; "Waiting..." placeholders)
 are installed by SystemAppMigrator.migrator, which only runs during migration;
@@ -103,6 +116,21 @@ with open(path, 'wb') as f:
 os.chown(path, st.st_uid, st.st_gid)
 os.chmod(path, st.st_mode & 0o7777)
 print(f'{rel}: {off} disabled')
+
+rel = 'System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.15'
+DSC_PATCHES = [  # (file offset, original, patched, what)
+    (0x115c3bc, 'f44fbea9fd7b01a9', '20008052c0035fd6', 'workaround_alwaysForceNoTreatment -> YES'),
+    (0x115ba34, '20008052c0035fd6', '00008052c0035fd6', '+_canCacheImages -> NO'),
+]
+with open(os.path.join(root, rel), 'r+b') as f:
+    for at, old, new, what in DSC_PATCHES:
+        f.seek(at)
+        cur = f.read(8).hex()
+        assert cur in (old, new), f'{rel} +{at:#x}: {cur} is neither {old} nor {new} (not 20H392?)'
+        if cur == old:
+            f.seek(at)
+            f.write(bytes.fromhex(new))
+        print(f'{rel} +{at:#x}: PBUIStaticWallpaperView {what} ({"patched" if cur == old else "already patched"})')
 
 if wallpaper:
     sbdir = os.path.join(root, 'private/var/mobile/Library/SpringBoard')
