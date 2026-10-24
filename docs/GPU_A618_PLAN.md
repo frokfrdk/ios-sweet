@@ -191,8 +191,18 @@ the GPU is untouched, so the everyday H4 behaviour stays the default.
 reaches the home screen as H4 does.
 
 **Result (2026-10-25, commit dab0e56, kernel 0094, image G0):** passed. All four blobs checked out, the
-cmd-db and speed-bin results are in section 4, and the home screen came up as with H4. The deliberate-hang
-log-recovery test (`sweetgpuhang=1`, step 2) has not been run yet.
+cmd-db and speed-bin results are in section 4, and the home screen came up as with H4.
+
+**Hang test (image G0H = G0 + `sweetgpuhang=1`):** passed for log recovery. The log was pulled after a
+forced power-off, as `tools/sweet-log-pull.sh` does it, and held the `next: deliberate hang` line. One
+core spinning with interrupts off did **not** freeze iOS: the phone kept responding for over 2 minutes, and
+3686 more lines (12 of them CPUFREQ status) reached the log after the hang line. With `wdt=-1` nothing
+notices a stuck core. For later stages this means:
+
+- A stuck register access may leave the phone running. A `next:` line with no result line after it marks
+  the hang, so every risky step must log its result.
+- A stall of the whole SoC was not exercised. The 2 s pause plus `ufslogsecs=1` (0047 ends each flush with
+  a UFS cache sync) puts the `next:` line on disk before the access, so it should still be there.
 
 ### Stage 1: CX side and the GMU block (reads only)
 
@@ -391,6 +401,4 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stage 0 passed except for the deliberate-hang log test (boot with `sweetgpu=1 sweetgpuhang=1`, force
-power-off after the hang, pull the log). Run that before Stage 1, whose CX-side writes can hang the bus.
-Then Stage 1: CX clocks and GDSC, and CX-domain reads only.
+Stage 0 passed, including the hang test. Next is Stage 1: CX clocks and GDSC, and CX-domain reads only.
