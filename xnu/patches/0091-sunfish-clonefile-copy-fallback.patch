@@ -1,0 +1,84 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8581,6 +8581,69 @@
+  * Helper function for doing clones. The caller is expected to provide an
+  * iocounted source vnode and release it.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: the iOS root is HFS+, which has no VNOP_CLONEFILE. installd
++ * stages every app with clonefile() (MIFileManager), so on HFS+ all app
++ * installs failed with ENOTSUP ("Waiting..." placeholders). For a regular
++ * file, emulate the clone with a create and a full data copy; the caller's
++ * success path then applies the remaining attributes as usual.
++ */
++#define SWEET_CLONE_COPY_CHUNK  (64 * 1024)
++
++static int
++sweet_clone_by_copy(vnode_t fvp, vnode_t tdvp, vnode_t *tvpp,
++    struct componentname *cnp, struct vnode_attr *nva, vfs_context_t ctx)
++{
++	struct vnode_attr sva;
++	kauth_cred_t cred = vfs_context_ucred(ctx);
++	proc_t p = vfs_context_proc(ctx);
++	char *buf;
++	off_t off;
++	int error, resid;
++
++	VATTR_INIT(&sva);
++	VATTR_WANTED(&sva, va_data_size);
++	if ((error = vnode_getattr(fvp, &sva, ctx)) != 0) {
++		return error;
++	}
++	if ((error = VNOP_CREATE(tdvp, tvpp, cnp, nva, ctx)) != 0) {
++		return error;
++	}
++	buf = kalloc_data(SWEET_CLONE_COPY_CHUNK, Z_WAITOK);
++	if (buf == NULL) {
++		error = ENOMEM;
++		goto fail;
++	}
++	for (off = 0; off < (off_t)sva.va_data_size; off += SWEET_CLONE_COPY_CHUNK) {
++		int len = (int)MIN((off_t)SWEET_CLONE_COPY_CHUNK, (off_t)sva.va_data_size - off);
++		error = vn_rdwr(UIO_READ, fvp, buf, len, off, UIO_SYSSPACE, 0, cred, &resid, p);
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error == 0) {
++			error = vn_rdwr(UIO_WRITE, *tvpp, buf, len, off, UIO_SYSSPACE, 0, cred, &resid, p);
++		}
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error) {
++			break;
++		}
++	}
++	kfree_data(buf, SWEET_CLONE_COPY_CHUNK);
++	if (error == 0) {
++		return 0;
++	}
++fail:
++	/* Do not leave a truncated "clone" behind: installd retries. */
++	(void)VNOP_REMOVE(tdvp, *tvpp, cnp, 0, ctx);
++	vnode_put(*tvpp);
++	*tvpp = NULLVP;
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ clonefile_internal(vnode_t fvp, boolean_t data_read_authorised, int dst_dirfd,
+     user_addr_t dst, uint32_t flags, vfs_context_t ctx)
+@@ -8731,6 +8794,11 @@
+ #endif
+ 
+ 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, &nva, vnop_flags, ctx);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == ENOTSUP && v_type == VREG && tvp == NULLVP) {
++		error = sweet_clone_by_copy(fvp, tdvp, &tvp, cnp, &nva, ctx);
++	}
++#endif
+ 
+ 	if (!error && tvp) {
+ 		int     update_flags = 0;
