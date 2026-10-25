@@ -1,0 +1,55 @@
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -150,7 +150,8 @@
+ #define HFI_CMD_Q               0u
+ #define HFI_MSG_Q               1u
+ #define HFI_MSG_CMD             0u
+-#define HFI_MSG_ACK             2u
++#define HFI_F2H_MSG_ACK         126u            /* header bits 7:0 of an ack */
++#define HFI_SEQNUM(hdr)         ((hdr) >> 20)
+ #define HFI_IRQ_MSGQ            (1u << 0)
+ #define H2F_MSG_INIT            0u
+ #define H2F_MSG_FW_VER          1u
+@@ -808,9 +809,24 @@
+ 	return size;
+ }
+ 
++/* Logs the n dwords of the message in gm_rsp, four per line. */
++static void
++gmu_hfi_dump(const char *name, const char *what, unsigned n)
++{
++	const unsigned m = n < HFI_MSG_MAX ? n : HFI_MSG_MAX;
++	for (unsigned i = 0; i < m; i += 4) {
++		printf("SWEET GMU:   HFI %s: %s [%u]", name, what, i);
++		for (unsigned j = i; j < m && j < i + 4; ++j) {
++			printf(" 0x%08x", gm_rsp[j]);
++		}
++		printf("\n");
++	}
++}
++
+ /*
+  * hfi_send_cmd for HFI v1: gm_msg[1..dwords-1] is the body. Waits for the
+- * ack whose word 1 is our header; *payload gets its word 3. True if the GMU
++ * ack (id 126) whose word 1 carries our sequence number, as mainline
++ * a6xx_hfi_wait_for_ack does; *payload gets its word 3. True if the GMU
+  * answered with error 0.
+  */
+ static bool
+@@ -839,10 +855,14 @@
+ 		gmu_wr(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, HFI_IRQ_MSGQ);
+ 		unsigned n;
+ 		while ((n = gmu_hfi_read())) {
+-			if (((gm_rsp[0] >> 16) & 0xfu) != HFI_MSG_ACK || n < 3 || gm_rsp[1] != hdr) {
+-				printf("SWEET GMU:   HFI %s: skipped message 0x%08x (%u dwords)\n", name, gm_rsp[0], n);
++			if ((gm_rsp[0] & 0xffu) != HFI_F2H_MSG_ACK || n < 3 || HFI_SEQNUM(gm_rsp[1]) != HFI_SEQNUM(hdr)) {
++				gmu_hfi_dump(name, "skipped", n);
+ 				continue;
+ 			}
++			gmu_hfi_dump(name, "ack", n);
++			if (gm_rsp[1] != hdr) {
++				printf("SWEET GMU:   HFI %s: ack returns header 0x%08x (sent 0x%08x)\n", name, gm_rsp[1], hdr);
++			}
+ 			if (payload) {
+ 				*payload = n > 3 ? gm_rsp[3] : 0;
+ 			}
