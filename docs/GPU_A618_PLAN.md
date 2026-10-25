@@ -653,6 +653,20 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
   back. Next (proposal): for the six MSGID writes only, accept a readback that differs from the written value only in
   bits 7:0 (log it); every other PDC value must still read back.
 
+**Result on G3g (2026-10-25 17:30, patch 0104, `sweetgmu=3`): 2B.1–2B.3 all done; the GMU firmware runs.**
+- 2B.1 and the RSCC as on G3f. PDC: the six MSGID writes logged "length byte differs, accepted"; every other PDC value
+  read back; "2B.2 done".
+- 2B.3: 8192 firmware words into ITCM/DTCM, 0 differ on read-back. Boot registers read back except (non-fatal by design,
+  "going on"): CM3_CFG wrote 0x4052 reads 0x52; SYS_BUS_CONFIG, ICACHE_CONFIG, DCACHE_CONFIG wrote 1 read 0. HFI_QTBL_ADDR
+  0x60100000, AHB_FENCE_RANGE_0 0x80a008a0, PWR_COL_CP_MSG 0x60300000, RPMH_CTRL 0xf11 read back.
+- **CM3 out of reset: FW_INIT_RESULT = 0xBABEFACE after 42 us.** FW_BUSY 0, GMU2HOST 0, AO_HOST_INT 0,
+  RPMH_POWER_STATE 0xf, SPTPRAC 0xd4, HFI_STATUS 0. No SMMU fault before or after (sGFSR 0, bank 4 FSR only the
+  0x400 format field). Dummy and log pages still zero (firmware had not written them when read).
+- The GMU was left running (2B stops at `sweetgmu=3`). Phone booted to the UI as before; no visible change (expected:
+  nothing on screen uses the GPU yet).
+- Open questions (guesses): whether the four ignored boot registers matter (cache configs reading 0 may mean they
+  are write-only or locked like the RSCC addresses). Next: 2B.4 (`sweetgmu=4`), the GX rail vote through the GMU.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
