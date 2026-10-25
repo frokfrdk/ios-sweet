@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_cp.c
++++ b/bsd/dev/sweet_cp.c
+@@ -119,7 +119,8 @@
+ 	bool must;
+ } cp_init_list[] = {
+ 	{ "GBIF_HALT", REG_A6XX_GBIF_HALT, 0, true },
+-	{ "RBBM_GBIF_HALT", REG_A6XX_RBBM_GBIF_HALT, 0, true },
++	/* Reads 0xdeafbead before and after on G4a (as do 0x17 and 0x534); mainline does not check it either */
++	{ "RBBM_GBIF_HALT", REG_A6XX_RBBM_GBIF_HALT, 0, false },
+ 	{ "RBBM_SECVID_TSB_CNTL", REG_A6XX_RBBM_SECVID_TSB_CNTL, 0, true },
+ 	{ "SECVID_TSB_TRUSTED_BASE_LO", REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE, 0, true },
+ 	{ "SECVID_TSB_TRUSTED_BASE_HI", REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE + 1u, 0, true },
+@@ -412,7 +413,7 @@
+ 	for (unsigned i = 0; i < sizeof(cp_init_list) / sizeof(cp_init_list[0]); ++i) {
+ 		if (i == 0) {
+ 			gpu_pause("4.1 GBIF un-halt, SECVID TSB, 64-bit address modes (GPU block 0x5000000)");
+-		} else if (cp_init_list[i - 1].must && !cp_init_list[i].must) {
++		} else if (cp_init_list[i].reg == REG_A6XX_RBBM_VBIF_CLIENT_QOS_CNTL) {
+ 			gpu_pause("4.1 the rest: QoS, UCHE, CP queues, perf counters, UBWC, hang detect");
+ 		}
+ 		cp_wr(cp_init_list[i].reg, cp_init_list[i].val);
