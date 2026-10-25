@@ -1797,3 +1797,10 @@ at 5.3").** Seen in the log:
 Whether the write path differs in secure mode (for example, which SMMU context or "secure" attribute the GPU uses)
 is not known. Next, with the owner's OK: pack G5c (`sweetzap=6`) from out-0110. No code change is needed; the 5.5
 pass rule already checks the words.
+
+G5c is packed from out-0110:
+- Its boot-args differ from G5b's only in `sweetzap=6`.
+- The blob addresses are the same as before.
+- The 828xr ADT and all firmware are in the payload.
+
+Not booted. Next, with the owner's OK: boot G5c.
