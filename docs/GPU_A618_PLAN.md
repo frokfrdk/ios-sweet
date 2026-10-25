@@ -1568,28 +1568,453 @@ Fixes found on G5a or G5b are new patches and CI runs, shown before anything boo
 Stage 5 leaves these for later: CP_PROTECT, interrupts, indirect buffers, `CACHE_FLUSH_TS` fences (Stage 6),
 and reloading the zap after power collapse (Stage 9).
 
-### Stage 6: kernel GPU service and user client
+### Stage 6: kernel GPU service and user client (planned; not started)
 
-- Port the *design* of their SweetGPU user client to our own code, with the same selector numbers so a
-  sweetgl port maps 1:1:
-  - 10 bo new
-  - 11 bo free
-  - 12 bo import IOSurface
-  - 13 submit (IBs as `CP_INDIRECT_BUFFER_PFE`, then `CACHE_FLUSH_TS` to the fence page)
-  - 14 wait
-  - 15 info
-- Info returns:
-  - chip_id 0x06010800
-  - gmem_size 0x80000
-  - gmem_base 0x100000
-  - max_freq for the current level
-  - the fence page
-- Hang detection: if the fence does not move for 2 s, the service turns off until reboot.
-- Self-test: a kernel-built clear and copy (CP_BLIT / `CP_MEM_TO_MEM`), checked by the CPU.
-- Clock steps 180 → 430 → 565 MHz, each needing the matching `gfx.lvl` corner, and a DDR BCM vote
-  (their 0146) only if bandwidth turns out to be the limit.
+Planned 2026-10-26, after G5c passed Stage 5. The owner asked to see this plan before any code.
 
-✅ Pass when `sweetgpu=8` logs "service ready" and the self-test reports 0 bad pixels.
+**Idea.** Turn the CP that Stage 5 left running (outside secure mode, writes reaching DRAM) into a small
+service that other code can use. First add what mainline's `hw_init` and `a6xx_submit` do and we skipped:
+- register protection (CP_PROTECT);
+- the interrupt mask;
+- indirect buffers (IBs);
+- `CACHE_FLUSH_TS` fences;
+- a GPU address window for buffers that are not physically contiguous.
+
+Then:
+- a kernel self-test (clear and copy, checked by the CPU);
+- a hang detector;
+- the clock steps;
+- a "service ready" state with a C API.
+
+The user client (selectors 10–15) is a thin IOKit wrapper over that API. It comes last, in its own patch,
+and it is the only step that needs a userspace binary.
+
+**Sources, read in this session** (hardware facts only; no code copied):
+- Mainline Linux 6.18.54 (the WSL kernel tree), from `drm/msm/adreno`:
+  - `a6xx_gpu.c`: `a6xx_submit`, `a6xx_set_cp_protect`, the `hw_init` order (protect at line 1367,
+    `CP_SQE_CNTL = 1` at line 1464), `A6XX_INT_MASK`, `a6xx_irq`, `a6xx_fault_detect_irq` and the
+    `RBBM_INTERFACE_HANG_INT_CNTL` values;
+  - `a6xx_catalog.c`: `a630_protect_regs`, which a618 uses, and gmem 512 KiB;
+  - `a6xx_gpu.h`: the `A6XX_PROTECT_*` encodings;
+  - `msm_gpu.h`: hangcheck 500 ms × 3 retries.
+- `adreno_pm4.xml` (`~/ios-pixel/ref/adreno-xml`): the `CP_EVENT_WRITE` (EVENT 7:0, TIMESTAMP bit 30,
+  IRQ bit 31), `CP_MEM_TO_MEM`, `CP_WAIT_REG_MEM` and `CP_INDIRECT_BUFFER` (IB_SIZE 19:0, in dwords)
+  layouts, and the event numbers.
+- Our `xnu/gpu/regs` headers for every offset below.
+- Our own patches:
+  - 0100 (the 2B.6 DCVS mailbox: `GMU_DCVS_PERF_SETTING` 0x1cbfd, `_BW_SETTING` 0x1cbfe,
+    `_RETURN` 0x1cbff, `OOB_DCVS` 7);
+  - 0106 (the CB0 page table);
+  - 0107 (the ring helpers);
+  - 0046 (the IOKit user-client pattern: `externalMethod`, `createMappingInTask`);
+  - 0017 (the GIC: only the virtual timer and the IPI SGI are enabled).
+- Their design, for selector numbers only:
+  - 10–15 as below;
+  - a GPU VA window at 8–16 GiB with 4 KiB pages (their 0137);
+  - fences in a page written by `CACHE_FLUSH_TS`.
+
+  Their repo has no licence, so we keep only these numbers and shapes, so that a later sweetgl port maps
+  1:1.
+
+**What we already have from Stages 2B–5:**
+- OOB_GPU held; GX on at 180 MHz (DCVS perf index 1).
+- The SQE running and idle outside secure mode.
+- `cp_emit` / `cp_kick` / `cp_wait_idle` / `cp_marker` / `cp_dump` / `cp_clean`.
+- The scratch page.
+- CB0's identity map: 0x8000_0000–0x1_ffff_ffff, 1 GiB blocks, Normal non-cacheable, IOVA = PA.
+- The ring has NO_UPDATE, so RPTR is read from `CP_RB_RPTR`.
+
+**No interrupts in Stage 6 (decided by the hardware state, not a guess).** The GIC enables only the
+virtual timer and the IPI SGI (0017). The GPU's SPI 300 (INTID 332) is never enabled, so nothing reaches
+the CPU. Stage 6 therefore *polls*:
+- The fence page, every 1 ms while work is outstanding.
+- `RBBM_INT_0_STATUS`, on the same tick. With `INT_0_MASK` set, the GPU still latches status bits. We
+  read them and clear them with `RBBM_INT_CLEAR_CMD`, exactly as `a6xx_irq` does.
+
+Routing SPI 332 through the GIC is left for later (Stage 9 or its own stage), because it changes shared
+interrupt code. 6.0 and 6.2 only *read* the GIC distributor bits for INTID 332, as evidence for that later
+work.
+
+**Boot-args:**
+- `sweetgpu=8` selects Stage 6. It needs `sweetgmu=6 sweetcp=5`, and Stage 5 to pass to 5.5 in the same
+  boot. The test images use `sweetzap=5`, which skips 5.6's 30 s hold. `sweetgpu=7` stays exactly as on G5c.
+- The new `sweetsvc=N` (0–7, default 0) stops after step 6.N.
+
+**New code:**
+- **Patch 0111: kernel only, steps 6.0–6.7.**
+  - `sweet_gsvc.c` (new, about 800 lines):
+    - the protect and interrupt setup;
+    - the submit path (ring lock, the preamble, IBs, the fence);
+    - the fence/status poller thread;
+    - the hang detector;
+    - the VA window (map, unmap, TLB invalidate);
+    - the BO table;
+    - the self-test;
+    - the clock steps;
+    - the C API: `sweet_gsvc_bo_new`, `_bo_free`, `_bo_import_pages`, `_submit`, `_wait`, `_info`.
+  - `sweet_gmu.c`: export the DCVS vote (perf index in, `DCVS_RETURN` out) and the 0099 clock counter.
+  - `sweet_smmu.c`: export CB0's level-1 table pa/va and a `cb0_tlbiall()` helper (`TLBIALL`, `TLBSYNC`,
+    then poll `TLBSTATUS`).
+  - `sweet_gpu.c`: parse `sweetsvc`. After `sweet_zap_run()` succeeds with `gpu_level >= 8`, call
+    `sweet_gsvc_run(stop)`.
+- **Patch 0112: the user client (6U).**
+  - An IOKit `SweetGPU` service and `SweetGPUUserClient`, about 300 lines of C++ next to 0046, which
+    only marshal arguments into the C API.
+  - A small static test tool, `sweetgpu-test`, built in CI and ad-hoc signed like `tools/mkinit.py`.
+  - 0112 is planned here but written only after 6.7 passes.
+
+**Memory** (GPU-GMU-MEM is 1 MiB; offsets continue after Stage 5's metadata copy; PAs as on G5c, where
+GMU-MEM started at 0x1024f8000 and the metadata copy was 0x10258f000):
+
+| Offset | Size | PA on G5c layout | Use |
+|---|---|---|---|
+| +0x99000 | 4 KiB | 0x102591000 | fence page: word 0 = kernel ring fence, words 1–3 = last submit/retire/error counters (CPU-written), rest 0 |
+| +0x9a000 | 64 KiB | 0x102592000 | kernel IB pool: 16 × 4 KiB IBs for the self-tests (IOVA = PA) |
+| +0xaa000 | 4 KiB | 0x1025a2000 | window level-2 table: GPU VA 0x2_0000_0000–0x2_3fff_ffff (512 × 2 MiB) |
+| +0xab000 | 128 KiB | 0x1025a3000 | 32 level-3 tables, so **64 MiB of BO space** in Stage 6 (more later by moving the tables out of GMU-MEM) |
+
+- That uses 812 KiB of the 1 MiB. The GMU-MEM mapping is already uncached (Stage 3), so the tables and the
+  fence page need no cache maintenance, only `dsb sy` before the GPU uses them.
+- **The window.** Level-1 entry 8 of CB0's table (VA 8 GiB; entries 2–7 are the identity blocks) points at
+  the level-2 table. Each used 2 MiB slot points at a level-3 table with 4 KiB pages: AP read/write, AF,
+  nG, MAIR attribute 0 (Normal non-cacheable, as the identity map). Entry 8 is past DRAM (6 GiB ends at
+  0x1_ffff_ffff), so nothing there is in use today. 6.0 reads it and wants it 0.
+- **BOs** are allocated from the window with a simple first-fit bitmap over 16384 pages. A BO's GPU VA
+  never changes while it lives. After any unmap: `cb0_tlbiall()` with the CP idle or past the BO's last
+  fence. After a map, the same (cheap, and it rules out stale walk-cache entries).
+- **BO memory** comes from XNU:
+  - the 0111 self-tests use `kmem_alloc_contig` (as UFS does in 0028), cleaned and invalidated to PoC
+    once, then accessed only through an uncached alias;
+  - 0112 uses `IOBufferMemoryDescriptor` mapped write-combined, and imports walk an IOSurface's
+    descriptor page by page.
+
+  The GPU side is non-cacheable, so CPU writes need only `dsb sy` before a submit, and CPU reads need
+  only the fence.
+
+**Register writes in Stage 6** (CPU, through the GX mapping):
+- `CP_PROTECT_CNTL`, `CP_PROTECT_REG(0..31)`;
+- `RBBM_INT_0_MASK`, `RBBM_INT_CLEAR_CMD`, `RBBM_INTERFACE_HANG_INT_CNTL`;
+- the doorbell `CP_RB_WPTR`;
+- the DCVS mailbox (6.6 only);
+- CB0's `TLBIALL` / `TLBSYNC` in the SMMU;
+- `CP_SQE_CNTL = 0` only when the hang detector turns the service off.
+
+**Never** written: `RBBM_SECVID_TRUST_CNTL` (and never read, as in Stage 5), any GMU power register, and
+the CB0 identity entries 2–7.
+
+**The ring preamble per submit** (as `a6xx_submit`, without the stats counters). Every header word comes
+from 0107's `pkt4()` / `pkt7()` with their parity bits, so none are quoted here:
+1. `CP_EVENT_WRITE` (0x46, count 1): `PC_CCU_INVALIDATE_DEPTH` (0x18).
+2. `CP_EVENT_WRITE` (0x46, count 1): `PC_CCU_INVALIDATE_COLOR` (0x19).
+3. Per IB: `CP_INDIRECT_BUFFER` (0x3f, count 3): iova low, iova high, size in dwords.
+4. PKT4 `CP_SCRATCH_REG(2)` (0x885) = seqno (mainline's "fence in scratch 2", useful in a dump).
+5. `CP_EVENT_WRITE` (count 4): dword 0 = `CACHE_FLUSH_TS (4) | IRQ (bit 31)` = `0x80000004`, then fence
+   pa low, high, seqno. Then the doorbell.
+
+**The "svc dump"** is the zap dump plus:
+- `RBBM_INT_0_STATUS`, `CP_IB1_BASE`/`REM_SIZE`, `CP_IB2_BASE`/`REM_SIZE`, `CP_SCRATCH_REG(2)`;
+- fence word 0 and the last seqno sent;
+- the GICD enable/pending bits for INTID 332.
+
+It is logged after every step and on any stop.
+
+#### 6.0 Survey and setup, no new GPU work (`sweetsvc=0`)
+
+1. Read and log `CP_PROTECT_CNTL` and all 32 `CP_PROTECT_REG`s, `RBBM_INT_0_MASK`, `RBBM_INT_0_STATUS`,
+   `RBBM_INTERFACE_HANG_INT_CNTL`, `CP_SCRATCH_REG(0..7)` and `CP_ALWAYS_ON_COUNTER`. These are new
+   reads, so their values before we write them are the record.
+2. Read GICD `ISENABLER10`/`ISPENDR10` bit 12 (INTID 332) through a read-only `ml_io_map` of the
+   distributor. Want enabled 0.
+3. Read CB0's level-1 entry 8. Want 0.
+4. Zero the fence page, the IB pool and the window tables, then `dsb sy`.
+5. Allocate one 16 KiB self-test BO (`kmem_alloc_contig`) and log its pa.
+
+✅ Pass when every read completes without an abort, entry 8 is 0, INTID 332 is not enabled, and nothing
+is latched in the CP or the SMMU.
+
+#### 6.1 Register protection and the interrupt mask (`sweetsvc=1`)
+
+With the CP idle (RPTR = WPTR, RBBM_STATUS idle):
+
+1. `CP_PROTECT_CNTL = 0xb`: `ACCESS_PROT_EN` (bit 0), `ACCESS_FAULT_ON_VIOL_EN` (bit 1),
+   `LAST_SPAN_INF_RANGE` (bit 3).
+2. The 32 `a630_protect` entries below. a630 has count = count_max = 32, so entry 31 is both "the last"
+   and the infinite one. Encoding: RDONLY = `len << 18 | reg`, NORDWR = the same | bit 31.
+3. `RBBM_INTERFACE_HANG_INT_CNTL = 0x401fffff` (mainline's default branch, which a618 takes).
+4. `RBBM_INT_0_MASK = 0x03d0e242` (mainline's `A6XX_INT_MASK`).
+5. Read every register back.
+6. Then on the ring: a register marker (0x5ee76001 to `CP_SCRATCH_REG(7)` = 0x88a, which is not
+   protected), and `CP_MEM_WRITE 0xc0ff6001` to scratch-page word 4. Wait idle.
+
+| # | Register | Kind | Base | Len | Value |
+|---|---|---|---|---|---|
+| 0 | 0x850 | RDONLY | 0x00000 | 0x04ff | 0x13fc0000 |
+| 1 | 0x851 | RDONLY | 0x00501 | 0x0005 | 0x00140501 |
+| 2 | 0x852 | RDONLY | 0x0050b | 0x02f4 | 0x0bd0050b |
+| 3 | 0x853 | NORDWR | 0x0050e | 0x0000 | 0x8000050e |
+| 4 | 0x854 | NORDWR | 0x00510 | 0x0000 | 0x80000510 |
+| 5 | 0x855 | NORDWR | 0x00534 | 0x0000 | 0x80000534 |
+| 6 | 0x856 | NORDWR | 0x00800 | 0x0082 | 0x82080800 |
+| 7 | 0x857 | NORDWR | 0x008a0 | 0x0008 | 0x802008a0 |
+| 8 | 0x858 | NORDWR | 0x008ab | 0x0024 | 0x809008ab |
+| 9 | 0x859 | RDONLY | 0x008de | 0x00ae | 0x02b808de |
+| 10 | 0x85a | NORDWR | 0x00900 | 0x004d | 0x81340900 |
+| 11 | 0x85b | NORDWR | 0x0098d | 0x0272 | 0x89c8098d |
+| 12 | 0x85c | NORDWR | 0x00e00 | 0x0001 | 0x80040e00 |
+| 13 | 0x85d | NORDWR | 0x00e03 | 0x000c | 0x80300e03 |
+| 14 | 0x85e | NORDWR | 0x03c00 | 0x00c3 | 0x830c3c00 |
+| 15 | 0x85f | RDONLY | 0x03cc4 | 0x1fff | 0x7ffc3cc4 |
+| 16 | 0x860 | NORDWR | 0x08630 | 0x01cf | 0x873c8630 |
+| 17 | 0x861 | NORDWR | 0x08e00 | 0x0000 | 0x80008e00 |
+| 18 | 0x862 | NORDWR | 0x08e08 | 0x0000 | 0x80008e08 |
+| 19 | 0x863 | NORDWR | 0x08e50 | 0x001f | 0x807c8e50 |
+| 20 | 0x864 | NORDWR | 0x09624 | 0x01db | 0x876c9624 |
+| 21 | 0x865 | NORDWR | 0x09e70 | 0x0001 | 0x80049e70 |
+| 22 | 0x866 | NORDWR | 0x09e78 | 0x0187 | 0x861c9e78 |
+| 23 | 0x867 | NORDWR | 0x0a630 | 0x01cf | 0x873ca630 |
+| 24 | 0x868 | NORDWR | 0x0ae02 | 0x0000 | 0x8000ae02 |
+| 25 | 0x869 | NORDWR | 0x0ae50 | 0x032f | 0x8cbcae50 |
+| 26 | 0x86a | NORDWR | 0x0b604 | 0x0000 | 0x8000b604 |
+| 27 | 0x86b | NORDWR | 0x0be02 | 0x0001 | 0x8004be02 |
+| 28 | 0x86c | NORDWR | 0x0be20 | 0x17df | 0xdf7cbe20 |
+| 29 | 0x86d | NORDWR | 0x0f000 | 0x0bff | 0xaffcf000 |
+| 30 | 0x86e | RDONLY | 0x0fc00 | 0x1fff | 0x7ffcfc00 |
+| 31 | 0x86f | NORDWR | 0x11c00 | (infinite) | 0x80011c00 |
+
+Notes:
+- Entry 6 covers 0x800–0x882 (ring registers, `CP_PROTECT_*` itself). The scratch registers 0x883–0x88a
+  are just past it, which is why our markers still work. CP_PROTECT only filters the *CP's* register
+  accesses (ring and IB packets), not the CPU's AHB writes, so the doorbell is unaffected.
+- `RBBM_INT_0_MASK` bits: CP_AHB_ERROR 1, ATB_ASYNCFIFO_OVERFLOW 6, CP_HW_ERROR 9, CP_IB2 13, CP_IB1 14,
+  CP_RB 15, CP_CACHE_FLUSH_TS 20, ATB_BUS_OVERFLOW 22, HANG_DETECT 23, UCHE_OOB_ACCESS 24,
+  UCHE_TRAP_INTR 25.
+- Mainline writes all of this **before** `CP_SQE_CNTL = 1`. Ours writes it with the SQE running but idle
+  (risk 1).
+- No violation test in Stage 6: a fault-on-violation stops the CP, and we have no GPU reset yet.
+
+✅ Pass when every register reads back as written, the marker and the write land, and `CP_HW_FAULT`,
+`CP_PROTECT_STATUS` and `CP_INTERRUPT_STATUS` stay 0.
+
+#### 6.2 Fences: `CACHE_FLUSH_TS` (`sweetsvc=2`)
+
+1. Ring: `CP_SCRATCH_REG(2) = 1`, then the 4-dword `CACHE_FLUSH_TS` (with IRQ) writing 1 to fence word 0.
+   Kick. Poll the fence word from the CPU every 10 µs, up to 1 s, and log the time.
+2. Read `RBBM_INT_0_STATUS`. Want bit 20 (CACHE_FLUSH_TS), and perhaps bits 15 (CP_RB) and 14. Clear it
+   with `RBBM_INT_CLEAR_CMD` = the value read, and read 0 back.
+3. Log the GICD pending bit for INTID 332 (want 1: the line asserted at a disabled interrupt; harmless).
+4. 64 fences back to back, seqnos 2–65, one kick. Want fence word 0 = 65, monotonic samples, and RPTR = WPTR.
+5. Start the **poller**: a kernel thread that, every 1 ms while `last_sent != fence`, reads the fence word
+   and `RBBM_INT_0_STATUS`.
+   - It clears the latched bits.
+   - It wakes waiters on each new fence.
+   - It logs (rate-limited) any error bit: 1, 6, 9, 22, 23, 24, 25.
+
+   With no work outstanding it sleeps until the next submit.
+
+✅ Pass when every fence lands in order, the first within 1 ms, `INT_0_STATUS` latches and clears as
+expected, and nothing else is latched.
+
+#### 6.3 Indirect buffers and the GPU VA window (`sweetsvc=3`)
+
+1. **Kernel IB, identity address.** IB 0 in the pool: `CP_MEM_WRITE 0xc0ff6301` to scratch word 5, and a
+   PKT4 marker 0x5ee76301 to `CP_SCRATCH_REG(6)`. Submit it with the preamble and fence 66. Want the word,
+   the marker and the fence.
+2. **A long IB.** IB 1: 256 `CP_MEM_WRITE`s of `0xc0ff6400 + i` to scratch words 256–511, about 1 KiB of
+   commands. Want all 256 words, and nothing else in the page changed.
+3. **Two IBs in one submit**, then **16 submits queued** before one kick (ring space check: never let WPTR
+   pass RPTR − 1).
+4. **The window.**
+   - Write CB0 level-1 entry 8 → the level-2 table, then `cb0_tlbiall()`.
+   - Map 6.0's 16 KiB BO at GPU VA 0x2_0000_0000 (4 pages, possibly scattered).
+   - IB: `CP_MEM_WRITE`s through the *window* VA to the first and last word of each page. The CPU reads
+     them back through the BO's own mapping.
+5. **Unmap and remap.**
+   - Unmap page 2, `cb0_tlbiall()`, map a *different* page at the same VA, and write through it again.
+   - Want the new page written and the old page untouched.
+   - This proves the TLB invalidate. Without it, the write would land in the old page.
+
+✅ Pass when every write and fence lands, the window writes land in the right physical pages,
+`CP_IB1_REM_SIZE` reads 0 when idle, and the SMMU bank 0 FSR stays at the 0x400 baseline (no translation
+fault).
+
+#### 6.4 Self-test: clear and copy (`sweetsvc=4`)
+
+Two 64×64 RGBA8 "surfaces" (16 KiB each) as window BOs A and B, both poisoned by the CPU with 0x5ee7dead.
+1. **Clear.** One IB: a single `CP_MEM_WRITE` packet with 4096 data dwords of `0xff336699` into A.
+2. **Copy.** One IB: 4096 `CP_MEM_TO_MEM` packets (count 5: flags 0, dst B+4i, src A+4i), 24 KiB of
+   commands, with `WAIT_FOR_MEM_WRITES` (bit 30) on the first packet, so the copy waits for the clear.
+3. **Pattern copy.** The CPU fills A with `(y << 16) | x`, then the GPU copies A to B again.
+4. The CPU compares A and B after each step and counts bad pixels. It logs the time of each IB using
+   `CP_ALWAYS_ON_COUNTER` (19.2 MHz) read before the kick and after the fence.
+
+This uses the CP, not the 2D blitter. `CP_BLIT` and the `RB_2D_*` / `GRAS_2D_*` path need about 30
+registers of blitter state and CCU flushes. That is real rendering work, and it moves to Stage 7, where
+sweetgl's blitter code sets it up. The CP path still exercises everything the service owns: BOs, the
+window, IBs, ordering and fences.
+
+✅ Pass when all three checks report **0 bad pixels** and every fence lands.
+
+#### 6.5 Hang detector (`sweetsvc=5`)
+
+The rule:
+- If `last_sent != fence` and neither the fence word nor `CP_RB_RPTR` / `CP_IB1_REM_SIZE` has changed for
+  **2 s**, the GPU is hung.
+- The detector then logs the svc dump, writes `CP_SQE_CNTL = 0`, marks the service **dead** until reboot,
+  and fails every waiter (`kIOReturnNotResponding` in 0112).
+
+2 s matches mainline's order of magnitude (500 ms × 3 progress retries ≈ 1.5 s). An error bit in
+`INT_0_STATUS` (CP_HW_ERROR 9, HANG_DETECT 23, UCHE_OOB 24) also kills the service at once.
+
+Test, without losing the CP for later steps:
+1. Scratch word 8 = 0. Submit an IB with `CP_WAIT_REG_MEM` (count 5: FUNCTION = EQ (3), POLL = memory
+   (bit 4), addr = scratch word 8, ref 1, mask 0xffffffff, delay 16), then `CP_MEM_WRITE 0xc0ff6501` to
+   word 9, then the fence.
+2. The CP now waits for the memory. The detector runs in **test mode** for this one submit. It must report
+   "hang detected" between 2.0 and 2.1 s, then log "test mode: not stopping".
+3. The CPU writes 1 to word 8 and `dsb sy`. The CP must resume: word 9 and the fence land within 10 ms.
+4. Then a normal submit, to show that nothing stuck.
+
+✅ Pass when the detector fires in the window, the CP resumes and finishes after the release, and no error
+bit latches. If the CP does *not* resume, the real rule runs (SQE halted, service dead), the step fails,
+and the image's later steps are skipped.
+
+#### 6.6 Clock steps (`sweetsvc=6`)
+
+Through 2B.6's DCVS path (mailbox `GMU_DCVS_PERF_SETTING = 0x30000000 | index`, `DCVS_BW_SETTING`
+0x000ff0ff = no change, `OOB_DCVS`, then `DCVS_RETURN`).
+
+Perf indices follow the 2B.5 table order, 1 = 180 MHz (measured on G3k):
+- 2 = 267, 3 = 355, 4 = 430, 5 = 565, 6 = 650, 7 = 700 MHz.
+- This order is a guess until 6.6 measures it.
+
+The GMU votes the matching `gfx.lvl` corner itself from the perf table (as it did for 180 MHz). We send
+no ARC vote of our own.
+
+1. Index 4. Measure `gx_gfx3d` with the 0099 counter (want 430 MHz ± 1 %). Run the 6.4 self-test and time
+   it.
+2. Index 5. Measure (want 565 MHz ± 1 %), then the self-test again.
+3. Stay at 565 MHz for 6.7. 650 and 700 MHz are not tried in Stage 6: they need ACD, and their thermal
+   behaviour is unknown.
+
+The DDR bus vote stays "no change". A BW index is added (a separate, planned step) only if the copy is
+*not* faster at 565 than at 430, which would point at memory bandwidth.
+
+✅ Pass when `DCVS_RETURN` is 0 and the measured clock matches at both steps, the self-tests report 0 bad
+pixels, and GX stays on. If 565 fails, fall back to index 4 and record it. That is still a pass for
+Stage 6, with `max_freq` 430 MHz.
+
+#### 6.7 Service ready and hold (`sweetsvc=7`, the whole kernel part of Stage 6)
+
+1. Log `SWEET GSVC: service ready` with the info block:
+   - chip_id 0x06010800, gmem_size 0x80000, gmem_base 0x100000;
+   - cur/max freq;
+   - the fence page pa, the window base and size.
+2. For 60 s, every 10 s, run the 6.4 self-test **through the C API only** (`bo_new` ×2, `submit`, `wait`,
+   `bo_free` ×2). This is the same path the user client takes. After each run, log the svc dump, GX GDSC,
+   GMU state and the BO bitmap (want every page free again after each round).
+3. Leave the service up and idle.
+
+✅ Pass (Stage 6 kernel part) when "service ready" is logged, every self-test round reports 0 bad pixels,
+no BO pages leak, nothing latches, and the phone stays stable.
+
+#### 6U User client and userspace test (patch 0112, after 6.7 passes)
+
+A `SweetGPU` IOService, matched by name and published only when the service is ready, with user client
+`SweetGPUUserClient`. Selectors as in their design. Our argument layout:
+
+| Sel | Name | In | Out | Notes |
+|---|---|---|---|---|
+| 10 | bo new | scalar [size, flags] | scalar [handle, gpu_va, user_va] | pages from `IOBufferMemoryDescriptor`, user map write-combined; size ≤ 16 MiB per BO |
+| 11 | bo free | scalar [handle] | — | unmapped from the window only after the BO's last fence |
+| 12 | bo import IOSurface | scalar [surface id] | scalar [handle, gpu_va, size] | via `SweetSurface` lookup (0046); pages walked from its descriptor |
+| 13 | submit | struct {count ≤ 16; {handle, offset, size_dw} × count} | scalar [seqno] | each IB checked to lie inside its BO; the kernel builds the preamble and fence |
+| 14 | wait | scalar [seqno, timeout_ms] | — | success, `kIOReturnTimeout`, or `kIOReturnNotResponding` once the service is dead |
+| 15 | info | — | struct {chip_id, gmem_size, gmem_base, cur_khz, max_khz, fence_user_va, last_retired, flags} | the fence page mapped read-only into the task |
+
+- Selectors 0–9 and above 15 return `kIOReturnUnsupported`, logged once each.
+- Closing the client waits for its outstanding seqnos (2 s cap), then frees its BOs.
+
+**Security, and why 6U is a debug interface only.** CB0 maps all DRAM 1:1, and user IBs run in CB0. So
+any process that can submit can read and write *all physical memory* through the GPU. CP_PROTECT (6.1)
+only protects GPU registers. So in Stage 6:
+- the client opens only for uid 0;
+- it opens only when booted with `sweetgpu=8`;
+- every open is logged.
+
+Per-process GPU page tables (`CP_SMMU_TABLE_UPDATE`, a user context without the identity map) are required
+before any app may use the GPU. They are an open item for Stage 7/9, not a Stage 6 step.
+
+**The test tool** (`sweetgpu-test`, static, ad-hoc signed):
+- `info`;
+- 6.4's clear/copy through selectors 10/13/14;
+- an IOSurface import plus a clear of it;
+- a bad submit (IB outside its BO), which must be refused with no GPU work;
+- printing "0 bad pixels".
+
+How it reaches the phone is the **owner's decision**, because it changes the iOS root on userdata.
+Options:
+- (a) a LaunchDaemon added by the root tweaks;
+- (b) the tool in the boot payload's RAM disk, run before the root mounts.
+
+✅ Pass when the tool prints the info block, 0 bad pixels for both the BO and the IOSurface, the bad submit
+is refused, and the kernel log shows no error bits.
+
+#### Test boots
+
+One kernel (0111) for G6a–G6d, then 0112 for G6e. All use `sweetgpu=8 sweetgmu=6 sweetcp=5 sweetzap=5` and
+the 828xr ADT, and differ only in `sweetsvc`. `shim/out` has no G6* names yet. Each boot needs the owner's
+OK. Leave the phone on about 5 minutes, then pull the log as for G5c.
+
+| Image | `sweetsvc` | Beyond G5c | Purpose |
+|---|---|---|---|
+| G6a | 1 | survey, buffers, CP_PROTECT, INT mask | protection set while the SQE runs; first look at INTID 332 |
+| G6b | 3 | fences, IBs, the VA window, TLB invalidate | the submit path works end to end |
+| G6c | 5 | self-test, hang detector | 0 bad pixels; detector fires and the CP survives |
+| G6d | 7 | 430/565 MHz, service ready, 60 s hold | Stage 6 kernel part complete |
+| G6e | 7 + 0112 | user client and the test tool | after the owner picks how the tool is delivered |
+
+Steps 6.0, 6.2, 6.4 and 6.6 have no image of their own: the next image runs through them, and its log
+shows each step's result. If an image stops early, the fix is a new patch and CI run, shown before anything
+boots. A smaller `sweetsvc` value can then be used to isolate the step.
+
+#### Risks for Stage 6, most uncertain first
+
+1. **CP_PROTECT written while the SQE runs.**
+   - Mainline only programs it with the SQE stopped (in `hw_init`, and again after a reset).
+   - The CP may ignore the change, latch a protect fault on a later packet, or need CP_ME_INIT again.
+   - Fallback: move the writes into Stage 4's `cp_init_regs` (before `CP_SQE_CNTL = 1`) in a follow-up
+     patch. That changes the order of G4/G5, so they get re-run.
+2. **The window's TLB invalidate.**
+   - `TLBIALL`/`TLBSYNC` on CB0 are new SMMU writes. Stage 3 programmed CB0 freely, so the hypervisor
+     probably allows them (guess).
+   - If `TLBSTATUS` never clears, the window is still usable for map-once BOs. Unmap-and-reuse then waits
+     for a later stage.
+3. **The CP does not resume after `CP_WAIT_REG_MEM`** (6.5). Possible causes: the memory poll goes through
+   the UCHE and caches the old value, or the delay field means something else. The service dies as designed
+   and G6c ends there. A fix would be a short `delay`, or a register poll (`POLL` = register) on a scratch
+   register.
+4. **`RBBM_INT_0_STATUS` does not latch without a live interrupt line.** Then the fence poller still works.
+   Only the error-bit check goes blind. We would rely on `CP_HW_FAULT`, `CP_INTERRUPT_STATUS` and the
+   2 s rule instead, and record it.
+5. **565 MHz needs a bus or ACD vote**, or `DCVS_RETURN` is non-zero. Stay at 430 MHz (the pass rule
+   allows it), and plan the BCM vote separately.
+6. **CPU/GPU coherency.**
+   - The kernel BOs have a cacheable alias from `kmem_alloc_contig`. We clean and invalidate once, then
+     use only the uncached alias.
+   - A missed `dsb sy` or a stale line would show as bad pixels in 6.4, never as a hang. Pixels holding
+     0x5ee7dead mean "GPU write lost"; others mean "CPU read stale".
+7. **Throughput.** `CP_MEM_TO_MEM` moves one dword per 6-dword packet. 16 KiB per copy is a few
+   milliseconds at most, so it is too small to matter. It only means the timing numbers measure the CP, not
+   memory bandwidth.
+
+Stage 6 leaves these for later:
+- the GIC route for SPI 332 (real interrupts);
+- per-process page tables (needed before untrusted users);
+- the 2D blitter and shaders (Stage 7);
+- a GPU reset path for a dead service (today: reboot);
+- 650/700 MHz with ACD;
+- BOs over 64 MiB in total;
+- power collapse (Stage 9).
 
 ### Stage 7: sweetgl for a618 (needs the licence decision)
 
@@ -1827,3 +2252,11 @@ CPU-visible. Stages 0–5 are done.
 
 Not known: whether anything differs between secure and non-secure writes, since both landed. Next (to plan, with
 the owner's OK): Stage 6.
+
+**Stage 6 planned (2026-10-26), not yet approved.** The detailed plan is under "Stage 6" above. In short:
+- patch 0111 (kernel only) for steps 6.0–6.7, with the new boot-arg `sweetsvc`;
+- images G6a (1), G6b (3), G6c (5) and G6d (7);
+- then patch 0112 (the user client, selectors 10–15, and a test tool), whose delivery to the phone is the
+  owner's choice.
+
+Interrupts stay polled, because the GIC never enables SPI 332. No code exists yet.
