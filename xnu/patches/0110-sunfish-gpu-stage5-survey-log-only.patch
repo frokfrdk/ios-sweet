@@ -1,0 +1,74 @@
+--- a/bsd/dev/sweet_zap.c
++++ b/bsd/dev/sweet_zap.c
+@@ -10,8 +10,9 @@
+  * code is ours. RBBM_SECVID_TRUST_CNTL is never written (secvid-set-once) and
+  * is not read once the zap is loaded.
+  * sweetzap=N stops after step 5.N:
+- *  5.0 read-only SCM queries (convention, call availability, PAS 13
+- *      supported), the MDT and B02 checks, the metadata copied into
++ *  5.0 read-only SCM queries (convention, call availability; PAS 13, 1, 4,
++ *      9 and 18 supported is logged only), the MDT and B02 checks, the
++ *      carve-out read, the metadata copied into
+  *      GPU-GMU-MEM (uncached, 4 KiB aligned)
+  *  5.1 one CP_MEM_WRITE while still secure; whether it lands is only logged
+  *  5.2 PAS_INIT_IMAGE (the metadata), PAS_MEM_SETUP (the carve-out)
+@@ -341,34 +342,47 @@
+ 	zap_dump("5.0 as found");
+ 	unsigned page = zap_page_check("5.0");
+ 
+-	gpu_pause("5.0 SCM: SMC64 convention probe, IS_CALL_AVAIL for PIL 1/2/5/7, PAS_IS_SUPPORTED(13)");
++	gpu_pause("5.0 SCM: SMC64 convention probe, IS_CALL_AVAIL for PIL 1/2/5/7, PAS_IS_SUPPORTED(13, 1, 4, 9, 18)");
+ 	uint64_t r = 0;
+ 	if (!zap_scm("IS_CALL_AVAIL(INFO 1), fast", SCM_FN(1, SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 1,
+ 	    SCM_FNID_SIP(SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 0, 0, &r) || r != 1u) {
+ 		printf("SWEET ZAP: 5.0 stopped: the SMC64 convention probe did not answer 1\n");
+ 		return false;
+ 	}
++	/* 1, 2 and 5 are the calls 5.2-5.3 make; 7 is only logged */
+ 	static const struct {
+ 		const char *name;
+ 		uint32_t cmd;
++		bool need;
+ 	} pil[] = {
+-		{ "IS_CALL_AVAIL(PAS_INIT_IMAGE)", SCM_PAS_INIT_IMAGE },
+-		{ "IS_CALL_AVAIL(PAS_MEM_SETUP)", SCM_PAS_MEM_SETUP },
+-		{ "IS_CALL_AVAIL(PAS_AUTH_AND_RESET)", SCM_PAS_AUTH_AND_RESET },
+-		{ "IS_CALL_AVAIL(PAS_IS_SUPPORTED)", SCM_PAS_IS_SUPPORTED },
++		{ "IS_CALL_AVAIL(PAS_INIT_IMAGE)", SCM_PAS_INIT_IMAGE, true },
++		{ "IS_CALL_AVAIL(PAS_MEM_SETUP)", SCM_PAS_MEM_SETUP, true },
++		{ "IS_CALL_AVAIL(PAS_AUTH_AND_RESET)", SCM_PAS_AUTH_AND_RESET, true },
++		{ "IS_CALL_AVAIL(PAS_IS_SUPPORTED)", SCM_PAS_IS_SUPPORTED, false },
+ 	};
+ 	bool ok = true;
+ 	for (unsigned i = 0; i < sizeof(pil) / sizeof(pil[0]); ++i) {
+-		ok = zap_scm(pil[i].name, SCM_FN(0, SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 1,
+-		    SCM_FNID_SIP(SCM_SVC_PIL, pil[i].cmd), 0, 0, &r) && r == 1u && ok;
++		bool smc = zap_scm(pil[i].name, SCM_FN(0, SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 1,
++		    SCM_FNID_SIP(SCM_SVC_PIL, pil[i].cmd), 0, 0, &r);
++		ok = smc && (r == 1u || !pil[i].need) && ok;
++	}
++	/*
++	 * Log only (G5a: PAS 13 read 0). Neither the stock sunfish PIL nor
++	 * mainline asks this, so 1, 4, 9 and 18 are a baseline, not a rule.
++	 */
++	static const uint32_t pas[] = { ZAP_PAS_ID, 1, 4, 9, 18 };
++	char name[32];
++	printf("SWEET ZAP:   PAS_IS_SUPPORTED is logged only; it does not stop the stage\n");
++	for (unsigned i = 0; i < sizeof(pas) / sizeof(pas[0]); ++i) {
++		snprintf(name, sizeof(name), "PAS_IS_SUPPORTED(%u)", pas[i]);
++		r = 0;
++		ok = zap_scm(name, SCM_FN(0, SCM_SVC_PIL, SCM_PAS_IS_SUPPORTED), 1, pas[i], 0, 0, &r) && ok;
++		printf("SWEET ZAP:   PAS %u reads %s\n", pas[i], r == 1u ? "supported" : "not supported");
+ 	}
+-	bool sup = zap_scm("PAS_IS_SUPPORTED(13)", SCM_FN(0, SCM_SVC_PIL, SCM_PAS_IS_SUPPORTED), 1, ZAP_PAS_ID, 0, 0, &r) &&
+-	    r == 1u;
+-	printf("SWEET ZAP:   PIL calls %s; PAS 13 %s\n", ok ? "all available" : "NOT all available",
+-	    sup ? "supported" : "NOT supported");
++	printf("SWEET ZAP:   PIL calls %s\n", ok ? "answered; 1, 2 and 5 available" : "NOT all answered or available");
+ 	printf("SWEET ZAP:   RBBM_SECVID_TRUST_CNTL %#07x = 0x%08x (the last read; never written)\n", ZAP_SECVID_TRUST_CNTL,
+ 	    sweet_cp_rd(ZAP_SECVID_TRUST_CNTL));
+-	ok = zap_mdt_check(mdt, mdt_len, b02, b02_len) && ok && sup;
++	ok = zap_mdt_check(mdt, mdt_len, b02, b02_len) && ok;
+ 	if (!ok) {
+ 		return false;
+ 	}
