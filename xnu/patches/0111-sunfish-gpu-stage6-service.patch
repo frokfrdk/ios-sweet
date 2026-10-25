@@ -1,0 +1,1730 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_cp.c			standard
+ bsd/dev/sweet_zap.c			standard
++bsd/dev/sweet_gsvc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_cp.c
++++ b/bsd/dev/sweet_cp.c
+@@ -629,19 +629,39 @@
+ 	return ok;
+ }
+ 
+-/* For stage 5, after sweet_cp_run passed 4.4 or later */
++/* For stages 5 and 6, after sweet_cp_run passed 4.4 or later */
+ uint32_t
+ sweet_cp_rd(uint32_t reg)
+ {
+ 	return cp_rd(reg);
+ }
+ 
++void
++sweet_cp_wr(uint32_t reg, uint32_t val)
++{
++	cp_wr(reg, val);
++}
++
++uint32_t
++sweet_cp_pkt4(uint32_t reg, uint32_t cnt)
++{
++	return pkt4(reg, cnt);
++}
++
+ uint32_t
+ sweet_cp_pkt7(uint32_t op, uint32_t cnt)
+ {
+ 	return pkt7(op, cnt);
+ }
+ 
++/* Ring dwords free to emit; RPTR from the register, one slot kept empty */
++uint32_t
++sweet_cp_ring_free(void)
++{
++	uint32_t rptr = cp_rd(REG_A6XX_CP_RB_RPTR) % CP_RING_DWORDS;
++	return (rptr + CP_RING_DWORDS - cp_wptr - 1u) % CP_RING_DWORDS;
++}
++
+ void
+ sweet_cp_emit(uint32_t w)
+ {
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -1025,4 +1025,17 @@
+ 	sweet_gmu_status("after OOB_GPU and DCVS");
+ 	return ok;
+ }
++
++/* Stage 6.6: the 2B.6 DCVS vote with another perf index; ret = DCVS_RETURN (0 when the GMU accepted it) */
++bool
++sweet_gmu_dcvs(unsigned index, uint32_t *ret)
++{
++	bool ok = gmu_set("DCVS_ACK_OPTION", REG_A6XX_GMU_DCVS_ACK_OPTION, 0);
++	ok = gmu_set("DCVS_PERF_SETTING", REG_A6XX_GMU_DCVS_PERF_SETTING, 0x30000000u | index) && ok;
++	ok = gmu_set("DCVS_BW_SETTING", REG_A6XX_GMU_DCVS_BW_SETTING, DCVS_BW_NO_CHANGE) && ok;
++	ok = ok && gmu_oob_set(OOB_DCVS, "dcvs");
++	*ret = gmu_rd(gm_gmu, REG_A6XX_GMU_DCVS_RETURN);
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1u << (OOB_DCVS + 24u));   /* oob_clear */
++	return ok;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -88,6 +88,10 @@
+  * sweet_zap.c: sweetzap=N (0-6) stops after step 5.N, from read-only SCM
+  * queries (0) through TrustZone loading the zap (3), CP_SET_SECURE_MODE 0 (4)
+  * and the GPU's first writes to DRAM (5) to a 30 s hold (6).
++ * Stage 6 (sweetgpu=8, after stage 5 with sweetzap >= 5) is the kernel GPU
++ * service in sweet_gsvc.c: sweetsvc=N (0-7) stops after step 6.N, from reads
++ * only (0) through CP_PROTECT, fences, IBs and the GPU VA window, the
++ * self-test, the hang detector and DCVS to "service ready" and a 60 s hold (7).
+  * GMU and cx_misc offsets come from the generated sweet_gpu_regs.h; GCC and
+  * gpucc offsets from the downstream drivers above. Everything stays on after
+  * the last stage that runs.
+@@ -251,7 +255,9 @@
+ 	const uint8_t *va;
+ } gpu_blobs[BLOB_COUNT];
+ 
+-static int gpu_level, gpu_hang, gpu_gmu_stop, gpu_gmu_rsc, gpu_cp_stop, gpu_zap_stop;
++static int gpu_level, gpu_hang, gpu_gmu_stop, gpu_gmu_rsc, gpu_cp_stop, gpu_zap_stop, gpu_svc_stop;
++static vm_offset_t gpu_meas_gcc, gpu_meas_cc, gpu_l1_va;       /* for stage 6 */
++static uint64_t gpu_l1_pa;
+ static uint32_t gpu_delay_s = SWEET_GPU_DELAY_S;
+ static int gpu_sleep_chan;
+ 
+@@ -860,6 +866,16 @@
+ 	return (uint32_t)(hz * GCC_DEBUG_DIV * GPUCC_DEBUG_DIV / 1000u);
+ }
+ 
++/* Stage 6.6: gx_gfx3d now, in kHz (0 stopped, MEAS_FAILED if not measurable) */
++uint32_t
++sweet_gpu_gfx3d_khz(void)
++{
++	if (!gpu_meas_gcc || !gpu_meas_cc) {
++		return MEAS_FAILED;
++	}
++	return gpu_measure_khz(gpu_meas_gcc, gpu_meas_cc, 0x0c);
++}
++
+ struct gpu_meas {
+ 	const char *name;
+ 	uint32_t sel;           /* gpucc debug mux input */
+@@ -1165,6 +1181,8 @@
+ 		return false;
+ 	}
+ 	*cbp = cb;
++	gpu_l1_va = va;
++	gpu_l1_pa = pa;
+ 	bool ok = sweet_smmu_faults(cb, "stage 3 after attach") == 0;
+ 	uint32_t st3 = gpu_rd(gpu, REG_A6XX_RBBM_STATUS3 * 4u);
+ 	printf("SWEET GPU:   RBBM_STATUS 0x%08x RBBM_STATUS3 0x%08x (%s)\n", gpu_rd(gpu, REG_A6XX_RBBM_STATUS * 4u), st3,
+@@ -1195,8 +1213,8 @@
+ 	}
+ 	printf("SWEET GPU: stage 0 (sweetgpu=%d): firmware blobs, cmd-db, speed bin; no GPU registers\n",
+ 	    gpu_level);
+-	if (gpu_level > 7) {
+-		printf("SWEET GPU: stages above 5 are not built yet; running stages 0 to 5\n");
++	if (gpu_level > 8) {
++		printf("SWEET GPU: stages above 6 are not built yet; running stages 0 to 6\n");
+ 	}
+ 	unsigned found = gpu_find_blobs();
+ 	gpu_check_blobs();
+@@ -1210,6 +1228,8 @@
+ 			gpu_stage2a(gcc, cc, gmu);
+ 		} else if (gpu_level >= 4 && gpu_stage2b(gcc, cc, gmu, bin) && gpu_level >= 5) {
+ 			vm_offset_t gpu = ml_io_map(GPU_PA, GPU_REGS_SIZE);
++			gpu_meas_gcc = gcc;
++			gpu_meas_cc = cc;
+ 			if (gpu_gmu_stop != 6) {
+ 				printf("SWEET GPU: stage 3 needs all of 2B (sweetgmu=6); not run\n");
+ 			} else if (gpu) {
+@@ -1219,10 +1239,14 @@
+ 				    cc + GPUCC_GX_GDSCR) && gpu_level >= 7) {
+ 					if (gpu_cp_stop < 5) {
+ 						printf("SWEET GPU: stage 5 needs stage 4 through 4.5 (sweetcp=5 or 6); not run\n");
+-					} else {
+-						(void)sweet_zap_run(gpu_zap_stop, gpu_blobs[BLOB_ZAP_MDT].va,
+-						    gpu_blobs[BLOB_ZAP_MDT].len, gpu_blobs[BLOB_ZAP_B02].va,
+-						    gpu_blobs[BLOB_ZAP_B02].len);
++					} else if (sweet_zap_run(gpu_zap_stop, gpu_blobs[BLOB_ZAP_MDT].va,
++					    gpu_blobs[BLOB_ZAP_MDT].len, gpu_blobs[BLOB_ZAP_B02].va,
++					    gpu_blobs[BLOB_ZAP_B02].len) && gpu_level >= 8) {
++						if (gpu_zap_stop < 5) {
++							printf("SWEET GPU: stage 6 needs stage 5 through 5.5 (sweetzap=5 or 6); not run\n");
++						} else {
++							(void)sweet_gsvc_run(gpu_svc_stop, cb, gpu_l1_va, gpu_l1_pa);
++						}
+ 					}
+ 				}
+ 			}
+@@ -1262,6 +1286,10 @@
+ 	if (gpu_zap_stop < 0 || gpu_zap_stop > 6) {
+ 		gpu_zap_stop = 0;
+ 	}
++	(void)PE_parse_boot_argn("sweetsvc", &gpu_svc_stop, sizeof(gpu_svc_stop));
++	if (gpu_svc_stop < 0 || gpu_svc_stop > 7) {
++		gpu_svc_stop = 0;
++	}
+ 	thread_t thread;
+ 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -1,8 +1,9 @@
+ /*
+  * Shared by the SM7150 Adreno 618 bring-up files (docs/GPU_A618_PLAN.md):
+  * sweet_gpu.c (stages 0 to 2, the 2B flow), sweet_gmu.c (GMU firmware,
+- * RSCC/PDC, HFI), sweet_smmu.c (the GPU SMMU), sweet_cp.c (stage 4, the CP)
+- * and sweet_zap.c (stage 5, the zap shader).
++ * RSCC/PDC, HFI), sweet_smmu.c (the GPU SMMU), sweet_cp.c (stage 4, the CP),
++ * sweet_zap.c (stage 5, the zap shader) and sweet_gsvc.c (stage 6, the
++ * kernel GPU service).
+  */
+ #ifndef _SWEET_GPU_INTERNAL_H_
+ #define _SWEET_GPU_INTERNAL_H_
+@@ -97,9 +98,12 @@
+ 
+ /* sweet_cp.c: stage 4, CP first light; stop = sweetcp (0-6), cb = stage 3's bank, gx_gdscr = mapped GX GDSCR */
+ bool sweet_cp_run(int stop, int cb, const uint8_t *sqe, uint32_t sqe_len, vm_offset_t gx_gdscr);
+-/* The ring and the scratch page for stage 5, once sweet_cp_run passed 4.4 or later */
++/* The ring and the scratch page for stages 5 and 6, once sweet_cp_run passed 4.4 or later */
+ uint32_t sweet_cp_rd(uint32_t reg);
++void sweet_cp_wr(uint32_t reg, uint32_t val);
++uint32_t sweet_cp_pkt4(uint32_t reg, uint32_t cnt);
+ uint32_t sweet_cp_pkt7(uint32_t op, uint32_t cnt);
++uint32_t sweet_cp_ring_free(void);                              /* dwords that can be emitted now */
+ void sweet_cp_emit(uint32_t w);
+ void sweet_cp_kick(void);                                       /* dsb sy, then CP_RB_WPTR */
+ int sweet_cp_wait_idle(unsigned timeout_us);                    /* us taken, or -1 */
+@@ -112,6 +116,33 @@
+ /* sweet_zap.c: stage 5, the zap shader; stop = sweetzap (0-6) */
+ bool sweet_zap_run(int stop, const uint8_t *mdt, uint32_t mdt_len, const uint8_t *b02, uint32_t b02_len);
+ 
++/* Stage 6 helpers: GMU DCVS perf index (sweet_gmu.c), bank TLB invalidate (sweet_smmu.c), measured gx_gfx3d */
++bool sweet_gmu_dcvs(unsigned index, uint32_t *ret);
++bool sweet_smmu_tlbiall(int cb);
++uint32_t sweet_gpu_gfx3d_khz(void);                             /* 0xffffffff if not measurable */
++
++/* sweet_gsvc.c: stage 6, the kernel GPU service; stop = sweetsvc (0-7), l1 = stage 3's level-1 table */
++bool sweet_gsvc_run(int stop, int cb, vm_offset_t l1_va, uint64_t l1_pa);
++
++/* The C API patch 0112's user client wraps; errno values, ENXIO once the service is dead */
++struct sweet_gsvc_ib {
++	uint32_t handle, offset, size_dw;       /* offset in bytes, dword aligned */
++};
++#define SWEET_GSVC_READY        1u
++#define SWEET_GSVC_DEAD         2u
++struct sweet_gsvc_info {
++	uint32_t chip_id, gmem_size, gmem_base;
++	uint32_t cur_khz, max_khz, last_retired, flags;
++	uint64_t fence_pa, window_base, window_size;
++};
++int sweet_gsvc_bo_new(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gpu_va, volatile uint32_t **cpu);
++int sweet_gsvc_bo_import_pages(const uint64_t *pa, uint32_t npages, uint32_t *handle, uint64_t *gpu_va);
++int sweet_gsvc_bo_free(uint32_t handle);
++int sweet_gsvc_bo_sync(uint32_t handle);
++int sweet_gsvc_submit(const struct sweet_gsvc_ib *ibs, unsigned n, uint32_t *seq);
++int sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms);
++void sweet_gsvc_info(struct sweet_gsvc_info *info);
++
+ /* sweet_rpmh.c: cmd-db address of an ARC (slave 3) or BCM (slave 5) resource, and an ARC's levels */
+ int sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl,
+     unsigned nmax, unsigned *n);
+--- /dev/null
++++ b/bsd/dev/sweet_gsvc.c
+@@ -0,0 +1,1471 @@
++/*
++ * SM7150 Adreno 618, docs/GPU_A618_PLAN.md stage 6: the kernel GPU service.
++ *
++ * Builds on the CP that stage 5 left running outside secure mode, and adds
++ * what mainline's a6xx hw_init and a6xx_submit do that stages 4 and 5
++ * skipped: CP_PROTECT (the a630_protect table, which a618 uses),
++ * RBBM_INT_0_MASK, indirect buffers and CACHE_FLUSH_TS fences. On top come a
++ * GPU VA window of 4 KiB pages at 8 GiB in bank 0's table for buffers (BOs),
++ * a CP clear/copy self-test, a 2 s hang detector, DCVS clock steps and the C
++ * API (sweet_gsvc_*) that patch 0112's user client wraps. Register values
++ * and packet layouts come from mainline (a6xx_gpu.c, a6xx_catalog.c,
++ * adreno_pm4.xml); the code is ours.
++ * The GIC never enables the GPU's SPI 300 (INTID 332), so everything polls:
++ * a thread reads the fence page and RBBM_INT_0_STATUS every 1 ms while work
++ * is outstanding. sweetsvc=N stops after step 6.N:
++ *  6.0 reads only; then the fence page, IB pool and window tables in
++ *      GPU-GMU-MEM, and two 16 KiB test buffers from XNU
++ *  6.1 CP_PROTECT, RBBM_INTERFACE_HANG_INT_CNTL and RBBM_INT_0_MASK, written
++ *      with the SQE running but idle (mainline writes them before the start)
++ *  6.2 CACHE_FLUSH_TS fences; then the poller starts
++ *  6.3 indirect buffers, the window (level-1 entry 8), unmap and remap
++ *  6.4 self-test: clear and copy of 64x64 RGBA8 through the C API
++ *  6.5 hang detector, fired on purpose by CP_WAIT_REG_MEM, then released
++ *  6.6 DCVS to 430 and 565 MHz, measured, the self-test at each
++ *  6.7 "service ready", then the self-test every 10 s for 60 s
++ * Kernel BOs are physically contiguous XNU memory mapped cacheable for the
++ * CPU and cleaned/invalidated to PoC around GPU use (sweet_gsvc_bo_sync);
++ * the GPU side is Normal non-cacheable, as the identity map. When a step
++ * fails the svc dump is logged, the SQE halted and the service marked dead
++ * until reboot; nothing else is undone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "sweet_gpu_internal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/* a6xx registers, dword offsets from GPU_PA (a6xx.xml) */
++#define GS_RBBM_INTERFACE_HANG_INT_CNTL 0x0001fu
++#define GS_RBBM_INT_CLEAR_CMD           0x00037u
++#define GS_RBBM_INT_0_MASK              0x00038u
++#define GS_RBBM_INT_0_STATUS            0x00201u
++#define GS_CP_RB_RPTR                   0x00806u
++#define GS_CP_INTERRUPT_STATUS          0x00823u
++#define GS_CP_PROTECT_CNTL              0x0084fu
++#define GS_CP_PROTECT_REG0              0x00850u        /* 32 of them */
++#define GS_CP_SCRATCH_REG0              0x00883u        /* 8 of them, just past CP_PROTECT entry 6 */
++#define GS_CP_IB1_BASE                  0x00928u        /* 64-bit */
++#define GS_CP_IB1_REM_SIZE              0x0092au
++#define GS_CP_IB2_BASE                  0x0092bu        /* 64-bit */
++#define GS_CP_IB2_REM_SIZE              0x0092du
++#define GS_CP_ALWAYS_ON_COUNTER         0x00980u        /* 64-bit, 19.2 MHz */
++
++/* Mainline a6xx values */
++#define GS_PROTECT_CNTL         0xbu            /* ACCESS_PROT_EN, ACCESS_FAULT_ON_VIOL_EN, LAST_SPAN_INF_RANGE */
++#define GS_HANG_INT_CNTL        0x401fffffu     /* (1 << 30) | 0x1fffff, the default branch */
++#define GS_INT_MASK             0x03d0e242u     /* A6XX_INT_MASK */
++#define GS_INT_CACHE_FLUSH_TS   (1u << 20)
++#define GS_INT_ERRORS           0x03c00242u     /* AHB 1, ASYNCFIFO 6, HW_ERROR 9, ATB_BUS 22, HANG 23, UCHE_OOB 24, TRAP 25 */
++#define GS_INT_FATAL            0x01800200u     /* HW_ERROR, HANG_DETECT, UCHE_OOB: the service stops */
++#define PROT_RDONLY(reg, len)   ((((uint32_t)(len) & 0x3fffu) << 18) | ((uint32_t)(reg) & 0x3ffffu))
++#define PROT_NORDWR(reg, len)   (PROT_RDONLY(reg, len) | (1u << 31))
++
++/* a630_protect (a6xx_catalog.c); count = count_max = 32, so entry 31 is the infinite one */
++static const uint32_t gs_protect[32] = {
++	PROT_RDONLY(0x00000, 0x04ff), PROT_RDONLY(0x00501, 0x0005), PROT_RDONLY(0x0050b, 0x02f4),
++	PROT_NORDWR(0x0050e, 0x0000), PROT_NORDWR(0x00510, 0x0000), PROT_NORDWR(0x00534, 0x0000),
++	PROT_NORDWR(0x00800, 0x0082), PROT_NORDWR(0x008a0, 0x0008), PROT_NORDWR(0x008ab, 0x0024),
++	PROT_RDONLY(0x008de, 0x00ae), PROT_NORDWR(0x00900, 0x004d), PROT_NORDWR(0x0098d, 0x0272),
++	PROT_NORDWR(0x00e00, 0x0001), PROT_NORDWR(0x00e03, 0x000c), PROT_NORDWR(0x03c00, 0x00c3),
++	PROT_RDONLY(0x03cc4, 0x1fff), PROT_NORDWR(0x08630, 0x01cf), PROT_NORDWR(0x08e00, 0x0000),
++	PROT_NORDWR(0x08e08, 0x0000), PROT_NORDWR(0x08e50, 0x001f), PROT_NORDWR(0x09624, 0x01db),
++	PROT_NORDWR(0x09e70, 0x0001), PROT_NORDWR(0x09e78, 0x0187), PROT_NORDWR(0x0a630, 0x01cf),
++	PROT_NORDWR(0x0ae02, 0x0000), PROT_NORDWR(0x0ae50, 0x032f), PROT_NORDWR(0x0b604, 0x0000),
++	PROT_NORDWR(0x0be02, 0x0001), PROT_NORDWR(0x0be20, 0x17df), PROT_NORDWR(0x0f000, 0x0bff),
++	PROT_RDONLY(0x0fc00, 0x1fff), PROT_NORDWR(0x11c00, 0x0000),
++};
++
++/* PM4 opcodes and fields (adreno_pm4.xml) */
++#define PM4_CP_WAIT_REG_MEM     0x3cu
++#define PM4_CP_MEM_WRITE        0x3du
++#define PM4_CP_INDIRECT_BUFFER  0x3fu
++#define PM4_CP_EVENT_WRITE      0x46u
++#define PM4_CP_MEM_TO_MEM       0x73u
++#define EV_CACHE_FLUSH_TS       0x04u
++#define EV_CCU_INVALIDATE_DEPTH 0x18u
++#define EV_CCU_INVALIDATE_COLOR 0x19u
++#define EVENT_WRITE_IRQ         (1u << 31)
++#define M2M_WAIT_FOR_MEM_WRITES (1u << 30)
++#define WRM_EQ_MEMORY           0x13u           /* FUNCTION WRITE_EQ (3), POLL POLL_MEMORY (1 << 4) */
++#define IB_SIZE_MASK            0xfffffu        /* CP_INDIRECT_BUFFER dword 2, in dwords */
++
++/* Memory */
++#define GS_PAGE                 0x1000u         /* GPU pages; XNU's may be larger */
++#define GS_FENCE_BYTES          0x1000u
++#define GS_IB_BYTES             0x1000u
++#define GS_IB_DWORDS            (GS_IB_BYTES / 4u)
++#define GS_IB_SLOTS             16u
++#define GS_L3_TABLES            32u
++#define GS_WIN_BASE             0x200000000ull  /* GPU VA 8 GiB, level-1 entry 8 */
++#define GS_WIN_L1               8u
++#define GS_WIN_PAGES            (GS_L3_TABLES * 512u)   /* 64 MiB */
++#define GS_PTE_TABLE            3ull
++#define GS_PTE_PAGE_RW          0xe43ull        /* page, AP read/write, outer shareable, AF, nG, MAIR attr 0 */
++#define GS_PTE_ADDR_MASK        0x0000fffffffff000ull
++#define GS_MAX_BO               64u
++#define GS_BO_MAX_BYTES         (16u << 20)
++#define GS_MAX_IBS              16u
++#define GS_SCRATCH_WORDS        1024u
++#define GS_GICD_PA              0x17a00000u
++#define GS_GPU_INTID            332u            /* sdmmagpie-gpu.dtsi: GIC_SPI 300 */
++
++/* Timing */
++#define GS_TIMEOUT_US           1000000u
++#define GS_WAIT_MS              1000u
++#define GS_HANG_MS              2000u
++#define GS_POLL_MS              1u
++#define GS_IDLE_POLL_MS         10u
++#define GS_FREE_WAIT_MS         2000u
++#define GS_ERR_LOG_MAX          16u
++
++/* Self-test surfaces */
++#define ST_W                    64u
++#define ST_H                    64u
++#define ST_WORDS                (ST_W * ST_H)
++#define ST_CLEAR                0xff336699u
++#define ST_POISON               0x5ee7deadu
++
++/* What info reports; chip id and GMEM from the a618 catalog entry */
++#define GS_CHIP_ID              0x06010800u
++#define GS_GMEM_SIZE            0x80000u
++#define GS_GMEM_BASE            0x100000u
++
++struct gs_bo {
++	bool used, owned;               /* owned: kmem memory freed with the BO */
++	vm_offset_t va;                 /* kernel mapping (cacheable); 0 for imports */
++	uint64_t pa;                    /* owned BOs are contiguous */
++	uint32_t size;                  /* bytes, GS_PAGE multiple */
++	uint32_t page;                  /* first window page */
++};
++
++struct gs_ibref {
++	uint64_t iova;
++	uint32_t dwords;
++};
++
++/* An IB under construction */
++struct gs_ibw {
++	volatile uint32_t *p;
++	uint32_t n, max;
++};
++
++static LCK_GRP_DECLARE(gs_grp, "sweet_gsvc");
++static LCK_MTX_DECLARE(gs_lock, &gs_grp);
++
++static int gs_cb = -1;
++static volatile uint64_t *gs_l1, *gs_l2, *gs_l3;
++static volatile uint32_t *gs_fence, *gs_ib, *gs_page;
++static uint64_t gs_l1_pa, gs_l2_pa, gs_l3_pa, gs_fence_pa, gs_ib_pa, gs_page_pa;
++static vm_offset_t gs_gicd;
++static uint32_t gs_snap[GS_SCRATCH_WORDS];      /* what the scratch page should hold */
++static uint32_t gs_base_cpint;                  /* CP_INTERRUPT_STATUS in 6.0 */
++static volatile uint32_t gs_sent;               /* last seqno on the ring; the fence word is the last retired */
++static volatile uint32_t gs_int_err;            /* error bits the poller has seen */
++static volatile uint64_t gs_progress_us, gs_hang_us;
++static volatile bool gs_dead, gs_hang_test, gs_hang_seen;
++static bool gs_ready, gs_window, gs_latches;
++static uint32_t gs_cur_khz = 180000u, gs_max_khz = 180000u;
++static uint32_t gs_win_used[GS_WIN_PAGES / 32u];        /* 1 = window page in use */
++static struct gs_bo gs_bos[GS_MAX_BO];
++
++/* Test buffers from 6.0, used raw in 6.3 */
++static vm_offset_t gs_tbuf, gs_tspare;
++static uint64_t gs_tbuf_pa, gs_tspare_pa;
++static uint32_t gs_tbuf_size;
++
++static inline uint32_t
++gs_rd(uint32_t reg)
++{
++	return sweet_cp_rd(reg);
++}
++
++static inline void
++gs_wr(uint32_t reg, uint32_t val)
++{
++	sweet_cp_wr(reg, val);
++}
++
++static uint64_t
++gs_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static uint64_t
++gs_alwayson(void)
++{
++	uint32_t hi = gs_rd(GS_CP_ALWAYS_ON_COUNTER + 1u), lo, hi2;
++	for (unsigned i = 0; i < 4; ++i) {
++		lo = gs_rd(GS_CP_ALWAYS_ON_COUNTER);
++		hi2 = gs_rd(GS_CP_ALWAYS_ON_COUNTER + 1u);
++		if (hi2 == hi) {
++			return (uint64_t)hi << 32 | lo;
++		}
++		hi = hi2;
++	}
++	return (uint64_t)hi << 32 | gs_rd(GS_CP_ALWAYS_ON_COUNTER);
++}
++
++/* 19.2 MHz ticks to microseconds */
++static uint64_t
++gs_ticks_us(uint64_t ticks)
++{
++	return ticks * 10u / 192u;
++}
++
++static inline bool
++gs_passed(uint32_t seq)
++{
++	return (int32_t)(gs_fence[0] - seq) >= 0;
++}
++
++/* GICD ISENABLER / ISPENDR bits for the GPU's interrupt; -1 when unmapped */
++static int
++gs_gic_bit(uint32_t base)
++{
++	if (!gs_gicd) {
++		return -1;
++	}
++	return (int)((gpu_rd(gs_gicd, base + 4u * (GS_GPU_INTID / 32u)) >> (GS_GPU_INTID % 32u)) & 1u);
++}
++
++/* The svc dump: the CP dump (SMMU, GMU, GX GDSC) plus interrupts, IBs, fences and the GIC bits */
++static void
++gs_dump(const char *when)
++{
++	sweet_cp_dump(when);
++	printf("SWEET GSVC:   %s: INT_0_STATUS 0x%08x IB1 0x%08x%08x/%#x IB2 0x%08x%08x/%#x SCRATCH2 0x%08x\n", when,
++	    gs_rd(GS_RBBM_INT_0_STATUS), gs_rd(GS_CP_IB1_BASE + 1u), gs_rd(GS_CP_IB1_BASE), gs_rd(GS_CP_IB1_REM_SIZE),
++	    gs_rd(GS_CP_IB2_BASE + 1u), gs_rd(GS_CP_IB2_BASE), gs_rd(GS_CP_IB2_REM_SIZE),
++	    gs_rd(GS_CP_SCRATCH_REG0 + 2u));
++	printf("SWEET GSVC:   fence %u sent %u errors 0x%08x; GICD INTID %u enabled %d pending %d\n",
++	    gs_fence ? gs_fence[0] : 0, gs_sent, gs_int_err, GS_GPU_INTID, gs_gic_bit(0x100u), gs_gic_bit(0x200u));
++}
++
++/* No SMMU fault, CP_HW_FAULT / PROTECT_STATUS / INTERRUPT_STATUS as before, no error bit, not dead */
++static bool
++gs_clean(const char *when)
++{
++	bool ok = sweet_cp_clean(when);
++	uint32_t cpint = gs_rd(GS_CP_INTERRUPT_STATUS);
++	if (cpint != gs_base_cpint) {
++		printf("SWEET GSVC: %s: CP_INTERRUPT_STATUS 0x%08x (was 0x%08x)\n", when, cpint, gs_base_cpint);
++		ok = false;
++	}
++	if (gs_int_err) {
++		printf("SWEET GSVC: %s: error bits seen 0x%08x\n", when, gs_int_err);
++		ok = false;
++	}
++	return ok && !gs_dead;
++}
++
++/* Stop for good: dump, halt the SQE. Waiters see the dead flag. */
++static void
++gs_kill(const char *why)
++{
++	if (gs_dead) {
++		return;
++	}
++	gs_dead = true;
++	gs_ready = false;
++	printf("SWEET GSVC: service DEAD until reboot: %s\n", why);
++	gs_dump(why);
++	sweet_cp_halt();
++}
++
++/* Scratch-page words that differ from gs_snap (the first 8 logged) */
++static unsigned
++gs_page_check(const char *when)
++{
++	unsigned bad = 0;
++	for (unsigned i = 0; i < GS_SCRATCH_WORDS; ++i) {
++		uint32_t got = gs_page[i];
++		if (got != gs_snap[i]) {
++			if (bad < 8u) {
++				printf("SWEET GSVC:   %s: scratch word %u = 0x%08x (want 0x%08x)\n", when, i, got, gs_snap[i]);
++			}
++			++bad;
++		}
++	}
++	printf("SWEET GSVC:   %s: %u scratch words differ from what they should hold (want 0)\n", when, bad);
++	return bad;
++}
++
++static uint64_t
++gs_word_pa(unsigned word)
++{
++	return gs_page_pa + 4u * word;
++}
++
++/* Wait for n free ring dwords (RPTR from the register: NO_UPDATE) */
++static bool
++gs_ring_wait(uint32_t n)
++{
++	for (unsigned t = 0; t <= GS_TIMEOUT_US; t += 10u) {
++		if (sweet_cp_ring_free() >= n) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("SWEET GSVC: no room for %u dwords on the ring after 1 s\n", n);
++	return false;
++}
++
++static void
++gs_emit_fence(uint32_t seq)
++{
++	sweet_cp_emit(sweet_cp_pkt4(GS_CP_SCRATCH_REG0 + 2u, 1));
++	sweet_cp_emit(seq);
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_EVENT_WRITE, 4));
++	sweet_cp_emit(EV_CACHE_FLUSH_TS | EVENT_WRITE_IRQ);
++	sweet_cp_emit((uint32_t)gs_fence_pa);
++	sweet_cp_emit((uint32_t)(gs_fence_pa >> 32));
++	sweet_cp_emit(seq);
++}
++#define GS_FENCE_DWORDS         7u
++
++/*
++ * One submit as a6xx_submit, without the stats counters: CCU invalidates,
++ * the IBs, CP_SCRATCH_REG(2) = seqno and a CACHE_FLUSH_TS fence. Called with
++ * gs_lock held (or before the service is shared). kick = false queues it.
++ */
++static bool
++gs_submit_locked(const struct gs_ibref *ib, unsigned n, bool kick, uint32_t *seqp)
++{
++	if (gs_dead || !gs_ring_wait(4u + 4u * n + GS_FENCE_DWORDS)) {
++		return false;
++	}
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_EVENT_WRITE, 1));
++	sweet_cp_emit(EV_CCU_INVALIDATE_DEPTH);
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_EVENT_WRITE, 1));
++	sweet_cp_emit(EV_CCU_INVALIDATE_COLOR);
++	for (unsigned i = 0; i < n; ++i) {
++		sweet_cp_emit(sweet_cp_pkt7(PM4_CP_INDIRECT_BUFFER, 3));
++		sweet_cp_emit((uint32_t)ib[i].iova);
++		sweet_cp_emit((uint32_t)(ib[i].iova >> 32));
++		sweet_cp_emit(ib[i].dwords & IB_SIZE_MASK);
++	}
++	uint32_t seq = gs_sent + 1u;
++	gs_emit_fence(seq);
++	gs_sent = seq;
++	gs_fence[1] = seq;
++	gs_progress_us = gs_now_us();
++	if (kick) {
++		sweet_cp_kick();
++	}
++	*seqp = seq;
++	return true;
++}
++
++/* 0, ETIMEDOUT, or ENXIO once the service is dead */
++static int
++gs_wait_seq(uint32_t seq, uint32_t timeout_ms)
++{
++	uint64_t t0 = gs_now_us();
++	for (;;) {
++		if (gs_passed(seq)) {
++			return 0;
++		}
++		if (gs_dead) {
++			return ENXIO;
++		}
++		uint64_t el = gs_now_us() - t0;
++		if (el >= (uint64_t)timeout_ms * 1000u) {
++			return ETIMEDOUT;
++		}
++		if (el < 1000u) {
++			delay(10);
++		} else {
++			gpu_sleep_ms(1);
++		}
++	}
++}
++
++/* IB building */
++static void
++ibw_init(struct gs_ibw *w, volatile uint32_t *p, uint32_t max)
++{
++	w->p = p;
++	w->n = 0;
++	w->max = max;
++}
++
++static void
++ibw_put(struct gs_ibw *w, uint32_t v)
++{
++	if (w->n < w->max) {
++		w->p[w->n] = v;
++	}
++	w->n++;
++}
++
++static void
++ibw_mem_write(struct gs_ibw *w, uint64_t addr, uint32_t val)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_MEM_WRITE, 3));
++	ibw_put(w, (uint32_t)addr);
++	ibw_put(w, (uint32_t)(addr >> 32));
++	ibw_put(w, val);
++}
++
++/* dst = src_a + src_b, one dword */
++static void
++ibw_mem_add(struct gs_ibw *w, uint32_t flags, uint64_t dst, uint64_t a, uint64_t b)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_MEM_TO_MEM, 7));
++	ibw_put(w, flags);
++	ibw_put(w, (uint32_t)dst);
++	ibw_put(w, (uint32_t)(dst >> 32));
++	ibw_put(w, (uint32_t)a);
++	ibw_put(w, (uint32_t)(a >> 32));
++	ibw_put(w, (uint32_t)b);
++	ibw_put(w, (uint32_t)(b >> 32));
++}
++
++/* dst = src, one dword */
++static void
++ibw_mem_copy(struct gs_ibw *w, uint32_t flags, uint64_t dst, uint64_t src)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_MEM_TO_MEM, 5));
++	ibw_put(w, flags);
++	ibw_put(w, (uint32_t)dst);
++	ibw_put(w, (uint32_t)(dst >> 32));
++	ibw_put(w, (uint32_t)src);
++	ibw_put(w, (uint32_t)(src >> 32));
++}
++
++static struct gs_ibref
++gs_slot(unsigned slot, struct gs_ibw *w)
++{
++	ibw_init(w, gs_ib + slot * GS_IB_DWORDS, GS_IB_DWORDS);
++	struct gs_ibref r = { gs_ib_pa + (uint64_t)slot * GS_IB_BYTES, 0 };
++	return r;
++}
++
++/* Finish a pool IB: its length, and the stores drained before the GPU fetches it */
++static bool
++gs_slot_done(struct gs_ibref *r, const struct gs_ibw *w, const char *name)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	r->dwords = w->n;
++	if (w->n > w->max) {
++		printf("SWEET GSVC: IB %s is %u dwords, more than %u\n", name, w->n, w->max);
++		return false;
++	}
++	return true;
++}
++
++/* One submit of pool IBs, kicked, waited for up to 1 s */
++static bool
++gs_run(const struct gs_ibref *ib, unsigned n, const char *when)
++{
++	uint32_t seq = 0;
++	if (!gs_submit_locked(ib, n, true, &seq)) {
++		return false;
++	}
++	int r = gs_wait_seq(seq, GS_WAIT_MS);
++	if (r) {
++		printf("SWEET GSVC: %s: fence %u %s (fence word %u)\n", when, seq, r == ETIMEDOUT ? "NOT reached in 1 s" :
++		    "lost: service dead", gs_fence[0]);
++		return false;
++	}
++	return true;
++}
++
++/* Contiguous XNU memory, cleaned and invalidated to PoC; 0 if none */
++static vm_offset_t
++gs_kalloc(uint32_t size, uint64_t *pa)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		kmem_free(kernel_map, va, size);
++		return 0;
++	}
++	*pa = ptoa_64(pn);
++	flush_dcache64((addr64_t)*pa, size, TRUE);
++	return va;
++}
++
++static uint32_t
++gs_round(uint32_t size)
++{
++	return (uint32_t)((size + PAGE_MASK) & ~(uint32_t)PAGE_MASK);
++}
++
++/* Window pages: first fit over the bitmap */
++static bool
++gs_win_busy(uint32_t p)
++{
++	return (gs_win_used[p / 32u] >> (p % 32u)) & 1u;
++}
++
++static void
++gs_win_mark(uint32_t p, uint32_t n, bool used)
++{
++	for (uint32_t i = p; i < p + n; ++i) {
++		if (used) {
++			gs_win_used[i / 32u] |= 1u << (i % 32u);
++		} else {
++			gs_win_used[i / 32u] &= ~(1u << (i % 32u));
++		}
++	}
++}
++
++static int
++gs_win_alloc(uint32_t n)
++{
++	uint32_t run = 0;
++	for (uint32_t p = 0; p < GS_WIN_PAGES; ++p) {
++		run = gs_win_busy(p) ? 0 : run + 1u;
++		if (run == n) {
++			gs_win_mark(p + 1u - n, n, true);
++			return (int)(p + 1u - n);
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++gs_win_count(void)
++{
++	uint32_t n = 0;
++	for (uint32_t p = 0; p < GS_WIN_PAGES; ++p) {
++		n += gs_win_busy(p);
++	}
++	return n;
++}
++
++static uint64_t
++gs_win_va(uint32_t page)
++{
++	return GS_WIN_BASE + (uint64_t)page * GS_PAGE;
++}
++
++/* Level-3 entries only; the caller invalidates the TLB */
++static void
++gs_win_map(uint32_t page, uint64_t pa)
++{
++	gs_l3[page] = (pa & GS_PTE_ADDR_MASK) | GS_PTE_PAGE_RW;
++}
++
++static void
++gs_win_unmap(uint32_t page)
++{
++	gs_l3[page] = 0;
++}
++
++static bool
++gs_tlbi(const char *when)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	bool ok = sweet_smmu_tlbiall(gs_cb);
++	if (!ok) {
++		printf("SWEET GSVC: %s: bank %d TLBIALL / TLBSYNC did not complete\n", when, gs_cb);
++	}
++	return ok;
++}
++
++static bool
++gs_carve(uint32_t len, volatile void **va, uint64_t *pa, const char *name)
++{
++	vm_offset_t v = sweet_gmu_spare(len, pa);
++	if (!v) {
++		printf("SWEET GSVC: 6.0: no room for the %s in GPU-GMU-MEM\n", name);
++		return false;
++	}
++	*va = (volatile void *)v;
++	for (uint32_t i = 0; i < len; i += 4u) {
++		*(volatile uint32_t *)(v + i) = 0;
++	}
++	printf("SWEET GSVC:   %-12s pa/iova %#llx, %#x bytes, zeroed\n", name, *pa, len);
++	return true;
++}
++
++/* 6.0: reads only, then our memory */
++static bool
++gs_survey(void)
++{
++	printf("SWEET GSVC: 6.0 survey (reads only) and memory\n");
++	printf("SWEET GSVC:   CP_PROTECT_CNTL 0x%08x RBBM_INT_0_MASK 0x%08x RBBM_INT_0_STATUS 0x%08x "
++	    "RBBM_INTERFACE_HANG_INT_CNTL 0x%08x CP_INTERRUPT_STATUS 0x%08x\n", gs_rd(GS_CP_PROTECT_CNTL),
++	    gs_rd(GS_RBBM_INT_0_MASK), gs_rd(GS_RBBM_INT_0_STATUS), gs_rd(GS_RBBM_INTERFACE_HANG_INT_CNTL),
++	    gs_rd(GS_CP_INTERRUPT_STATUS));
++	for (unsigned i = 0; i < 32u; i += 8u) {
++		printf("SWEET GSVC:   CP_PROTECT_REG%-2u 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n", i,
++		    gs_rd(GS_CP_PROTECT_REG0 + i), gs_rd(GS_CP_PROTECT_REG0 + i + 1u), gs_rd(GS_CP_PROTECT_REG0 + i + 2u),
++		    gs_rd(GS_CP_PROTECT_REG0 + i + 3u), gs_rd(GS_CP_PROTECT_REG0 + i + 4u),
++		    gs_rd(GS_CP_PROTECT_REG0 + i + 5u), gs_rd(GS_CP_PROTECT_REG0 + i + 6u),
++		    gs_rd(GS_CP_PROTECT_REG0 + i + 7u));
++	}
++	printf("SWEET GSVC:   CP_ALWAYS_ON %llu\n", gs_alwayson());
++	gs_base_cpint = gs_rd(GS_CP_INTERRUPT_STATUS);
++
++	gs_gicd = ml_io_map(GS_GICD_PA, 0x1000u);
++	int en = gs_gic_bit(0x100u), pend = gs_gic_bit(0x200u);
++	printf("SWEET GSVC:   GICD %#x: INTID %u enabled %d pending %d (want enabled 0)\n", GS_GICD_PA, GS_GPU_INTID, en,
++	    pend);
++
++	uint64_t e8 = gs_l1[GS_WIN_L1];
++	printf("SWEET GSVC:   bank %d level-1 table %#llx: entry %u = 0x%016llx (want 0), entry 2 = 0x%016llx\n", gs_cb,
++	    gs_l1_pa, GS_WIN_L1, e8, gs_l1[2]);
++
++	gs_page = sweet_cp_scratch(&gs_page_pa);
++	for (unsigned i = 0; i < GS_SCRATCH_WORDS; ++i) {
++		gs_snap[i] = gs_page[i];
++	}
++	volatile void *v;
++	if (!gs_carve(GS_FENCE_BYTES, &v, &gs_fence_pa, "fence page")) {
++		return false;
++	}
++	gs_fence = (volatile uint32_t *)v;
++	if (!gs_carve(GS_IB_SLOTS * GS_IB_BYTES, &v, &gs_ib_pa, "IB pool")) {
++		return false;
++	}
++	gs_ib = (volatile uint32_t *)v;
++	if (!gs_carve(GS_PAGE, &v, &gs_l2_pa, "window L2")) {
++		return false;
++	}
++	gs_l2 = (volatile uint64_t *)v;
++	if (!gs_carve(GS_L3_TABLES * GS_PAGE, &v, &gs_l3_pa, "window L3s")) {
++		return false;
++	}
++	gs_l3 = (volatile uint64_t *)v;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	gs_tbuf_size = gs_round(4u * GS_PAGE);
++	gs_tbuf = gs_kalloc(gs_tbuf_size, &gs_tbuf_pa);
++	gs_tspare = gs_kalloc(gs_tbuf_size, &gs_tspare_pa);
++	if (!gs_tbuf || !gs_tspare) {
++		printf("SWEET GSVC: 6.0 stopped: no contiguous XNU memory for the test buffers\n");
++		return false;
++	}
++	printf("SWEET GSVC:   test buffer pa %#llx, spare pa %#llx, %#x bytes each (XNU page %#x)\n", gs_tbuf_pa,
++	    gs_tspare_pa, gs_tbuf_size, (unsigned)PAGE_SIZE);
++	gs_dump("6.0");
++	return e8 == 0 && en != 1 && gs_clean("6.0");
++}
++
++/* 6.1: CP_PROTECT, the interface hang control and the interrupt mask */
++static bool
++gs_protect_init(void)
++{
++	printf("SWEET GSVC: 6.1 CP_PROTECT (a630_protect), RBBM_INT_0_MASK; the SQE is running\n");
++	if (sweet_cp_wait_idle(GS_TIMEOUT_US) < 0) {
++		printf("SWEET GSVC: 6.1 stopped: the CP is not idle\n");
++		return false;
++	}
++	gpu_pause("6.1 CP_PROTECT_CNTL = 0xb, CP_PROTECT_REG0..31, RBBM_INTERFACE_HANG_INT_CNTL, RBBM_INT_0_MASK");
++	bool ok = true;
++	gs_wr(GS_CP_PROTECT_CNTL, GS_PROTECT_CNTL);
++	for (unsigned i = 0; i < 32u; ++i) {
++		gs_wr(GS_CP_PROTECT_REG0 + i, gs_protect[i]);
++	}
++	gs_wr(GS_RBBM_INTERFACE_HANG_INT_CNTL, GS_HANG_INT_CNTL);
++	gs_wr(GS_RBBM_INT_0_MASK, GS_INT_MASK);
++	uint32_t c = gs_rd(GS_CP_PROTECT_CNTL);
++	printf("SWEET GSVC:   CP_PROTECT_CNTL <- 0x%08x: reads 0x%08x%s\n", GS_PROTECT_CNTL, c,
++	    c == GS_PROTECT_CNTL ? "" : " DIFFERS");
++	ok = c == GS_PROTECT_CNTL;
++	for (unsigned i = 0; i < 32u; ++i) {
++		uint32_t got = gs_rd(GS_CP_PROTECT_REG0 + i);
++		printf("SWEET GSVC:   CP_PROTECT_REG%-2u %#05x <- 0x%08x: reads 0x%08x%s\n", i, GS_CP_PROTECT_REG0 + i,
++		    gs_protect[i], got, got == gs_protect[i] ? "" : " DIFFERS");
++		ok = ok && got == gs_protect[i];
++	}
++	uint32_t h = gs_rd(GS_RBBM_INTERFACE_HANG_INT_CNTL), m = gs_rd(GS_RBBM_INT_0_MASK);
++	printf("SWEET GSVC:   RBBM_INTERFACE_HANG_INT_CNTL <- 0x%08x: reads 0x%08x%s; RBBM_INT_0_MASK <- 0x%08x: "
++	    "reads 0x%08x%s\n", GS_HANG_INT_CNTL, h, h == GS_HANG_INT_CNTL ? "" : " DIFFERS", GS_INT_MASK, m,
++	    m == GS_INT_MASK ? "" : " DIFFERS");
++	ok = ok && h == GS_HANG_INT_CNTL && m == GS_INT_MASK;
++
++	/* The ring still works: an unprotected register and a DRAM write */
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_MEM_WRITE, 3));
++	sweet_cp_emit((uint32_t)gs_word_pa(4));
++	sweet_cp_emit((uint32_t)(gs_word_pa(4) >> 32));
++	sweet_cp_emit(0xc0ff6001u);
++	gs_snap[4] = 0xc0ff6001u;
++	bool mk = sweet_cp_marker(0x5ee76001u, "6.1");
++	printf("SWEET GSVC:   marker 0x5ee76001 %s, scratch word 4 = 0x%08x\n", mk ? "landed" : "DID NOT land", gs_page[4]);
++	gs_dump("after 6.1");
++	return gs_clean("6.1") && gs_page_check("6.1") == 0 && mk && ok;
++}
++
++/* 6.2: CACHE_FLUSH_TS fences, polled from the CPU; then the poller */
++static void gs_poller(void *arg, wait_result_t result);
++
++static bool
++gs_fences(void)
++{
++	printf("SWEET GSVC: 6.2 CACHE_FLUSH_TS fences to %#llx (dword 0 0x%08x)\n", gs_fence_pa,
++	    EV_CACHE_FLUSH_TS | EVENT_WRITE_IRQ);
++	gpu_pause("6.2 the first CACHE_FLUSH_TS fence");
++	(void)gs_rd(GS_RBBM_INT_0_STATUS);
++	if (!gs_ring_wait(GS_FENCE_DWORDS)) {
++		return false;
++	}
++	gs_emit_fence(1);
++	gs_sent = 1;
++	sweet_cp_kick();
++	uint64_t t0 = gs_now_us();
++	unsigned us = 0;
++	while (gs_fence[0] != 1u && us < GS_TIMEOUT_US) {
++		delay(10);
++		us = (unsigned)(gs_now_us() - t0);
++	}
++	bool first = gs_fence[0] == 1u;
++	printf("SWEET GSVC:   fence 1: word 0 = %u after %u us (%s), SCRATCH2 0x%08x\n", gs_fence[0], us,
++	    !first ? "NOT reached in 1 s" : us <= 1000u ? "within 1 ms" : "SLOWER than 1 ms", gs_rd(GS_CP_SCRATCH_REG0 + 2u));
++	bool ok = first && us <= 1000u;
++
++	uint32_t st = gs_rd(GS_RBBM_INT_0_STATUS);
++	gs_wr(GS_RBBM_INT_CLEAR_CMD, st);
++	uint32_t st2 = gs_rd(GS_RBBM_INT_0_STATUS);
++	gs_latches = (st & GS_INT_CACHE_FLUSH_TS) && !(st2 & GS_INT_CACHE_FLUSH_TS);
++	printf("SWEET GSVC:   RBBM_INT_0_STATUS 0x%08x, after RBBM_INT_CLEAR_CMD 0x%08x: CACHE_FLUSH_TS %s\n", st, st2,
++	    gs_latches ? "latched and cleared" : "does NOT latch/clear (finding: the error-bit check is blind, risk 4)");
++	if (st & GS_INT_ERRORS) {
++		printf("SWEET GSVC:   error bits 0x%08x\n", st & GS_INT_ERRORS);
++		ok = false;
++	}
++	printf("SWEET GSVC:   GICD INTID %u enabled %d pending %d (pending 1 expected: the line asserts at a disabled "
++	    "interrupt)\n", GS_GPU_INTID, gs_gic_bit(0x100u), gs_gic_bit(0x200u));
++
++	if (!gs_ring_wait(64u * GS_FENCE_DWORDS)) {
++		return false;
++	}
++	for (uint32_t s = 2; s <= 65u; ++s) {
++		gs_emit_fence(s);
++	}
++	gs_sent = 65;
++	sweet_cp_kick();
++	uint32_t prev = gs_fence[0], back = 0, samples = 0;
++	t0 = gs_now_us();
++	while (gs_fence[0] != 65u && gs_now_us() - t0 < GS_TIMEOUT_US) {
++		uint32_t v = gs_fence[0];
++		back += (int32_t)(v - prev) < 0;
++		prev = v;
++		++samples;
++		delay(1);
++	}
++	int idle = sweet_cp_wait_idle(GS_TIMEOUT_US);
++	printf("SWEET GSVC:   64 fences 2..65: word 0 = %u after %llu us, %u samples, %u went backwards; CP %s\n",
++	    gs_fence[0], gs_now_us() - t0, samples, back, idle >= 0 ? "idle, RPTR = WPTR" : "NOT idle");
++	ok = ok && gs_fence[0] == 65u && back == 0 && idle >= 0;
++	gs_wr(GS_RBBM_INT_CLEAR_CMD, gs_rd(GS_RBBM_INT_0_STATUS));
++	gs_dump("after 6.2");
++	ok = gs_clean("6.2") && gs_page_check("6.2") == 0 && ok;
++	if (ok) {
++		thread_t thread;
++		gs_progress_us = gs_now_us();
++		if (kernel_thread_start(gs_poller, NULL, &thread) != KERN_SUCCESS) {
++			printf("SWEET GSVC: 6.2 stopped: the poller thread did not start\n");
++			return false;
++		}
++		thread_deallocate(thread);
++		printf("SWEET GSVC:   poller started: 1 ms while work is outstanding, %u ms idle, hang after %u ms\n",
++		    GS_IDLE_POLL_MS, GS_HANG_MS);
++	}
++	return ok;
++}
++
++/*
++ * The poller: fence and RBBM_INT_0_STATUS every 1 ms while work is
++ * outstanding. Fatal error bits, or 2 s without progress (fence, RPTR or
++ * IB1_REM_SIZE), stop the service, except during 6.5's test.
++ */
++static void
++gs_poller(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	uint32_t last_fence = gs_fence[0], last_rptr = 0, last_ib1 = 0, logged = 0;
++	for (;;) {
++		bool busy = gs_sent != gs_fence[0];
++		gpu_sleep_ms(busy ? GS_POLL_MS : GS_IDLE_POLL_MS);
++		if (gs_dead) {
++			return;
++		}
++		uint32_t st = gs_rd(GS_RBBM_INT_0_STATUS);
++		if (st) {
++			gs_wr(GS_RBBM_INT_CLEAR_CMD, st);
++			if (st & GS_INT_ERRORS) {
++				gs_int_err |= st & GS_INT_ERRORS;
++				gs_fence[3] += 1u;
++				if (logged++ < GS_ERR_LOG_MAX) {
++					printf("SWEET GSVC: poller: RBBM_INT_0_STATUS 0x%08x has error bits 0x%08x\n", st,
++					    st & GS_INT_ERRORS);
++				}
++			}
++			if (st & GS_INT_FATAL) {
++				gs_kill("fatal error bit in RBBM_INT_0_STATUS");
++				return;
++			}
++		}
++		uint32_t f = gs_fence[0];
++		gs_fence[2] = f;
++		uint64_t now = gs_now_us();
++		if (gs_sent == f) {
++			gs_progress_us = now;
++			continue;
++		}
++		uint32_t rptr = gs_rd(GS_CP_RB_RPTR), ib1 = gs_rd(GS_CP_IB1_REM_SIZE);
++		if (f != last_fence || rptr != last_rptr || ib1 != last_ib1) {
++			last_fence = f;
++			last_rptr = rptr;
++			last_ib1 = ib1;
++			gs_progress_us = now;
++			continue;
++		}
++		if (now - gs_progress_us < (uint64_t)GS_HANG_MS * 1000u) {
++			continue;
++		}
++		if (gs_hang_test) {
++			if (!gs_hang_seen) {
++				gs_hang_us = now;
++				gs_hang_seen = true;
++				printf("SWEET GSVC: poller: hang detected (fence %u sent %u, RPTR %u, IB1_REM_SIZE %#x); test mode: "
++				    "not stopping\n", f, gs_sent, rptr, ib1);
++			}
++			continue;
++		}
++		printf("SWEET GSVC: poller: hang detected: fence %u sent %u, RPTR %u, IB1_REM_SIZE %#x unchanged for %u ms\n",
++		    f, gs_sent, rptr, ib1, GS_HANG_MS);
++		gs_kill("GPU hang (no progress for 2 s)");
++		return;
++	}
++}
++
++/* 6.3: indirect buffers, then the window */
++static bool
++gs_ibs(void)
++{
++	printf("SWEET GSVC: 6.3 indirect buffers from the pool at %#llx (header 0x%08x)\n", gs_ib_pa,
++	    sweet_cp_pkt7(PM4_CP_INDIRECT_BUFFER, 3));
++	struct gs_ibw w;
++	struct gs_ibref ib[2];
++
++	gpu_pause("6.3 the first indirect buffer");
++	ib[0] = gs_slot(0, &w);
++	ibw_mem_write(&w, gs_word_pa(5), 0xc0ff6301u);
++	ibw_put(&w, sweet_cp_pkt4(GS_CP_SCRATCH_REG0 + 6u, 1));
++	ibw_put(&w, 0x5ee76301u);
++	gs_snap[5] = 0xc0ff6301u;
++	bool ok = gs_slot_done(&ib[0], &w, "0") && gs_run(ib, 1, "6.3 IB 0");
++	uint32_t s6 = gs_rd(GS_CP_SCRATCH_REG0 + 6u);
++	printf("SWEET GSVC:   IB 0: scratch word 5 0x%08x, SCRATCH_REG6 0x%08x (want 0xc0ff6301, 0x5ee76301), fence %u\n",
++	    gs_page[5], s6, gs_fence[0]);
++	ok = ok && gs_page[5] == 0xc0ff6301u && s6 == 0x5ee76301u;
++
++	ib[0] = gs_slot(1, &w);
++	for (unsigned i = 0; i < 256u; ++i) {
++		ibw_mem_write(&w, gs_word_pa(256u + i), 0xc0ff6400u + i);
++		gs_snap[256u + i] = 0xc0ff6400u + i;
++	}
++	ok = ok && gs_slot_done(&ib[0], &w, "1") && gs_run(ib, 1, "6.3 IB 1");
++	printf("SWEET GSVC:   IB 1: %u dwords, 256 writes to words 256-511\n", ib[0].dwords);
++
++	ib[0] = gs_slot(2, &w);
++	ibw_mem_write(&w, gs_word_pa(6), 0xc0ff6302u);
++	ok = ok && gs_slot_done(&ib[0], &w, "2");
++	ib[1] = gs_slot(3, &w);
++	ibw_mem_write(&w, gs_word_pa(7), 0xc0ff6303u);
++	ok = ok && gs_slot_done(&ib[1], &w, "3") && gs_run(ib, 2, "6.3 IBs 2+3");
++	gs_snap[6] = 0xc0ff6302u;
++	gs_snap[7] = 0xc0ff6303u;
++
++	/* 16 submits of word 8 += word 10, queued, one kick */
++	gs_page[8] = 0;
++	gs_page[10] = 1;
++	gs_snap[8] = 16;
++	gs_snap[10] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++	ib[0] = gs_slot(4, &w);
++	ibw_mem_add(&w, M2M_WAIT_FOR_MEM_WRITES, gs_word_pa(8), gs_word_pa(8), gs_word_pa(10));
++	uint32_t seq = 0;
++	ok = ok && gs_slot_done(&ib[0], &w, "4");
++	for (unsigned k = 0; ok && k < 16u; ++k) {
++		ok = gs_submit_locked(ib, 1, k == 15u, &seq);
++	}
++	ok = ok && gs_wait_seq(seq, GS_WAIT_MS) == 0;
++	printf("SWEET GSVC:   16 queued submits of word 8 += 1: word 8 = %u (want 16), fence %u\n", gs_page[8], gs_fence[0]);
++	uint32_t rem = gs_rd(GS_CP_IB1_REM_SIZE);
++	printf("SWEET GSVC:   CP_IB1_REM_SIZE %#x when idle (want 0)\n", rem);
++	ok = ok && rem == 0 && gs_page_check("6.3 IBs") == 0;
++	gs_dump("6.3 IBs");
++	if (!ok || !gs_clean("6.3 IBs")) {
++		return false;
++	}
++
++	/* The window */
++	gpu_pause("6.3 level-1 entry 8 -> the window's level-2 table, then bank 0 TLBIALL");
++	for (unsigned t = 0; t < GS_L3_TABLES; ++t) {
++		gs_l2[t] = (gs_l3_pa + (uint64_t)t * GS_PAGE) | GS_PTE_TABLE;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	gs_l1[GS_WIN_L1] = gs_l2_pa | GS_PTE_TABLE;
++	ok = gs_tlbi("6.3 window on");
++	printf("SWEET GSVC:   level-1 entry %u = 0x%016llx: GPU VA %#llx..%#llx, %u pages\n", GS_WIN_L1, gs_l1[GS_WIN_L1],
++	    GS_WIN_BASE, gs_win_va(GS_WIN_PAGES) - 1u, GS_WIN_PAGES);
++	gs_window = ok;
++
++	volatile uint32_t *tb = (volatile uint32_t *)gs_tbuf, *sp = (volatile uint32_t *)gs_tspare;
++	const uint32_t pw = GS_PAGE / 4u;
++	for (uint32_t i = 0; i < 4u * pw; ++i) {
++		tb[i] = ST_POISON;
++		sp[i] = ST_POISON;
++	}
++	flush_dcache64((addr64_t)gs_tbuf_pa, gs_tbuf_size, TRUE);
++	flush_dcache64((addr64_t)gs_tspare_pa, gs_tbuf_size, TRUE);
++	int first = gs_win_alloc(4);
++	if (!ok || first < 0) {
++		return false;
++	}
++	uint32_t wp = (uint32_t)first;
++	for (uint32_t p = 0; p < 4u; ++p) {
++		gs_win_map(wp + p, gs_tbuf_pa + p * GS_PAGE);
++	}
++	ok = gs_tlbi("6.3 test buffer mapped");
++	ib[0] = gs_slot(5, &w);
++	for (uint32_t p = 0; p < 4u; ++p) {
++		ibw_mem_write(&w, gs_win_va(wp + p), 0xc0ff6500u + 2u * p);
++		ibw_mem_write(&w, gs_win_va(wp + p) + GS_PAGE - 4u, 0xc0ff6501u + 2u * p);
++	}
++	ok = ok && gs_slot_done(&ib[0], &w, "5") && gs_run(ib, 1, "6.3 window writes");
++	flush_dcache64((addr64_t)gs_tbuf_pa, gs_tbuf_size, TRUE);
++	unsigned bad = 0;
++	for (uint32_t i = 0; i < 4u * pw; ++i) {
++		uint32_t p = i / pw, want = ST_POISON;
++		if (i % pw == 0) {
++			want = 0xc0ff6500u + 2u * p;
++		} else if (i % pw == pw - 1u) {
++			want = 0xc0ff6501u + 2u * p;
++		}
++		bad += tb[i] != want;
++	}
++	printf("SWEET GSVC:   window pages %u-%u (VA %#llx) -> pa %#llx: %u of %u words wrong (want 0)\n", wp, wp + 3u,
++	    gs_win_va(wp), gs_tbuf_pa, bad, 4u * pw);
++	ok = ok && bad == 0;
++
++	/* Unmap page 2, map the spare page at the same VA, write through it again */
++	gs_win_unmap(wp + 2u);
++	ok = gs_tlbi("6.3 page 2 unmapped") && ok;
++	gs_win_map(wp + 2u, gs_tspare_pa);
++	ok = gs_tlbi("6.3 spare page mapped") && ok;
++	ib[0] = gs_slot(6, &w);
++	ibw_mem_write(&w, gs_win_va(wp + 2u), 0xc0ff6601u);
++	ok = ok && gs_slot_done(&ib[0], &w, "6") && gs_run(ib, 1, "6.3 remapped write");
++	flush_dcache64((addr64_t)gs_tbuf_pa, gs_tbuf_size, TRUE);
++	flush_dcache64((addr64_t)gs_tspare_pa, gs_tbuf_size, TRUE);
++	printf("SWEET GSVC:   remap: spare word 0 = 0x%08x (want 0xc0ff6601), old page 2 word 0 = 0x%08x (want 0xc0ff6504)\n",
++	    sp[0], tb[2u * pw]);
++	ok = ok && sp[0] == 0xc0ff6601u && tb[2u * pw] == 0xc0ff6504u;
++
++	for (uint32_t p = 0; p < 4u; ++p) {
++		gs_win_unmap(wp + p);
++	}
++	gs_win_mark(wp, 4, false);
++	ok = gs_tlbi("6.3 test buffer unmapped") && ok;
++	kmem_free(kernel_map, gs_tbuf, gs_tbuf_size);
++	kmem_free(kernel_map, gs_tspare, gs_tbuf_size);
++	gs_tbuf = gs_tspare = 0;
++	gs_dump("after 6.3");
++	return gs_clean("6.3") && gs_page_check("6.3") == 0 && ok;
++}
++
++/* The C API */
++static struct gs_bo *
++gs_bo_get(uint32_t handle)
++{
++	if (handle == 0 || handle > GS_MAX_BO || !gs_bos[handle - 1u].used) {
++		return NULL;
++	}
++	return &gs_bos[handle - 1u];
++}
++
++static bool
++gs_usable(void)
++{
++	return gs_window && !gs_dead;
++}
++
++int
++sweet_gsvc_bo_new(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gpu_va, volatile uint32_t **cpu)
++{
++	if (!gs_usable()) {
++		return ENXIO;
++	}
++	if (flags || size == 0 || size > GS_BO_MAX_BYTES) {
++		return EINVAL;
++	}
++	uint32_t ksize = gs_round(size), n = ksize / GS_PAGE;
++	uint64_t pa = 0;
++	vm_offset_t va = gs_kalloc(ksize, &pa);
++	if (!va) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&gs_lock);
++	unsigned h = 0;
++	while (h < GS_MAX_BO && gs_bos[h].used) {
++		++h;
++	}
++	int page = h < GS_MAX_BO ? gs_win_alloc(n) : -1;
++	if (page < 0) {
++		lck_mtx_unlock(&gs_lock);
++		kmem_free(kernel_map, va, ksize);
++		return ENOMEM;
++	}
++	for (uint32_t i = 0; i < n; ++i) {
++		gs_win_map((uint32_t)page + i, pa + (uint64_t)i * GS_PAGE);
++	}
++	bool tlb = gs_tlbi("bo new");
++	gs_bos[h] = (struct gs_bo){ .used = true, .owned = true, .va = va, .pa = pa, .size = ksize, .page = (uint32_t)page };
++	lck_mtx_unlock(&gs_lock);
++	*handle = h + 1u;
++	*gpu_va = gs_win_va((uint32_t)page);
++	*cpu = (volatile uint32_t *)va;
++	return tlb ? 0 : EIO;
++}
++
++/* Pages of someone else's memory (an IOSurface): mapped, never freed here */
++int
++sweet_gsvc_bo_import_pages(const uint64_t *pa, uint32_t npages, uint32_t *handle, uint64_t *gpu_va)
++{
++	if (!gs_usable()) {
++		return ENXIO;
++	}
++	if (npages == 0 || npages > GS_BO_MAX_BYTES / GS_PAGE) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < npages; ++i) {
++		if (pa[i] & (GS_PAGE - 1u)) {
++			return EINVAL;
++		}
++	}
++	lck_mtx_lock(&gs_lock);
++	unsigned h = 0;
++	while (h < GS_MAX_BO && gs_bos[h].used) {
++		++h;
++	}
++	int page = h < GS_MAX_BO ? gs_win_alloc(npages) : -1;
++	if (page < 0) {
++		lck_mtx_unlock(&gs_lock);
++		return ENOMEM;
++	}
++	for (uint32_t i = 0; i < npages; ++i) {
++		gs_win_map((uint32_t)page + i, pa[i]);
++	}
++	bool tlb = gs_tlbi("bo import");
++	gs_bos[h] = (struct gs_bo){ .used = true, .owned = false, .va = 0, .pa = pa[0], .size = npages * GS_PAGE,
++		                    .page = (uint32_t)page };
++	lck_mtx_unlock(&gs_lock);
++	*handle = h + 1u;
++	*gpu_va = gs_win_va((uint32_t)page);
++	return tlb ? 0 : EIO;
++}
++
++/* Waits (up to 2 s) for everything sent so far, then unmaps and frees */
++int
++sweet_gsvc_bo_free(uint32_t handle)
++{
++	lck_mtx_lock(&gs_lock);
++	struct gs_bo *bo = gs_bo_get(handle);
++	uint32_t upto = gs_sent;
++	lck_mtx_unlock(&gs_lock);
++	if (!bo) {
++		return EINVAL;
++	}
++	int r = gs_dead ? 0 : gs_wait_seq(upto, GS_FREE_WAIT_MS);
++	if (r == ETIMEDOUT) {
++		return EBUSY;
++	}
++	lck_mtx_lock(&gs_lock);
++	uint32_t n = bo->size / GS_PAGE;
++	for (uint32_t i = 0; i < n; ++i) {
++		gs_win_unmap(bo->page + i);
++	}
++	bool tlb = gs_tlbi("bo free");
++	gs_win_mark(bo->page, n, false);
++	if (bo->owned) {
++		kmem_free(kernel_map, bo->va, bo->size);
++	}
++	*bo = (struct gs_bo){ .used = false };
++	lck_mtx_unlock(&gs_lock);
++	return tlb ? 0 : EIO;
++}
++
++/* Clean and invalidate a kernel BO to PoC: before the GPU reads it, and after a fence before the CPU reads it */
++int
++sweet_gsvc_bo_sync(uint32_t handle)
++{
++	lck_mtx_lock(&gs_lock);
++	struct gs_bo *bo = gs_bo_get(handle);
++	if (bo && bo->owned) {
++		flush_dcache64((addr64_t)bo->pa, bo->size, TRUE);
++	}
++	lck_mtx_unlock(&gs_lock);
++	return bo ? 0 : EINVAL;
++}
++
++int
++sweet_gsvc_submit(const struct sweet_gsvc_ib *ibs, unsigned n, uint32_t *seq)
++{
++	if (!gs_usable()) {
++		return ENXIO;
++	}
++	if (n == 0 || n > GS_MAX_IBS) {
++		return EINVAL;
++	}
++	struct gs_ibref ref[GS_MAX_IBS];
++	lck_mtx_lock(&gs_lock);
++	for (unsigned i = 0; i < n; ++i) {
++		struct gs_bo *bo = gs_bo_get(ibs[i].handle);
++		if (!bo || (ibs[i].offset & 3u) || ibs[i].size_dw == 0 || ibs[i].size_dw > IB_SIZE_MASK ||
++		    ibs[i].offset > bo->size || (uint64_t)ibs[i].size_dw * 4u > bo->size - ibs[i].offset) {
++			lck_mtx_unlock(&gs_lock);
++			return EINVAL;
++		}
++		ref[i].iova = gs_win_va(bo->page) + ibs[i].offset;
++		ref[i].dwords = ibs[i].size_dw;
++	}
++	bool ok = gs_submit_locked(ref, n, true, seq);
++	lck_mtx_unlock(&gs_lock);
++	return ok ? 0 : (gs_dead ? ENXIO : EBUSY);
++}
++
++int
++sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms)
++{
++	if ((int32_t)(seq - gs_sent) > 0) {
++		return EINVAL;
++	}
++	return gs_wait_seq(seq, timeout_ms);
++}
++
++void
++sweet_gsvc_info(struct sweet_gsvc_info *info)
++{
++	*info = (struct sweet_gsvc_info){
++		.chip_id = GS_CHIP_ID, .gmem_size = GS_GMEM_SIZE, .gmem_base = GS_GMEM_BASE,
++		.cur_khz = gs_cur_khz, .max_khz = gs_max_khz, .last_retired = gs_fence ? gs_fence[0] : 0,
++		.flags = (gs_ready ? SWEET_GSVC_READY : 0u) | (gs_dead ? SWEET_GSVC_DEAD : 0u),
++		.fence_pa = gs_fence_pa, .window_base = GS_WIN_BASE, .window_size = (uint64_t)GS_WIN_PAGES * GS_PAGE,
++	};
++}
++
++/* Self-test (6.4, 6.6, 6.7): clear and copy of 64x64 RGBA8 through the C API; bad pixels, or UINT32_MAX */
++struct st_bo {
++	uint32_t h;
++	uint64_t gva;
++	volatile uint32_t *cpu;
++};
++
++static uint32_t
++gs_selftest(const char *when)
++{
++	struct st_bo a = { 0 }, b = { 0 }, c = { 0 }, d = { 0 };
++	const uint32_t clear_dw = 3u + ST_WORDS, copy_dw = 6u * ST_WORDS;
++	uint32_t nbad = UINT32_MAX, bad[3] = { 0, 0, 0 };
++	uint64_t us[3] = { 0, 0, 0 };
++	int r = sweet_gsvc_bo_new(4u * ST_WORDS, 0, &a.h, &a.gva, &a.cpu);
++	r = r ? r : sweet_gsvc_bo_new(4u * ST_WORDS, 0, &b.h, &b.gva, &b.cpu);
++	r = r ? r : sweet_gsvc_bo_new(4u * clear_dw, 0, &c.h, &c.gva, &c.cpu);
++	r = r ? r : sweet_gsvc_bo_new(4u * copy_dw, 0, &d.h, &d.gva, &d.cpu);
++	if (r) {
++		printf("SWEET GSVC: %s: bo_new failed (%d)\n", when, r);
++		goto out;
++	}
++	for (uint32_t i = 0; i < ST_WORDS; ++i) {
++		a.cpu[i] = ST_POISON;
++		b.cpu[i] = ST_POISON;
++	}
++	struct gs_ibw w;
++	ibw_init(&w, c.cpu, clear_dw);
++	ibw_put(&w, sweet_cp_pkt7(PM4_CP_MEM_WRITE, 2u + ST_WORDS));
++	ibw_put(&w, (uint32_t)a.gva);
++	ibw_put(&w, (uint32_t)(a.gva >> 32));
++	for (uint32_t i = 0; i < ST_WORDS; ++i) {
++		ibw_put(&w, ST_CLEAR);
++	}
++	ibw_init(&w, d.cpu, copy_dw);
++	for (uint32_t i = 0; i < ST_WORDS; ++i) {
++		ibw_mem_copy(&w, i == 0 ? M2M_WAIT_FOR_MEM_WRITES : 0, b.gva + 4u * i, a.gva + 4u * i);
++	}
++	(void)sweet_gsvc_bo_sync(a.h);
++	(void)sweet_gsvc_bo_sync(b.h);
++	(void)sweet_gsvc_bo_sync(c.h);
++	(void)sweet_gsvc_bo_sync(d.h);
++
++	for (unsigned k = 0; k < 3u; ++k) {
++		if (k == 2u) {
++			for (uint32_t i = 0; i < ST_WORDS; ++i) {
++				a.cpu[i] = ((i / ST_W) << 16) | (i % ST_W);
++			}
++			(void)sweet_gsvc_bo_sync(a.h);
++		}
++		struct sweet_gsvc_ib ib = { k == 0 ? c.h : d.h, 0, k == 0 ? clear_dw : copy_dw };
++		uint32_t seq = 0;
++		uint64_t t0 = gs_alwayson();
++		r = sweet_gsvc_submit(&ib, 1, &seq);
++		r = r ? r : sweet_gsvc_wait(seq, GS_WAIT_MS);
++		us[k] = gs_ticks_us(gs_alwayson() - t0);
++		if (r) {
++			printf("SWEET GSVC: %s: %s submit/wait failed (%d)\n", when, k == 0 ? "clear" : "copy", r);
++			goto out;
++		}
++		struct st_bo *dst = k == 0 ? &a : &b;
++		(void)sweet_gsvc_bo_sync(dst->h);
++		for (uint32_t i = 0; i < ST_WORDS; ++i) {
++			uint32_t want = k == 2u ? (((i / ST_W) << 16) | (i % ST_W)) : ST_CLEAR;
++			uint32_t got = dst->cpu[i];
++			if (got != want) {
++				if (bad[k] < 4u) {
++					printf("SWEET GSVC:   %s: pixel (%u,%u) 0x%08x, want 0x%08x\n", when, i % ST_W, i / ST_W, got,
++					    want);
++				}
++				++bad[k];
++			}
++		}
++	}
++	nbad = bad[0] + bad[1] + bad[2];
++	printf("SWEET GSVC: %s: self-test %ux%u: clear %u bad (%llu us), copy %u bad (%llu us), pattern copy %u bad "
++	    "(%llu us): %u bad pixels\n", when, ST_W, ST_H, bad[0], us[0], bad[1], us[1], bad[2], us[2], nbad);
++out:
++	if (a.h) {
++		(void)sweet_gsvc_bo_free(a.h);
++	}
++	if (b.h) {
++		(void)sweet_gsvc_bo_free(b.h);
++	}
++	if (c.h) {
++		(void)sweet_gsvc_bo_free(c.h);
++	}
++	if (d.h) {
++		(void)sweet_gsvc_bo_free(d.h);
++	}
++	return nbad;
++}
++
++/* 6.4 */
++static bool
++gs_selftest_step(void)
++{
++	printf("SWEET GSVC: 6.4 self-test: CP_MEM_WRITE clear and CP_MEM_TO_MEM copy of %ux%u RGBA8 in window BOs\n",
++	    ST_W, ST_H);
++	gpu_pause("6.4 the self-test through the C API");
++	uint32_t bad = gs_selftest("6.4");
++	uint32_t used = gs_win_count();
++	printf("SWEET GSVC:   window pages in use afterwards: %u (want 0)\n", used);
++	gs_dump("after 6.4");
++	return gs_clean("6.4") && bad == 0 && used == 0;
++}
++
++/* 6.5: the hang detector, fired by a CP_WAIT_REG_MEM on scratch word 11, then released by the CPU */
++static bool
++gs_hang_step(void)
++{
++	printf("SWEET GSVC: 6.5 hang detector: CP_WAIT_REG_MEM (EQ, memory) on scratch word 11, released after detection\n");
++	gs_page[11] = 0;
++	gs_snap[11] = 1;
++	gs_snap[12] = 0xc0ff6501u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	struct gs_ibw w;
++	struct gs_ibref ib = gs_slot(7, &w);
++	ibw_put(&w, sweet_cp_pkt7(PM4_CP_WAIT_REG_MEM, 6));
++	ibw_put(&w, WRM_EQ_MEMORY);
++	ibw_put(&w, (uint32_t)gs_word_pa(11));
++	ibw_put(&w, (uint32_t)(gs_word_pa(11) >> 32));
++	ibw_put(&w, 1);
++	ibw_put(&w, 0xffffffffu);
++	ibw_put(&w, 16);
++	ibw_mem_write(&w, gs_word_pa(12), 0xc0ff6501u);
++	if (!gs_slot_done(&ib, &w, "7")) {
++		return false;
++	}
++	gpu_pause("6.5 the CP waits on purpose; the detector runs in test mode");
++	gs_hang_seen = false;
++	gs_hang_test = true;
++	uint32_t seq = 0;
++	if (!gs_submit_locked(&ib, 1, true, &seq)) {
++		gs_hang_test = false;
++		return false;
++	}
++	uint64_t t0 = gs_now_us();
++	while (!gs_hang_seen && !gs_dead && gs_now_us() - t0 < 3000000u) {
++		gpu_sleep_ms(5);
++	}
++	uint64_t ms = gs_hang_seen ? (gs_hang_us - t0) / 1000u : 0;
++	printf("SWEET GSVC:   detector %s after %llu ms (want 2000-2100); word 12 0x%08x fence %u sent %u\n",
++	    gs_hang_seen ? "fired" : "did NOT fire in 3 s", ms, gs_page[12], gs_fence[0], gs_sent);
++	gs_dump("6.5 while waiting");
++	bool ok = gs_hang_seen && ms >= 2000u && ms <= 2100u && gs_page[12] != 0xc0ff6501u;
++
++	gs_page[11] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t t1 = gs_now_us();
++	int r = gs_wait_seq(seq, 10);
++	printf("SWEET GSVC:   released: fence %u %s after %llu us, word 12 0x%08x (want 0xc0ff6501)\n", seq,
++	    r == 0 ? "reached" : "NOT reached", gs_now_us() - t1, gs_page[12]);
++	gs_hang_test = false;
++	gs_hang_seen = false;
++	ok = ok && r == 0 && gs_page[12] == 0xc0ff6501u;
++	if (r == ETIMEDOUT) {
++		r = gs_wait_seq(seq, GS_WAIT_MS);
++		printf("SWEET GSVC:   after 1 s more: fence %s\n", r == 0 ? "reached (slow)" : "still NOT reached");
++		if (r) {
++			gs_kill("6.5: the CP did not resume after the release");
++			return false;
++		}
++	}
++
++	ib = gs_slot(0, &w);
++	ibw_mem_write(&w, gs_word_pa(5), 0xc0ff6301u);
++	ibw_put(&w, sweet_cp_pkt4(GS_CP_SCRATCH_REG0 + 6u, 1));
++	ibw_put(&w, 0x5ee76301u);
++	ok = gs_slot_done(&ib, &w, "0") && gs_run(&ib, 1, "6.5 normal submit") && ok;
++	gs_dump("after 6.5");
++	return gs_clean("6.5") && gs_page_check("6.5") == 0 && ok;
++}
++
++/* 6.6: DCVS perf index -> measured gx_gfx3d within 1 %, then the self-test */
++static bool
++gs_clock(unsigned index, uint32_t want_khz)
++{
++	if (gs_wait_seq(gs_sent, GS_WAIT_MS)) {
++		return false;
++	}
++	char when[32];
++	snprintf(when, sizeof(when), "6.6 %u MHz", want_khz / 1000u);
++	uint32_t ret = 0;
++	bool acked = sweet_gmu_dcvs(index, &ret);
++	uint32_t khz = sweet_gpu_gfx3d_khz();
++	bool near = khz != 0xffffffffu && khz >= want_khz - want_khz / 100u && khz <= want_khz + want_khz / 100u;
++	printf("SWEET GSVC:   %s: DCVS perf %u %s, DCVS_RETURN 0x%08x, gx_gfx3d %u kHz (%s)\n", when, index,
++	    acked ? "acked" : "NOT acked", ret, khz, near ? "within 1 %" : "NOT within 1 %");
++	if (!acked || ret != 0 || !near) {
++		return false;
++	}
++	gs_cur_khz = khz;
++	uint32_t bad = gs_selftest(when);
++	return bad == 0 && gs_clean(when);
++}
++
++static bool
++gs_clocks(void)
++{
++	printf("SWEET GSVC: 6.6 clock steps through DCVS: perf 4 (430 MHz), then perf 5 (565 MHz)\n");
++	gpu_pause("6.6 DCVS perf index 4 (430 MHz)");
++	if (!gs_clock(4, 430000u)) {
++		uint32_t ret = 0;
++		(void)sweet_gmu_dcvs(1, &ret);
++		gs_cur_khz = gs_max_khz = 180000u;
++		printf("SWEET GSVC: 6.6 stopped: 430 MHz failed; back at perf 1 (180 MHz)\n");
++		return false;
++	}
++	gs_max_khz = 430000u;
++	gpu_pause("6.6 DCVS perf index 5 (565 MHz)");
++	if (gs_clock(5, 565000u)) {
++		gs_max_khz = 565000u;
++	} else {
++		uint32_t ret = 0;
++		bool back = sweet_gmu_dcvs(4, &ret) && ret == 0;
++		gs_cur_khz = sweet_gpu_gfx3d_khz();
++		printf("SWEET GSVC:   565 MHz failed: back at perf 4 (%s, %u kHz); max_freq 430 MHz (recorded, still a pass)\n",
++		    back ? "acked" : "NOT acked", gs_cur_khz);
++		if (!back) {
++			return false;
++		}
++	}
++	gs_dump("after 6.6");
++	return gs_clean("6.6");
++}
++
++/* 6.7: service ready, then the self-test every 10 s for 60 s */
++static bool
++gs_hold(void)
++{
++	gs_ready = true;
++	struct sweet_gsvc_info in;
++	sweet_gsvc_info(&in);
++	printf("SWEET GSVC: service ready: chip_id 0x%08x gmem_size %#x gmem_base %#x cur %u kHz max %u kHz fence pa %#llx "
++	    "window %#llx + %#llx\n", in.chip_id, in.gmem_size, in.gmem_base, in.cur_khz, in.max_khz, in.fence_pa,
++	    in.window_base, in.window_size);
++	printf("SWEET GSVC: 6.7 hold: the self-test through the C API every 10 s for 60 s\n");
++	bool ok = true;
++	for (unsigned s = 10; s <= 60u; s += 10u) {
++		gpu_sleep_ms(10000);
++		char when[24];
++		snprintf(when, sizeof(when), "6.7 hold %u s", s);
++		uint32_t bad = gs_selftest(when);
++		uint32_t used = gs_win_count();
++		gs_dump(when);
++		printf("SWEET GSVC:   %s: %u bad pixels, %u window pages in use (want 0, 0)\n", when, bad, used);
++		ok = gs_clean(when) && bad == 0 && used == 0 && ok;
++	}
++	return ok;
++}
++
++bool
++sweet_gsvc_run(int stop, int cb, vm_offset_t l1_va, uint64_t l1_pa)
++{
++	printf("SWEET GSVC: stage 6 (sweetgpu=8 sweetsvc=%d): the kernel GPU service on SMMU bank %d\n", stop, cb);
++	gs_cb = cb;
++	gs_l1 = (volatile uint64_t *)l1_va;
++	gs_l1_pa = l1_pa;
++	int step = 0;
++	bool ok = gs_survey();
++	if (ok && stop >= 1) {
++		step = 1;
++		ok = gs_protect_init();
++	}
++	if (ok && stop >= 2) {
++		step = 2;
++		ok = gs_fences();
++	}
++	if (ok && stop >= 3) {
++		step = 3;
++		ok = gs_ibs();
++	}
++	if (ok && stop >= 4) {
++		step = 4;
++		ok = gs_selftest_step();
++	}
++	if (ok && stop >= 5) {
++		step = 5;
++		ok = gs_hang_step();
++	}
++	if (ok && stop >= 6) {
++		step = 6;
++		ok = gs_clocks();
++	}
++	if (ok && stop >= 7) {
++		step = 7;
++		ok = gs_hold();
++	}
++	if (!ok) {
++		gs_kill("stage 6 at the failure");
++	}
++	printf("SWEET GSVC: stage 6 %s at 6.%d (sweetsvc=%d); %s\n", ok ? "done" : "STOPPED by a failure", step, stop,
++	    gs_dead ? "the service is dead, the SQE stopped" : gs_ready ? "the service stays ready" :
++	    "the SQE stays running");
++	return ok;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -476,6 +476,18 @@
+ 	return bank;
+ }
+ 
++/* Stage 6: drop the bank's cached walks after a table change; false if TLBSYNC does not complete */
++bool
++sweet_smmu_tlbiall(int cb)
++{
++	if (cb < 0) {
++		return false;
++	}
++	vm_offset_t base = smmu_cb((unsigned)cb);
++	gpu_wr(base, CB_TLBIALL, 0);
++	return smmu_tlb_sync(base, CB_TLBSYNC, CB_TLBSTATUS);
++}
++
+ /* Logs the global and (cb >= 0) the bank's fault registers; returns sGFSR | FSR fault bits, 0 if clean. */
+ uint32_t
+ sweet_smmu_faults(int cb, const char *when)

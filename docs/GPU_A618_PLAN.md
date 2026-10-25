@@ -1568,9 +1568,24 @@ Fixes found on G5a or G5b are new patches and CI runs, shown before anything boo
 Stage 5 leaves these for later: CP_PROTECT, interrupts, indirect buffers, `CACHE_FLUSH_TS` fences (Stage 6),
 and reloading the zap after power collapse (Stage 9).
 
-### Stage 6: kernel GPU service and user client (planned; not started)
+### Stage 6: kernel GPU service and user client (patch 0111 written; not booted)
 
 Planned 2026-10-26, after G5c passed Stage 5. The owner asked to see this plan before any code.
+
+**Where patch 0111 differs from the plan below** (written 2026-10-26; these override the step text):
+- `CP_WAIT_REG_MEM` takes **6** payload dwords (count 6), not 5: function/poll, addr lo, addr hi, ref,
+  mask, delay.
+- The 6.4 copy IB is 4096 × 6 dwords = **96 KiB**, not 24 KiB. The self-test IBs therefore live in window
+  BOs (made through the C API), not in the 4 KiB slots of the IB pool. The pool (16 × 4 KiB) holds only
+  the 6.3 and 6.5 test IBs.
+- Kernel BOs are `kmem_alloc_contig` memory kept **cacheable** for the CPU and cleaned/invalidated to PoC
+  (`flush_dcache64`) before submit and after the fence (`sweet_gsvc_bo_sync`). This replaces the uncached
+  alias, because each `ml_io_map` alias would leak kernel VA when a BO is freed.
+- The gx_gfx3d clock counter is static in `sweet_gpu.c`, so `sweet_gpu_gfx3d_khz()` is exported from
+  there, not from `sweet_gmu.c`. `sweet_gmu_dcvs(index, &ret)` stays in `sweet_gmu.c`.
+- 6.5 waits on scratch word **11** and writes word **12**, because 6.3 already uses words 8 and 10.
+- In 6.2, if `INT_0_STATUS` bit 20 does not latch and clear, the step logs it as a finding (risk 4) and
+  goes on. It is not a stop.
 
 **Idea.** Turn the CP that Stage 5 left running (outside secure mode, writes reaching DRAM) into a small
 service that other code can use. First add what mainline's `hw_init` and `a6xx_submit` do and we skipped:
@@ -2253,10 +2268,11 @@ CPU-visible. Stages 0–5 are done.
 Not known: whether anything differs between secure and non-secure writes, since both landed. Next (to plan, with
 the owner's OK): Stage 6.
 
-**Stage 6 planned (2026-10-26), not yet approved.** The detailed plan is under "Stage 6" above. In short:
+**Stage 6 planned and approved (2026-10-26); patch 0111 written, not booted.** The detailed plan is under
+"Stage 6" above, with 0111's deviations listed at its top. In short:
 - patch 0111 (kernel only) for steps 6.0–6.7, with the new boot-arg `sweetsvc`;
 - images G6a (1), G6b (3), G6c (5) and G6d (7);
 - then patch 0112 (the user client, selectors 10–15, and a test tool), whose delivery to the phone is the
   owner's choice.
 
-Interrupts stay polled, because the GIC never enables SPI 332. No code exists yet.
+Interrupts stay polled, because the GIC never enables INTID 332 (SPI 300).
