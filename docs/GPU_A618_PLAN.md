@@ -1410,5 +1410,10 @@ still reads 0x3.
 Result on G4b (0108, `sweetcp=4`): stage 4 done at 4.4, the CP runs. 4.3: with CP_SQE_CNTL=1 on the empty
 ring, RPTR stays 0 and the GPU idle at 1 ms, 100 ms and 1 s, CP_HW_FAULT and CP_PROTECT_STATUS 0, and no fault on
 SMMU bank 0 or 4, so the SQE's microcode fetch through bank 0 worked. 4.4: ME_INIT was consumed, RPTR 9 and idle
-after 10 us, no fault. The SQE stays running. Next, with the owner's OK: G4c (0108, `sweetcp=6`): markers, ring
-wrap and the 30 s hold.
+after 10 us, no fault. The SQE stays running.
+
+Result on G4c (0108, `sweetcp=6`): **stage 4 passed.** 4.5: the first marker landed (SCRATCH_REG7 0x5ee70001,
+RPTR 11), then all 80 batches of 64 (each idle within 10 us), two ring wraps, last value 0x5ee723ff, RPTR = WPTR
+2059. The ring past ME_INIT was still zero beforehand and the tripwire page was unchanged after. 4.6: markers
+0x5ee72001..3 at 10, 20 and 30 s, RBBM_STATUS 0x1, CP_HW_FAULT and CP_PROTECT_STATUS 0, no SMMU fault, GMU
+and GX GDSC steady. Next, with the owner's OK: plan stage 5 (zap shader) in detail.
