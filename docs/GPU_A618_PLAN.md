@@ -1,10 +1,10 @@
 # Adreno 618 GPU acceleration plan (sunfish / Pixel 4a)
 
-Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A ran on G2
-(patch 0097) and G2b (patch 0098): the rail votes, PLL0 and the GX GDSC work, and the GMU sees GX powered.
-The gfx3d RCG root still reads off, so no GX register has been read yet. Patch 0099 (image G2m) measures
-the GPU clocks; it is written and not yet booted.** Nothing is flashed: every test is a `fastboot boot`
-image. The firmware is extracted. The hardware facts
+Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A ran on G2, G2b
+and G2m (patches 0097–0099): the rail votes, PLL0 and the GX GDSC work, and the GMU sees GX powered. The
+GCC counter shows the GPU core clock (gx_gfx3d) does not run at all, so no GX register has been read.
+Per the 2A decision rule, the next path is 2B (the GMU powers GX).** Nothing is flashed: every test is a
+`fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
 
@@ -458,6 +458,39 @@ How to read G2m:
 - If gx_gfx3d runs but GX_HM_CLK_OFF stays set, the stage still stops before the reads. That bit is the
   next thing to study.
 
+**Result on G2m (kernel 0099, booted 11:05:50).** The owner reported a working phone. The log (flush #133,
+5179 lines) has no panic or fault, and 2710 lines follow the stage's last line. Everything up to the GX
+branches matched G2b. The counter measured:
+
+| clock | after the GX branches (CFG = XO) | after the 180 MHz update |
+|---|---|---|
+| cx_gmu | 200001 kHz | 199999 kHz |
+| gx_gfx3d | 0 (not running) | 0 (not running) |
+| cx_gfx3d | 0 (not running) | 0 (not running) |
+| gx_cxo | 19201 kHz | not measured |
+| gx_gmu | 199999 kHz | not measured |
+
+- The counter method works. cx_gmu reads the 200 MHz that stage 1 set, and gx_cxo reads XO.
+- Clocks on the powered GX side can run: gx_gmu runs at 200 MHz and gx_cxo at 19.2 MHz.
+- The gfx3d RCG took the update (CFG 0 → 0x101, UPDATE cleared), but its root still read off. gx_gfx3d
+  and cx_gfx3d count nothing, both from XO before the update and from crc_div after it. So the status bit
+  was right: **the GPU core clock does not run when the host drives it.**
+- SPTPRAC stayed 0x94, and the stage stopped before any GX read, as designed.
+
+This rules out causes 1 and 3 above. Cause 2 is unlikely, because gx_cxo, which comes from the same XO,
+runs. That leaves cause 4: something the host cannot see holds the gfx3d root off, most likely the GMU.
+Supporting facts from downstream:
+- The GMU node in sdmmagpie-gpu.dtsi lists only cx_gmu, cxo, the AXI and the memnoc clocks; gfx3d is not
+  among them. Only the kgsl GPU node names gfx3d (as core_clk).
+- No DT node enables gpu_cc_crc_ahb_clk or the ACD clocks. They are left to the GMU firmware or to the
+  hardware defaults.
+- Mainline Linux runs the a618 in sc7180 with the GMU firmware setting the GPU frequency. As far as we
+  know it has no host gfx3d clock, and its GX GDSC enable is a no-op left to the GMU. This is from memory
+  and was not re-checked in this session.
+
+2A ends here, per its decision rule: gx_gfx3d never ran. The next path is 2B. A last cheap 2A try would be
+turning on crc_ahb and the ACD clocks, but nothing in downstream does that, so it is a guess.
+
 **2B: the real GMU path (fallback; it is what mainline Linux does for a618).**
 
 1. Load `a618_gmu.bin` into ITCM (legacy raw image; at most 0x8000 bytes).
@@ -621,6 +654,7 @@ Stages 0 and 1 passed on the phone. Stage 1 needed one fix: patch 0096 turns the
 GPU branches. The owner approved Stage 2A. On G2 (patch 0097) the rail votes and PLL0 worked, and the stage
 stopped because the gfx3d RCG root stayed off with GX clamped. On G2b (patch 0098) the GX GDSC came on and
 the GMU saw GX powered, so the apps DRV can raise the GX rail. The gfx3d root still read off and SPTP did not
-come on. Patch 0099 measures the GPU clocks with the GCC counter and does downstream's CFG update even with
-the root off. Next is the G2m test boot, once the owner approves it. If gx_gfx3d never runs, the fallback
-is 2B.
+come on. On G2m (patch 0099) the GCC counter confirmed the clocks around it run (cx_gmu and gx_gmu at
+200 MHz, gx_cxo at 19.2 MHz), but gx_gfx3d does not run at all, either from XO or after the 180 MHz update.
+2A has hit its decision rule. Next is planning 2B in detail: the GMU firmware in ITCM, RSCC/PDC, CM3 start,
+then HFI. It needs the owner's go-ahead.
