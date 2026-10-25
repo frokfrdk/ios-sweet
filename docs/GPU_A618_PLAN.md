@@ -1048,21 +1048,228 @@ G3b and G3c may need fixes in between. Those are new patches and CI runs, shown 
 
 ✅ Pass when the readback matches and no fault is latched.
 
-### Stage 4: CP first light (SQE)
+### Stage 4: CP first light (detailed plan, nothing built yet)
 
-1. Load the SQE image into a GPU-visible page. Write `CP_SQE_INSTR_BASE`.
-2. Program the a618 hardware-init list:
-   - GBIF/VBIF, UCHE ranges and trap base.
-   - UBWC / bank-bit registers, set to the DT values: highest-bank-bit 14, UBWC mode 2.
-   - CP_PROTECT: left open for now.
-   - RBBM clock-gating settings.
-   - Take the list from Mesa/mainline register names; it is a list of register writes, not code.
-3. 16 KB ring, `CP_ME_INIT` (8 dwords), start the SQE.
+Planned 2026-10-25, after G3l passed Stage 3. The owner asked to see this plan before any code.
 
-Expected: the ring read pointer advances. A `CP_MEM_WRITE` marker to normal memory will **not** land
-while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers or RPTR as the proof.
+**Idea.** Start the command processor (CP) the way mainline's a6xx `hw_init` does, minus everything that
+is not needed to prove the CP runs. The SQE microcode goes into memory the GPU reaches through Stage 3's
+bank, then come the hardware init list, a ring buffer, `CP_ME_INIT`, and packets whose only effect is a
+CP register the CPU can read back. Stage 4 makes **no GPU writes to DRAM** by design: the ring has
+`NO_UPDATE` set and no packet writes memory. Memory writes are Stage 5's test, because the GPU is still
+in secure mode (their 0130 finding).
 
-✅ Pass when RPTR equals WPTR after a NOP stream and the SQE version register reads back.
+**Sources, read in this session:**
+- Mainline Linux 6.18.54 (the WSL kernel tree): `drm/msm/adreno/a6xx_gpu.c` (`hw_init`,
+  `a6xx_cp_init`, `a6xx_set_ubwc_config`, `a6xx_ucode_check_version`, `a6xx_idle`), `a6xx_catalog.c`
+  (the `qcom,sm7150` a618 entry), `adreno_gpu.h` (PKT4/PKT7), `soc/qcom/ubwc_config.c` (`sm7150_data`).
+- Our generated headers `xnu/gpu/regs/a6xx.xml.h`, `adreno_common.xml.h`, `adreno_pm4.xml.h` for the
+  offsets.
+- The downstream sunfish kgsl is **not** in `src/sunfish-kernel` (no `drivers/gpu/msm`), so mainline is
+  the only reference for the init list. Values are hardware facts from GPL code. We write our own code (§5).
+- The firmware file itself: `a630_sqe.fw` is 32136 B; dwords 0–3 are `0x00000000 0x016ee19a 0x01001ee1
+  0x01190001`.
+
+**What mainline does for this GPU** (the `qcom,sm7150` entry, chip id 0x06010800):
+- SQE `a630_sqe.fw`, GMEM 512 KiB, `hwcg = a615_hwcg`, `protect = a630_protect`,
+  `prim_fifo_threshold = 0x00180000`. Its zap is `a615_zap`, which matches our blobs.
+- `a6xx_has_gbif()` is true (everything except a630), so the GBIF halts are cleared. The QoS write still
+  takes the VBIF branch, because a618 is not in the a610/a640/a650 family list.
+- UBWC from `sm7150_data`: UBWC 2.0, level 2 and 3 swizzle on, highest bank bit 14. So hbb = 1
+  (hbb_lo 1, hbb_hi 0), `ubwc_mode` 0 (it is set only for UBWC 1.0), amsbc 0, and macrotile 0.
+- The SQE check: the low 12 bits of the first word after dword 0 must be ≥ 0x190. Ours is 0x19a, so
+  mainline would accept it and would use `WHERE_AM_I`. We use neither the RPTR shadow nor `WHERE_AM_I`.
+- Order: OOB_GPU set → GBIF un-halt → SECVID TSB → 64-bit address modes → HWCG → QoS → UCHE → ROQ / mem
+  pool / prim fifo → AHB, perf counters → UBWC → hang detect → UCHE_CLIENT_PF → GMU busy counters →
+  CP_PROTECT → INT_0_MASK → SQE base → ring base/cntl → `CP_SQE_CNTL = 1` → `CP_ME_INIT` + idle → zap,
+  then `CP_SET_SECURE_MODE 0` → clear OOB_GPU and OOB_BOOT_SLUMBER.
+
+**What we already have from 2B/3:**
+- OOB_GPU and OOB_BOOT_SLUMBER are set and never cleared, so the GMU keeps GX on. Stage 4 keeps it that way.
+- Bank 0 (SID 0): 1 GiB identity blocks over 0x80000000–0x1_ffff_ffff, MAIR attribute 0 = Normal
+  non-cacheable. The CPU maps GPU-GMU-MEM write-combined, so a `dsb sy` before each doorbell is enough and
+  no cache maintenance is needed. The bank's SCTLR has CFRE but not CFCFG or HUPCF: a fault terminates
+  the access instead of stalling it, and the FSR latches it.
+- The `GPU-SQE` blob has been in the image since 0094.
+
+**Boot-args:**
+- `sweetgpu=6` selects Stage 4. It needs `sweetgmu=6`, and Stage 3 must pass in the same boot.
+  `sweetgpu=5` stays exactly as on G3l.
+- The new `sweetcp=N` (0–6, default 0) stops after step 4.N, like `sweetgmu`.
+
+**New code (patch 0107):**
+- `sweet_cp.c` (new, about 400 lines): steps 4.0–4.6, the PM4 header helpers (mainline's parity formula),
+  the "CP dump" below.
+- `sweet_gmu.c`: `sweet_gmu_spare()` becomes a page-aligned bump allocator. The first call still returns
+  +0x89000, so Stage 3's table does not move.
+- `sweet_gpu.c`: the `sweetgpu=6` hook after `gpu_stage3()`, which must return success. The "stages above
+  N not built" message moves to `gpu_level > 6`.
+- No `mkboot.sh` change: everything fits in the existing 1 MiB GPU-GMU-MEM blob.
+
+**Memory layout** (GPU-GMU-MEM offsets; PAs as on G3l, where the blob started at 0x1024f0000; IOVA = PA
+through the identity map):
+
+| Offset | Size | PA on G3l | Use |
+|---|---|---|---|
+| +0x89000 | 4 KiB | 0x102579000 | Stage 3 level-1 table (unchanged) |
+| +0x8a000 | 32 KiB | 0x10257a000 | SQE: the file without dword 0 (32132 B), rest zero |
+| +0x92000 | 16 KiB | 0x102582000 | ring 0 (4096 dwords) |
+| +0x96000 | 4 KiB | 0x102586000 | scratch page, filled with 0x5ee7dead; a tripwire in Stage 4, the marker target in Stage 5 |
+| +0x97000 | | | end (the blob is 0x100000) |
+
+**The "CP dump"** (logged after every step from 4.2 on, and on any stop):
+RBBM_STATUS 0x210, STATUS1 0x211, STATUS2 0x212, STATUS3 0x213, RBBM_INT_0_STATUS 0x201,
+CP_RB_RPTR 0x806, CP_RB_WPTR 0x807, CP_SQE_CNTL 0x808, CP_HW_FAULT 0x821, CP_INTERRUPT_STATUS 0x823,
+CP_PROTECT_STATUS 0x824, CP_STATUS_1 0x825, CP_IB1_BASE 0x928/0x929, CP_IB1_REM_SIZE 0x92a,
+CP_ROQ_AVAIL_RB 0x948, CP_SCRATCH_REG(0–7) 0x883–0x88a, CP_ALWAYS_ON_COUNTER 0x980/0x981, bank 0
+FSR/FAR/FSYNR0, the GX GDSC, and the GMU's AO_HOST_INTERRUPT_STATUS. When a step from 4.3 on fails, the dump
+is followed by `CP_SQE_CNTL = 0` (halt the SQE) and the stage stops. Nothing else is undone.
+
+Every poll is bounded (1 s unless stated) and spins with 10 µs delays. Each register write is
+announced with `gpu_pause()` as in 2B, then read back and logged with its expected value.
+
+#### 4.0 Survey and memory (`sweetcp=0`)
+
+No GPU register is written. CPU writes go only to our own blob.
+1. Read and log the reset values of every register 4.1 and 4.2 will write. Also log
+   RBBM_SECVID_TRUST_CNTL 0xf400 (read only, **never written**: the `secvid-set-once` quirk),
+   RBBM_CLOCK_CNTL 0xae, CP_PROTECT_CNTL 0x84f, CP_PROTECT_REG(0–31) 0x850–0x86f, RBBM_INT_0_MASK 0x38,
+   GBIF_HALT_ACK 0x3c46, RBBM_GBIF_HALT_ACK 0x17, and the CP dump.
+2. Check the SQE blob: length 32136, dword 0 = 0, and (dword 1 & 0xfff) ≥ 0x190. A failed version check is
+   logged but does not stop the stage, since nothing depends on `WHERE_AM_I` yet.
+3. Allocate the three areas above. Copy the SQE without dword 0 and read every word back. Zero the ring,
+   poison the scratch page, then `dsb sy`.
+
+✅ Pass when the reads complete, the copy compares equal, and no SMMU fault is latched.
+
+#### 4.1 Hardware init list (`sweetcp=1`)
+
+Mainline's `hw_init` values for this GPU, in mainline's order. "Skip" rows are left at reset and logged
+only.
+
+| # | Register | Offset | Value | Note |
+|---|---|---|---|---|
+| 1 | GBIF_HALT, RBBM_GBIF_HALT | 0x3c45, 0x16 | 0, 0 | then read each back; log both ACKs |
+| 2 | RBBM_SECVID_TSB_CNTL | 0xf803 | 0 | |
+| 3 | RBBM_SECVID_TSB_TRUSTED_BASE, _SIZE | 0xf800/1, 0xf802 | 0, 0 | no trusted range |
+| 4 | *_ADDR_MODE_CNTL × 12 | CP 0x842, VSC 0xc01, GRAS 0x8601, RB 0x8e05, PC 0x9e01, HLSQ 0xbe05, VFD 0xa601, VPC 0x9601, UCHE 0xe00, SP 0xae01, TPL1 0xb601, RBBM_SECVID_TSB 0xf810 | 1 each | 64-bit addressing |
+| – | HWCG (`a615_hwcg`, ~60 writes plus GMU CGC) | | **skip** | clock gating is power, not function; Stage 9 |
+| 5 | RBBM_VBIF_CLIENT_QOS_CNTL | 0x10 | 0x3 | |
+| 6 | RBBM_PERFCTR_GPU_BUSY_MASKED | 0x50b | 0xffffffff | |
+| 7 | UCHE_WRITE_RANGE_MAX | 0xe05/6 | 0x0001ffff_ffffffc0 | trap base + 0xfc0 |
+| 8 | UCHE_TRAP_BASE, UCHE_WRITE_THRU_BASE | 0xe09/a, 0xe07/8 | 0x0001ffff_fffff000 | mainline's a6xx `uche_trap_base` |
+| 9 | UCHE_GMEM_RANGE_MIN, _MAX | 0xe0b/c, 0xe0d/e | 0x00100000, 0x0017ffff | 512 KiB GMEM at 1 MiB |
+| 10 | UCHE_FILTER_CNTL, UCHE_CACHE_WAYS | 0xe18, 0xe17 | 0x804, 0x4 | |
+| 11 | CP_ROQ_THRESHOLDS_2, _1 | 0x8c2, 0x8c1 | 0x010000c0, 0x8040362c | |
+| 12 | CP_MEM_POOL_SIZE | 0x8c3 | 128 | |
+| 13 | PC_DBG_ECO_CNTL | 0x9e00 | 0x00180000 | prim fifo threshold |
+| 14 | CP_AHB_CNTL | 0x98d | 0x1 | AHB default slave response = error |
+| 15 | RBBM_PERFCTR_CNTL; CP_PERFCTR_CP_SEL(0) | 0x500; 0x8d0 | 1; 0 | 0 = `PERF_CP_ALWAYS_COUNT` (`a6xx_perfcntrs.xml`) |
+| 16 | RB_NC_MODE_CNTL, TPL1_NC_MODE_CNTL, SP_NC_MODE_CNTL | 0x8e08, 0xb604, 0xae02 | 0x2 each | UBWC: hbb_lo 1, everything else 0 |
+| 17 | UCHE_MODE_CNTL; RBBM_NC_MODE_CNTL | 0xe01; 0x534 | 0x00200000; 0 | hbb_lo << 21; macrotile 0 |
+| 18 | RBBM_INTERFACE_HANG_INT_CNTL | 0x1f | 0x401fffff | hang detect on |
+| 19 | UCHE_CLIENT_PF | 0xe19 | 0x81 | |
+| – | GMU busy and power counters | | **skip** | Stage 9 |
+| – | CP_PROTECT_CNTL and the 32 `a630_protect` entries | 0x84f, 0x850+ | **skip** | Stage 6 turns it on (see note) |
+| – | RBBM_INT_0_MASK | 0x38 | **stays 0** | no handler yet; mainline's 0x03d0e242 waits for Stage 6 |
+
+Note on CP_PROTECT: the scratch registers 0x883–0x88a sit just past mainline's `NORDWR(0x800, 0x82)` span,
+so the 4.5 test keeps working once protection is on.
+
+Never written in Stage 4: RBBM_SECVID_TRUST_CNTL, RBBM_SW_RESET_CMD, anything in the GMU's own range
+except what 2B already does.
+
+✅ Pass when every row reads back its value. A row that reads back differently is logged, as in 2B.2's RSCC
+rule. It stops the stage only for rows 1–4 (halt, secure and address modes), which the CP needs.
+
+#### 4.2 SQE and ring registers, CP still stopped (`sweetcp=2`)
+
+| Register | Offset | Value |
+|---|---|---|
+| CP_SQE_INSTR_BASE | 0x830/0x831 | SQE IOVA (0x10257a000 on G3l's layout) |
+| CP_RB_BASE | 0x800/0x801 | ring IOVA |
+| CP_RB_CNTL | 0x802 | 0x0800020b: BUFSZ 11 (16 KiB / 8), BLKSZ 2 (32 B / 8) << 8, NO_UPDATE (bit 27) |
+| CP_RB_WPTR | 0x807 | 0 |
+
+CP_RB_RPTR_ADDR is not written, because NO_UPDATE means the CP never writes an RPTR shadow.
+
+✅ Pass when all four read back, RPTR reads 0, and the CP dump shows nothing new.
+
+#### 4.3 Start the SQE on an empty ring (`sweetcp=3`)
+
+1. `CP_SQE_CNTL = 1`. **This is the GPU's first memory fetch through the SMMU**: the SQE reads its
+   microcode from the SQE IOVA.
+2. Dump at 1 ms, 100 ms and 1 s.
+
+✅ Pass when bank 0's FSR stays 0, CP_HW_FAULT stays 0, RPTR stays 0 (the ring is empty), and RBBM_STATUS
+settles to idle: `RBBM_STATUS & ~1 == 0`, mainline's check, where bit 0 is our own AHB access.
+
+#### 4.4 `CP_ME_INIT` (`sweetcp=4`)
+
+Ring dwords 0–8: `0x70c80008` (PKT7 opcode 0x48, count 8), then `0x2f, 0x3, 0x20000000, 0, 0, 0, 0, 0`,
+the mainline a6xx payload. Then `dsb sy` and `CP_RB_WPTR = 9`.
+
+✅ Pass when, within 1 s, RPTR = 9, RBBM_STATUS is idle and CP_HW_FAULT is 0. Log the time it took. This
+is mainline's `a6xx_idle` test without the GMU-idle part.
+
+#### 4.5 Register markers and ring wrap (`sweetcp=5`)
+
+1. One marker: `0x48088a01` (PKT4 CP_SCRATCH_REG(7) 0x88a, count 1), then `0x5ee70001`. Update WPTR, then
+   poll until CP_SCRATCH_REG(7) reads 0x5ee70001 and RPTR equals WPTR.
+2. A wrap test: 80 batches. Each batch is 64 markers (128 dwords) with values 0x5ee71000 + n. After each
+   batch, wait for idle and check the scratch register holds the batch's last value. 80 × 128 dwords is
+   2.5 times round the 4096-dword ring. Because ME_INIT left an odd 9-dword offset, some packets straddle
+   the end of the ring, as they will in real use.
+3. Check that the scratch page still holds 0x5ee7dead everywhere and that the ring area outside what we
+   wrote is still zero (no stray GPU writes).
+
+✅ Pass when every batch lands, RPTR and WPTR agree after each batch (WPTR wraps modulo 4096), and both
+tripwires are intact.
+
+#### 4.6 Hold (`sweetcp=6`, the whole of Stage 4)
+
+For 30 s, every 10 s: one marker (0x5ee72000 + n), the CP dump, the GX GDSC and the GMU state. Then leave
+the SQE running and idle, with OOB_GPU still held. Rebooting clears it, as with Stage 3.
+
+✅ Pass (Stage 4 as a whole) when all markers land, no SMMU fault, CP_HW_FAULT or CP_PROTECT_STATUS is
+latched, RBBM_STATUS stays idle between markers, and the phone stays stable.
+
+The draft's "SQE version register reads back" criterion is dropped: a6xx has no such register (the version
+lives in the firmware file, checked in 4.0). The CP_SQE_INSTR_BASE readback in 4.2 replaces it.
+
+#### Test boots
+
+One kernel (0107) and three images. All use `sweetgpu=6 sweetgmu=6` and the 828xr ADT, and differ only in
+`sweetcp`. `shim/out` has no G4* names yet. Each boot needs the owner's OK.
+
+| Image | `sweetcp` | Writes beyond G3l | Purpose |
+|---|---|---|---|
+| G4a | 2 | the init list and the ring registers; CP not started | the writes stick |
+| G4b | 4 | also `CP_SQE_CNTL = 1` and ME_INIT | the CP runs (first GPU fetch) |
+| G4c | 6 | also the markers, the wrap test and the hold | Stage 4 complete |
+
+Fixes found on G4a or G4b are new patches and CI runs, shown before anything boots.
+
+#### Risks for Stage 4, most uncertain first
+
+1. **The SQE fetch faults or reads garbage.** Bank 0 has not done a real walk yet (ATOS is off). The
+   FSR/FAR name the address. Other suspects: dword 0 not skipped, or the write-combined copy not drained
+   before `CP_SQE_CNTL` (the 4.0 readback plus `dsb sy` cover that).
+2. **Secure mode blocks the ring fetch.** Mainline runs ME_INIT *before* leaving secure mode, so the CP
+   should fetch non-secure memory while secure. If RPTR stays 0 with no fault, this is the first guess.
+   The answer would be the zap (Stage 5) before ME_INIT, not writing SECVID_TRUST_CNTL.
+3. **A SECVID TSB write is refused or raises an external abort.** The readback shows a refusal. An abort
+   panics the test boot, and the persistent log survives (as on G0H).
+4. **Hang detect that we cannot see.** INT_0_MASK stays 0, and we do not know yet whether INT_0_STATUS
+   latches masked causes. The dumps tell. If it does not latch, hangs show only as RPTR ≠ WPTR plus
+   RBBM_STATUS busy, which is enough for Stage 4.
+5. **GX collapses under us.** OOB_GPU is held as in 2B.6, so the GMU should not collapse GX. A CPU read of a
+   collapsed GX would stall one core. G0H showed that does not freeze iOS, and the log survives.
+6. **The skipped HWCG.** Without it the clocks run ungated: more power, nothing functional. Mainline turns
+   it on before the CP starts. If the SQE misbehaves only without it, Stage 4 gets an HWCG step.
+
+Stage 4 leaves these for later: memory writes and leaving secure mode (Stage 5), CP_PROTECT, interrupts,
+indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
 
 ### Stage 5: zap shader (leave secure mode)
 
@@ -1177,15 +1384,13 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 9. Next concrete step
 
-Stages 0 and 1 passed on the phone. Stage 1 needed one fix: patch 0096 turns the CX GDSC on before the GCC
-GPU branches. The owner approved Stage 2A. On G2 (patch 0097) the rail votes and PLL0 worked, and the stage
-stopped because the gfx3d RCG root stayed off with GX clamped. On G2b (patch 0098) the GX GDSC came on and
-the GMU saw GX powered, so the apps DRV can raise the GX rail. The gfx3d root still read off and SPTP did not
-come on. On G2m (patch 0099) the GCC counter confirmed the clocks around it run (cx_gmu and gx_gmu at
-200 MHz, gx_cxo at 19.2 MHz), but gx_gfx3d does not run at all, either from XO or after the 180 MHz update.
-2A has hit its decision rule. 2B is now planned in detail ("Stage 2B" above): GMU memory and an SMMU bank
-for streams 4–5, RSCC/PDC, the firmware into the TCMs, CM3 start, the GX rail through the GMU, HFI v1,
-then OOB_GPU and the first GX reads. Nothing of it is built. With the owner's go-ahead:
-1. Write patch 0100 (`sweet_gmu.c`, `sweet_smmu.c`, the `sweetgpu=4` flow, the `gmu-mem` blob in
-   `mkboot.sh`). Show it, push it and run CI.
-2. Boot G3a (`sweetgmu=0`, read-only survey) first. G3b and G3c follow, each with its own OK.
+Stages 0–3 passed on the phone. The last results: G3k (Stage 2 complete, gx_gfx3d at 180 MHz on the GPU
+PLL) and G3l (Stage 3, the GPU's SMMU bank for SID 0 reads back with no fault). The history is in the
+stage sections above.
+
+Stage 4 (CP first light) is now planned in detail ("Stage 4" above): survey, the init list, SQE and ring
+registers, SQE start, ME_INIT, register markers with a ring-wrap test, and a 30 s hold, under `sweetgpu=6
+sweetcp=N`. Nothing of it is built. With the owner's go-ahead:
+1. Write patch 0107 (`sweet_cp.c`, the bump allocator in `sweet_gmu.c`, the `sweetgpu=6` hook). Show it,
+   push it and run CI.
+2. Boot G4a (`sweetcp=2`: the writes, CP not started) first. G4b and G4c follow, each with its own OK.
