@@ -1,0 +1,1926 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,8 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_gmu.c			standard
++bsd/dev/sweet_smmu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -0,0 +1,100 @@
++/*
++ * Shared by the SM7150 Adreno 618 bring-up files (docs/GPU_A618_PLAN.md):
++ * sweet_gpu.c (stages 0 to 2, the 2B flow), sweet_gmu.c (GMU firmware,
++ * RSCC/PDC, HFI) and sweet_smmu.c (the GPU SMMU).
++ */
++#ifndef _SWEET_GPU_INTERNAL_H_
++#define _SWEET_GPU_INTERNAL_H_
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/systm.h>
++#include <kern/clock.h>
++
++/* GMU (sdmmagpie-gpu.dtsi); sweet_gpu_regs.h offsets are dwords from GPU_PA */
++#define GPU_PA                  0x05000000u
++#define GMU_PA                  0x0506a000u
++#define GMU_SIZE                0x31000u        /* covers RSCC (0x508d000) and GMU_AO (0x508ec00) */
++
++/* sweet_gpu.c: log what comes next, then let the persistent log reach the disk. */
++void gpu_pause(const char *next);
++void gpu_sleep_ms(unsigned ms);
++
++static inline uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Poll every 1 us until (reg & mask) == want; false after us tries. */
++static inline bool
++gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; ++i) {
++		if ((gpu_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (gpu_rd(base, off) & mask) == want;
++}
++
++/* reg is a dword offset from GPU_PA, as in sweet_gpu_regs.h. */
++static inline uint32_t
++gmu_rd(vm_offset_t gmu, uint32_t reg)
++{
++	uint32_t off = reg * 4u - (GMU_PA - GPU_PA);
++	if (reg * 4u < GMU_PA - GPU_PA || off >= GMU_SIZE) {
++		printf("SWEET GPU: register %#x is outside the GMU block\n", reg);
++		return 0xffffffffu;
++	}
++	return gpu_rd(gmu, off);
++}
++
++static inline void
++gmu_wr(vm_offset_t gmu, uint32_t reg, uint32_t val)
++{
++	uint32_t off = reg * 4u - (GMU_PA - GPU_PA);
++	if (reg * 4u < GMU_PA - GPU_PA || off >= GMU_SIZE) {
++		printf("SWEET GPU: register %#x is outside the GMU block; not written\n", reg);
++		return;
++	}
++	gpu_wr(gmu, off, val);
++}
++
++/* sweet_smmu.c: the GPU SMMU (qcom,smmu-v2 at 0x5040000) */
++struct sweet_smmu_pt {
++	vm_offset_t va;         /* uncached mapping of the table area */
++	uint64_t pa;
++	uint32_t size, used;    /* bytes; 4 KiB tables from the start, level 1 first */
++};
++bool sweet_smmu_survey(void);
++void sweet_smmu_pt_init(struct sweet_smmu_pt *pt, vm_offset_t va, uint64_t pa, uint32_t size);
++bool sweet_smmu_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
++int sweet_smmu_attach(uint32_t sid, uint32_t mask, uint64_t ttbr);
++uint32_t sweet_smmu_faults(int cb, const char *when);
++
++/* sweet_gmu.c: stage 2B steps, in order; each needs the previous one */
++bool sweet_gmu_survey(vm_offset_t gmu, uint64_t mem_pa, uint32_t mem_len);     /* 2B.0 */
++bool sweet_gmu_mem(void);                                                       /* 2B.1 */
++bool sweet_gmu_rpmh(void);                                                      /* 2B.2 */
++bool sweet_gmu_boot(const uint8_t *fw, uint32_t len, bool rsc_start);         /* 2B.3 */
++bool sweet_gmu_gx_on(void);                                                     /* 2B.4 */
++bool sweet_gmu_hfi(void);                                                       /* 2B.5 */
++bool sweet_gmu_oob_gpu(void);                                                   /* 2B.6 */
++void sweet_gmu_status(const char *when);
++
++/* sweet_rpmh.c: cmd-db address of an ARC (slave 3) or BCM (slave 5) resource, and an ARC's levels */
++int sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl,
++    unsigned nmax, unsigned *n);
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* _SWEET_GPU_INTERNAL_H_ */
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.c
+@@ -0,0 +1,398 @@
++/*
++ * SM7150 GPU SMMU (qcom,smmu-v2 "kgsl_smmu" at 0x5040000) for the Adreno 618
++ * bring-up, docs/GPU_A618_PLAN.md stage 2B.0, 2B.1 and later stage 3.
++ *
++ * Register layout from the ARM SMMUv2 architecture spec; the global space is
++ * 2^(NUMPAGENDXB + 1) pages, then the context banks, one page each (kgsl's
++ * qcom,gpu-offset puts bank 0 at +0x8000). The SMMU needs the CX GDSC and
++ * gcc_gpu_memnoc_gfx, both on after stage 1.
++ *  - sweet_smmu_survey reads the ID and global registers, every stream-match
++ *    group and every context bank; nothing is written.
++ *  - sweet_smmu_attach programs one free bank (never bank 0, the GPU's) as
++ *    AArch64 stage 1 with stage 2 bypass: 4 KiB granule, 32-bit input range
++ *    (walks start at level 1), non-cacheable walks, faults terminate. Then a
++ *    free stream-match group points the given streams at it. Every write is
++ *    read back; a mismatch undoes the stream match.
++ *  - sweet_smmu_map fills the tables in caller memory that is mapped
++ *    uncached, so the SMMU's non-cacheable walks see every store.
++ * Unmatched streams keep bypassing; sCR0 is written only if the SMMU is off
++ * (CLIENTPD), and then only to turn it on with unmatched streams bypassing.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "sweet_gpu_internal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SMMU_PA                 0x05040000u
++#define SMMU_SIZE               0x10000u
++/* Global register space 0 */
++#define SMMU_sCR0               0x000u
++#define SMMU_sACR               0x010u
++#define SMMU_IDR0               0x020u
++#define SMMU_IDR1               0x024u
++#define SMMU_IDR2               0x028u
++#define SMMU_IDR7               0x03cu
++#define SMMU_sGFAR              0x040u          /* 64-bit */
++#define SMMU_sGFSR              0x048u
++#define SMMU_sGFSYNR0           0x050u
++#define SMMU_TLBIALLNSNH        0x068u
++#define SMMU_sTLBGSYNC          0x070u
++#define SMMU_sTLBGSTATUS        0x074u
++#define SMMU_SMR(n)             (0x800u + 4u * (n))
++#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
++/* Global register space 1, one page up */
++#define SMMU_CBAR(n)            (0x000u + 4u * (n))
++#define SMMU_CBA2R(n)           (0x800u + 4u * (n))
++/* Context bank */
++#define CB_SCTLR                0x000u
++#define CB_TCR2                 0x010u
++#define CB_TTBR0                0x020u          /* 64-bit */
++#define CB_TCR                  0x030u
++#define CB_CONTEXTIDR           0x034u
++#define CB_MAIR0                0x038u
++#define CB_FSR                  0x058u
++#define CB_FAR                  0x060u          /* 64-bit */
++#define CB_FSYNR0               0x068u
++#define CB_TLBIALL              0x618u
++#define CB_TLBSYNC              0x7f0u
++#define CB_TLBSTATUS            0x7f4u
++
++#define sCR0_CLIENTPD           (1u << 0)
++#define sCR0_USFCFG             (1u << 10)
++#define IDR0_S1TS               (1u << 30)
++#define IDR1_PAGESIZE           (1u << 31)
++#define IDR2_PTFS_4K            (1u << 12)
++#define TLBSTATUS_ACTIVE        (1u << 0)
++#define SMR_VALID               (1u << 31)
++#define SMR_ID_MASK             0x7fffu
++#define S2CR_TYPE(v)            (((v) >> 16) & 3u)      /* 0 translate, 1 bypass, 2 fault */
++#define S2CR_CBNDX(v)           ((v) & 0xffu)
++#define S2CR_CHECKED            ((3u << 16) | 0xffu)
++#define CBAR_S1_BYPASS_S2       (1u << 16)
++#define CBAR_BPSHCFG_NSH        (3u << 8)
++#define CBAR_MEMATTR_WB         (0xfu << 12)
++#define CBAR_CHECKED            ((3u << 16) | (0xfu << 12) | (3u << 8))
++#define CBA2R_VA64              (1u << 0)
++#define TCR2_SEP_UPSTREAM       (7u << 15)
++#define TCR2_AS                 (1u << 4)
++#define CB_TCR_T0SZ_32             32u
++#define CB_TCR_SH0_OUTER           (2u << 12)
++#define CB_TCR_EPD1                (1u << 23)      /* IRGN0 = ORGN0 = 0: non-cacheable walks; TG0 = 0: 4 KiB */
++#define MAIR0_VALUE             0xf404ff44u     /* attr 0 Normal NC, 1 WB, 2 Device nGnRE, 3 outer WB */
++#define SCTLR_M                 (1u << 0)
++#define SCTLR_TRE               (1u << 1)
++#define SCTLR_AFE               (1u << 2)
++#define SCTLR_CFRE              (1u << 5)
++#define SCTLR_ASIDPNE           (1u << 12)
++#define SCTLR_VALUE             (SCTLR_M | SCTLR_TRE | SCTLR_AFE | SCTLR_CFRE | SCTLR_ASIDPNE)
++/* Long-descriptor entries, 4 KiB granule */
++#define PTE_TABLE               3u
++#define PTE_PAGE                3u
++#define PTE_AP_UNPRIV           (1u << 6)       /* read/write at any privilege; AP[2] = 0 */
++#define PTE_SH_OUTER            (2u << 8)
++#define PTE_AF                  (1u << 10)
++#define PTE_NG                  (1u << 11)
++#define PTE_PAGE_RW             (PTE_PAGE | PTE_AP_UNPRIV | PTE_SH_OUTER | PTE_AF | PTE_NG)    /* attr 0 */
++#define PTE_ADDR_MASK           0x0000fffffffff000ull
++#define PT_SIZE                 0x1000u
++
++static vm_offset_t smmu;
++static uint32_t smmu_pgsize, smmu_cb_base;
++static unsigned smmu_nsmr, smmu_ncb, smmu_oas;
++static bool smmu_ok;
++
++static uint64_t
++smmu_rd64(vm_offset_t base, uint32_t off)
++{
++	uint64_t v = *(volatile uint64_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++smmu_wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint64_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static vm_offset_t
++smmu_cb(unsigned n)
++{
++	return smmu + smmu_cb_base + n * smmu_pgsize;
++}
++
++static unsigned
++smmu_oas_bits(unsigned oas)
++{
++	static const unsigned bits[] = { 32, 36, 40, 42, 44, 48 };
++	return oas < 6 ? bits[oas] : 48;
++}
++
++bool
++sweet_smmu_survey(void)
++{
++	if (!smmu && !(smmu = ml_io_map(SMMU_PA, SMMU_SIZE))) {
++		printf("SWEET SMMU: mapping failed\n");
++		return false;
++	}
++	uint32_t idr0 = gpu_rd(smmu, SMMU_IDR0), idr1 = gpu_rd(smmu, SMMU_IDR1), idr2 = gpu_rd(smmu, SMMU_IDR2);
++	uint32_t scr0 = gpu_rd(smmu, SMMU_sCR0);
++	printf("SWEET SMMU: IDR0 0x%08x IDR1 0x%08x IDR2 0x%08x IDR7 0x%08x sCR0 0x%08x sACR 0x%08x sGFSR 0x%08x\n",
++	    idr0, idr1, idr2, gpu_rd(smmu, SMMU_IDR7), scr0, gpu_rd(smmu, SMMU_sACR), gpu_rd(smmu, SMMU_sGFSR));
++	smmu_nsmr = idr0 & 0xffu;
++	smmu_ncb = idr1 & 0xffu;
++	smmu_pgsize = (idr1 & IDR1_PAGESIZE) ? 0x10000u : 0x1000u;
++	smmu_cb_base = (1u << (((idr1 >> 28) & 7u) + 1u)) * smmu_pgsize;
++	smmu_oas = (idr2 >> 4) & 0xfu;
++	printf("SWEET SMMU: %u stream-match groups, %u SID bits, %u context banks of %#x from +%#x, OAS %u bits, "
++	    "stage 1 %s, 4K tables %s, %s\n", smmu_nsmr, (idr0 >> 9) & 0xfu, smmu_ncb, smmu_pgsize, smmu_cb_base,
++	    smmu_oas_bits(smmu_oas), (idr0 & IDR0_S1TS) ? "yes" : "NO", (idr2 & IDR2_PTFS_4K) ? "yes" : "NO",
++	    (scr0 & sCR0_CLIENTPD) ? "OFF (CLIENTPD: all streams bypass)" : "on");
++	if (!smmu_nsmr || smmu_nsmr > 128 || !smmu_ncb || smmu_cb_base + smmu_ncb * smmu_pgsize > SMMU_SIZE) {
++		printf("SWEET SMMU: unexpected geometry; not used\n");
++		return false;
++	}
++	for (unsigned i = 0; i < smmu_nsmr; ++i) {
++		uint32_t smr = gpu_rd(smmu, SMMU_SMR(i)), s2cr = gpu_rd(smmu, SMMU_S2CR(i));
++		printf("SWEET SMMU:   SMR%-3u 0x%08x %s id %#x mask %#x  S2CR 0x%08x (%s, bank %u)\n", i, smr,
++		    (smr & SMR_VALID) ? "valid" : "free ", smr & SMR_ID_MASK, (smr >> 16) & SMR_ID_MASK, s2cr,
++		    S2CR_TYPE(s2cr) == 0 ? "translate" : S2CR_TYPE(s2cr) == 1 ? "bypass" : "fault", S2CR_CBNDX(s2cr));
++	}
++	vm_offset_t gr1 = smmu + smmu_pgsize;
++	for (unsigned n = 0; n < smmu_ncb; ++n) {
++		vm_offset_t cb = smmu_cb(n);
++		printf("SWEET SMMU:   CB%u CBAR 0x%08x CBA2R 0x%08x SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%016llx "
++		    "MAIR0 0x%08x FSR 0x%08x\n", n, gpu_rd(gr1, SMMU_CBAR(n)), gpu_rd(gr1, SMMU_CBA2R(n)),
++		    gpu_rd(cb, CB_SCTLR), gpu_rd(cb, CB_TCR), gpu_rd(cb, CB_TCR2), smmu_rd64(cb, CB_TTBR0),
++		    gpu_rd(cb, CB_MAIR0), gpu_rd(cb, CB_FSR));
++	}
++	smmu_ok = (idr0 & IDR0_S1TS) && (idr2 & IDR2_PTFS_4K);
++	return true;
++}
++
++void
++sweet_smmu_pt_init(struct sweet_smmu_pt *pt, vm_offset_t va, uint64_t pa, uint32_t size)
++{
++	pt->va = va;
++	pt->pa = pa;
++	pt->size = size;
++	pt->used = PT_SIZE;     /* the level-1 table */
++	for (uint32_t i = 0; i < PT_SIZE; i += 8) {
++		*(volatile uint64_t *)(va + i) = 0;
++	}
++}
++
++/* The table a descriptor points to, made (zeroed) if the slot is empty; 0 if out of room or not ours. */
++static vm_offset_t
++smmu_pt_next(struct sweet_smmu_pt *pt, vm_offset_t slot)
++{
++	uint64_t d = *(volatile uint64_t *)slot;
++	if ((d & 3u) == PTE_TABLE) {
++		uint64_t tpa = d & PTE_ADDR_MASK;
++		return tpa >= pt->pa && tpa - pt->pa < pt->used ? pt->va + (vm_offset_t)(tpa - pt->pa) : 0;
++	}
++	if ((d & 1u) || pt->used + PT_SIZE > pt->size) {
++		return 0;
++	}
++	vm_offset_t t = pt->va + pt->used;
++	for (uint32_t i = 0; i < PT_SIZE; i += 8) {
++		*(volatile uint64_t *)(t + i) = 0;
++	}
++	*(volatile uint64_t *)slot = (pt->pa + pt->used) | PTE_TABLE;
++	pt->used += PT_SIZE;
++	return t;
++}
++
++/* 4 KiB pages iova..iova+len -> pa..; refuses a page that is already mapped. */
++bool
++sweet_smmu_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len)
++{
++	if ((iova | pa | len) & (PT_SIZE - 1u) || (uint64_t)iova + len > (1ull << CB_TCR_T0SZ_32)) {
++		printf("SWEET SMMU: map %#x -> %#llx len %#x: not page-aligned or above 4 GiB\n", iova, pa, len);
++		return false;
++	}
++	for (uint32_t off = 0; off < len; off += PT_SIZE) {
++		uint32_t va = iova + off;
++		vm_offset_t l2 = smmu_pt_next(pt, pt->va + 8u * ((va >> 30) & 3u));
++		vm_offset_t l3 = l2 ? smmu_pt_next(pt, l2 + 8u * ((va >> 21) & 0x1ffu)) : 0;
++		if (!l3) {
++			printf("SWEET SMMU: map %#x: no room for another table (%#x of %#x used)\n", va, pt->used, pt->size);
++			return false;
++		}
++		vm_offset_t slot = l3 + 8u * ((va >> 12) & 0x1ffu);
++		if (*(volatile uint64_t *)slot & 1u) {
++			printf("SWEET SMMU: map %#x: already mapped\n", va);
++			return false;
++		}
++		*(volatile uint64_t *)slot = (pa + off) | PTE_PAGE_RW;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SMMU: mapped %#010x..%#010x -> %#llx (%#x of %#x table bytes used)\n", iova, iova + len - 1u,
++	    pa, pt->used, pt->size);
++	return true;
++}
++
++static bool
++smmu_tlb_sync(vm_offset_t base, uint32_t sync, uint32_t status)
++{
++	gpu_wr(base, sync, 0);
++	return gpu_poll(base, status, TLBSTATUS_ACTIVE, 0, 1000);
++}
++
++static bool
++smmu_check(const char *what, uint32_t got, uint32_t want, uint32_t mask)
++{
++	if ((got & mask) == (want & mask)) {
++		return true;
++	}
++	printf("SWEET SMMU:   %s reads 0x%08x, wrote 0x%08x (mask 0x%08x): MISMATCH\n", what, got, want, mask);
++	return false;
++}
++
++/* A bank no valid stream-match group translates through and with translation off; not bank 0. */
++static int
++smmu_free_bank(void)
++{
++	for (unsigned n = smmu_ncb - 1u; n >= 1u; --n) {
++		bool used = (gpu_rd(smmu_cb(n), CB_SCTLR) & SCTLR_M) != 0;
++		for (unsigned i = 0; i < smmu_nsmr && !used; ++i) {
++			uint32_t s2cr = gpu_rd(smmu, SMMU_S2CR(i));
++			used = (gpu_rd(smmu, SMMU_SMR(i)) & SMR_VALID) && S2CR_TYPE(s2cr) == 0 && S2CR_CBNDX(s2cr) == n;
++		}
++		if (!used) {
++			return (int)n;
++		}
++	}
++	return -1;
++}
++
++/*
++ * Translate streams sid..(sid | mask) through a free context bank whose
++ * level-1 table is at ttbr. Returns the bank, or -1 with the SMMU as it was.
++ */
++int
++sweet_smmu_attach(uint32_t sid, uint32_t mask, uint64_t ttbr)
++{
++	if (!smmu_ok) {
++		printf("SWEET SMMU: not surveyed or no stage 1 with 4K tables; not attached\n");
++		return -1;
++	}
++	unsigned pabits = smmu_oas_bits(smmu_oas);
++	if ((ttbr & (PT_SIZE - 1u)) || (pabits < 64 && (ttbr >> pabits))) {
++		printf("SWEET SMMU: tables at %#llx are unaligned or above the %u-bit output range\n", ttbr, pabits);
++		return -1;
++	}
++	int free_smr = -1;
++	for (unsigned i = 0; i < smmu_nsmr; ++i) {
++		uint32_t smr = gpu_rd(smmu, SMMU_SMR(i));
++		uint32_t id = smr & SMR_ID_MASK, m = (smr >> 16) & SMR_ID_MASK;
++		if (!(smr & SMR_VALID)) {
++			free_smr = free_smr < 0 ? (int)i : free_smr;
++		} else if (((sid ^ id) & ~(m | mask) & SMR_ID_MASK) == 0) {
++			printf("SWEET SMMU: SMR%u (0x%08x) already matches stream %#x/%#x; not attached\n", i, smr, sid, mask);
++			return -1;
++		}
++	}
++	int bank = smmu_free_bank();
++	if (free_smr < 0 || bank < 0) {
++		printf("SWEET SMMU: no free %s; not attached\n", free_smr < 0 ? "stream-match group" : "context bank");
++		return -1;
++	}
++	unsigned n = (unsigned)bank, g = (unsigned)free_smr;
++	vm_offset_t cb = smmu_cb(n), gr1 = smmu + smmu_pgsize;
++	printf("SWEET SMMU: streams %#x/%#x -> SMR%u, bank %u, tables at %#llx\n", sid, mask, g, n, ttbr);
++
++	const uint32_t cbar = CBAR_S1_BYPASS_S2 | CBAR_BPSHCFG_NSH | CBAR_MEMATTR_WB;
++	const uint32_t tcr2 = TCR2_SEP_UPSTREAM | TCR2_AS | (smmu_oas < 5 ? smmu_oas : 5u);
++	const uint32_t tcr = CB_TCR_EPD1 | CB_TCR_SH0_OUTER | CB_TCR_T0SZ_32;
++	const uint64_t ttbr0 = ttbr | (uint64_t)n << 48;        /* ASID = bank */
++	gpu_wr(cb, CB_SCTLR, 0);
++	gpu_wr(gr1, SMMU_CBA2R(n), CBA2R_VA64);
++	gpu_wr(gr1, SMMU_CBAR(n), cbar);
++	gpu_wr(cb, CB_TCR2, tcr2);
++	gpu_wr(cb, CB_TCR, tcr);
++	gpu_wr(cb, CB_MAIR0, MAIR0_VALUE);
++	smmu_wr64(cb, CB_TTBR0, ttbr0);
++	gpu_wr(cb, CB_CONTEXTIDR, n);
++	gpu_wr(cb, CB_TLBIALL, 0);
++	bool ok = smmu_tlb_sync(cb, CB_TLBSYNC, CB_TLBSTATUS);
++	if (!ok) {
++		printf("SWEET SMMU:   bank TLB sync timed out\n");
++	}
++	gpu_wr(cb, CB_FSR, gpu_rd(cb, CB_FSR));         /* write-one-to-clear stale faults */
++	gpu_wr(cb, CB_SCTLR, SCTLR_VALUE);
++	ok = smmu_check("CBA2R", gpu_rd(gr1, SMMU_CBA2R(n)), CBA2R_VA64, CBA2R_VA64) && ok;
++	ok = smmu_check("CBAR", gpu_rd(gr1, SMMU_CBAR(n)), cbar, CBAR_CHECKED) && ok;
++	ok = smmu_check("TCR2", gpu_rd(cb, CB_TCR2), tcr2, 0xffffffffu) && ok;
++	ok = smmu_check("TCR", gpu_rd(cb, CB_TCR), tcr, 0xffffffffu) && ok;
++	ok = smmu_check("MAIR0", gpu_rd(cb, CB_MAIR0), MAIR0_VALUE, 0xffffffffu) && ok;
++	uint64_t t = smmu_rd64(cb, CB_TTBR0);
++	ok = smmu_check("TTBR0 lo", (uint32_t)t, (uint32_t)ttbr0, 0xffffffffu) && ok;
++	ok = smmu_check("TTBR0 hi", (uint32_t)(t >> 32), (uint32_t)(ttbr0 >> 32), 0xffffffffu) && ok;
++	ok = smmu_check("SCTLR", gpu_rd(cb, CB_SCTLR), SCTLR_VALUE, SCTLR_VALUE | (1u << 6) | (1u << 7)) && ok;
++	if (!ok) {
++		gpu_wr(cb, CB_SCTLR, 0);
++		printf("SWEET SMMU: bank %u did not take; translation off again, no stream points at it\n", n);
++		return -1;
++	}
++
++	uint32_t s2cr_old = gpu_rd(smmu, SMMU_S2CR(g));
++	const uint32_t s2cr = n, smr = SMR_VALID | (mask & SMR_ID_MASK) << 16 | (sid & SMR_ID_MASK);
++	gpu_wr(smmu, SMMU_S2CR(g), s2cr);
++	gpu_wr(smmu, SMMU_SMR(g), smr);
++	uint32_t scr0 = gpu_rd(smmu, SMMU_sCR0);
++	ok = smmu_check("S2CR", gpu_rd(smmu, SMMU_S2CR(g)), s2cr, S2CR_CHECKED) &&
++	    smmu_check("SMR", gpu_rd(smmu, SMMU_SMR(g)), smr, 0xffffffffu);
++	if (ok && (scr0 & sCR0_CLIENTPD)) {
++		uint32_t on = scr0 & ~(sCR0_CLIENTPD | sCR0_USFCFG);
++		gpu_wr(smmu, SMMU_sCR0, on);
++		ok = smmu_check("sCR0", gpu_rd(smmu, SMMU_sCR0), on, sCR0_CLIENTPD | sCR0_USFCFG);
++		printf("SWEET SMMU:   sCR0 0x%08x -> 0x%08x (SMMU on, unmatched streams bypass)\n", scr0,
++		    gpu_rd(smmu, SMMU_sCR0));
++	}
++	gpu_wr(smmu, SMMU_TLBIALLNSNH, 0);
++	if (!smmu_tlb_sync(smmu, SMMU_sTLBGSYNC, SMMU_sTLBGSTATUS)) {
++		printf("SWEET SMMU:   global TLB sync timed out\n");
++		ok = false;
++	}
++	if (!ok) {
++		gpu_wr(smmu, SMMU_SMR(g), 0);
++		gpu_wr(smmu, SMMU_S2CR(g), s2cr_old);
++		gpu_wr(cb, CB_SCTLR, 0);
++		printf("SWEET SMMU: attach undone: SMR%u 0x%08x S2CR 0x%08x, bank %u off\n", g,
++		    gpu_rd(smmu, SMMU_SMR(g)), gpu_rd(smmu, SMMU_S2CR(g)), n);
++		return -1;
++	}
++	printf("SWEET SMMU: bank %u: SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%016llx; SMR%u 0x%08x S2CR 0x%08x "
++	    "sCR0 0x%08x\n", n, gpu_rd(cb, CB_SCTLR), gpu_rd(cb, CB_TCR), gpu_rd(cb, CB_TCR2), smmu_rd64(cb, CB_TTBR0),
++	    g, gpu_rd(smmu, SMMU_SMR(g)), gpu_rd(smmu, SMMU_S2CR(g)), gpu_rd(smmu, SMMU_sCR0));
++	return bank;
++}
++
++/* Logs the global and (cb >= 0) the bank's fault registers; returns sGFSR | FSR, 0 if clean. */
++uint32_t
++sweet_smmu_faults(int cb, const char *when)
++{
++	if (!smmu) {
++		return 0;
++	}
++	uint32_t gfsr = gpu_rd(smmu, SMMU_sGFSR), fsr = 0;
++	if (cb >= 0 && (unsigned)cb < smmu_ncb) {
++		vm_offset_t b = smmu_cb((unsigned)cb);
++		fsr = gpu_rd(b, CB_FSR);
++		printf("SWEET SMMU: %s: sGFSR 0x%08x sGFSYNR0 0x%08x sGFAR %#llx; bank %d FSR 0x%08x FAR %#llx FSYNR0 0x%08x\n",
++		    when, gfsr, gpu_rd(smmu, SMMU_sGFSYNR0), smmu_rd64(smmu, SMMU_sGFAR), cb, fsr, smmu_rd64(b, CB_FAR),
++		    gpu_rd(b, CB_FSYNR0));
++	} else {
++		printf("SWEET SMMU: %s: sGFSR 0x%08x sGFSYNR0 0x%08x sGFAR %#llx\n", when, gfsr,
++		    gpu_rd(smmu, SMMU_sGFSYNR0), smmu_rd64(smmu, SMMU_sGFAR));
++	}
++	return gfsr | fsr;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_gmu.c
+@@ -0,0 +1,945 @@
++/*
++ * SM7150 Adreno 618 GMU bring-up, docs/GPU_A618_PLAN.md stage 2B: Qualcomm's
++ * a618_gmu.bin firmware on the GMU's Cortex-M3 powers GX.
++ *
++ * Follows the sunfish downstream kgsl (adreno_a6xx_gmu.c, kgsl_gmu.c,
++ * kgsl_hfi.c) for the a615 family a618 belongs to: a raw firmware image
++ * written to the TCMs, OOB request bit req+16 with ack bit req+24, HFI v1
++ * with the legacy queue indices, and the hfi-use-reg quirk (GX rail through
++ * the mailbox registers before HFI, TEST as the last message). Mainline
++ * a6xx_gmu.c/a6xx_hfi.c were the cross-check. Register offsets, values and
++ * their order come from those drivers; the code is ours. One call per step,
++ * each needing the one before:
++ *  2B.0 sweet_gmu_survey: SMMU, RSCC, PDC and GMU reads; nothing written
++ *  2B.1 sweet_gmu_mem: the GPU-GMU-MEM blob uncached, page tables, and an
++ *       SMMU bank for streams 4-5 (gmu_user, gmu_kernel)
++ *  2B.2 sweet_gmu_rpmh: TCM retention, RSCC and PDC sequencers and TCSs
++ *  2B.3 sweet_gmu_boot: HFI queue table, firmware into ITCM+DTCM, boot
++ *       registers, CM3 out of reset, wait for the init result
++ *  2B.4 sweet_gmu_gx_on: perf votes from cmd-db, gfx_rail_on (OOB
++ *       boot_slumber), SPTPRAC
++ *  2B.5 sweet_gmu_hfi: HFI start, then INIT, FW_VER, PERF_TBL, BW_TBL, TEST
++ *  2B.6 sweet_gmu_oob_gpu: OOB_GPU, then a DCVS vote through the registers
++ * Everything polls; no GMU interrupt is unmasked. Idle level stays active (no
++ * IFPC, SPTP or NAP), so the GMU never collapses GX by itself. A step that
++ * fails leaves what it did in place, except the CM3, which goes back into
++ * reset when it does not start cleanly.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "sweet_gpu_regs.h"
++#include "sweet_gpu_internal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++
++/* GMU registers missing from sweet_gpu_regs.h; dword offsets from GPU_PA (mainline a6xx_gmu.xml + 0x1a800) */
++#define REG_A6XX_GMU_BOOT_SLUMBER_OPTION        0x1cbf8u        /* this block is DTCM: firmware mailbox */
++#define REG_A6XX_GMU_GX_VOTE_IDX                0x1cbf9u
++#define REG_A6XX_GMU_MX_VOTE_IDX                0x1cbfau
++#define REG_A6XX_GMU_DCVS_ACK_OPTION            0x1cbfcu
++#define REG_A6XX_GMU_DCVS_PERF_SETTING          0x1cbfdu
++#define REG_A6XX_GMU_DCVS_BW_SETTING            0x1cbfeu
++#define REG_A6XX_GMU_DCVS_RETURN                0x1cbffu
++#define REG_A6XX_GMU_ICACHE_CONFIG              0x1f400u
++#define REG_A6XX_GMU_DCACHE_CONFIG              0x1f401u
++#define REG_A6XX_GMU_SYS_BUS_CONFIG             0x1f40fu
++#define REG_A6XX_GMU_CX_GMU_WFI_CONFIG          0x1f802u
++#define REG_A6XX_GMU_CM3_CFG                    0x1f82du
++#define REG_A6XX_GMU_PWR_COL_INTER_FRAME_CTRL   0x1f8c0u
++#define REG_A6XX_GMU_RPMH_CTRL                  0x1f8e8u
++#define REG_A6XX_GMU_PWR_COL_CP_MSG             0x1f900u
++#define REG_A6XX_GMU_HFI_SFR_ADDR               0x1f982u
++#define REG_A6XX_GMU_HFI_QTBL_INFO              0x1f984u
++#define REG_A6XX_GMU_HFI_QTBL_ADDR              0x1f985u
++#define REG_A6XX_GMU_HFI_CTRL_INIT              0x1f986u
++#define REG_A6XX_GMU_GMU2HOST_INTR_CLR          0x1f991u
++#define REG_A6XX_GMU_GMU2HOST_INTR_INFO         0x1f992u
++#define REG_A6XX_GMU_GMU2HOST_INTR_MASK         0x1f993u
++#define REG_A6XX_GMU_HOST2GMU_INTR_SET          0x1f994u
++#define REG_A6XX_GMU_GENERAL_7                  0x1f9ccu
++#define REG_A6XX_GMU_AO_HOST_INTERRUPT_STATUS   0x23b05u
++#define REG_A6XX_GMU_RSCC_CONTROL_REQ           0x23b07u
++#define REG_A6XX_GMU_RSCC_CONTROL_ACK           0x23b08u
++#define REG_A6XX_GMU_AHB_FENCE_RANGE_0          0x23b11u
++/* GPU RSCC, inside the GMU mapping (block at dword 0x23400) */
++#define REG_A6XX_RSCC_RSC_STATUS0_DRV0          0x23404u
++#define REG_A6XX_RSCC_PDC_SEQ_START_ADDR        0x23408u
++#define REG_A6XX_RSCC_PDC_MATCH_VALUE_LO        0x23409u
++#define REG_A6XX_RSCC_PDC_MATCH_VALUE_HI        0x2340au
++#define REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0         0x2340bu
++#define REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR      0x2340du        /* DATA = ADDR + 1; command n at + 2n */
++#define REG_A6XX_RSCC_OVERRIDE_START_ADDR       0x23500u
++#define REG_A6XX_RSCC_SEQ_BUSY_DRV0             0x23501u
++#define REG_A6XX_RSCC_SEQ_MEM_0_DRV0            0x23580u
++/* GPU PDC (sdmmagpie-gpu.dtsi: kgsl GMU reg-names "kgsl_gmu_pdc_cfg", "kgsl_gmu_pdc_seq"); dword offsets */
++#define PDC_CFG_PA              0x0b290000u
++#define PDC_SEQ_PA              0x0b490000u
++#define PDC_SIZE                0x10000u
++#define PDC_ENABLE_PDC          0x1140u
++#define PDC_SEQ_START_ADDR      0x1148u
++#define PDC_TCS_CONTROL(n)      (0x1540u + 0x32u * (n))
++#define PDC_TCS_ENABLE          1u              /* from CONTROL */
++#define PDC_TCS_WAIT            2u
++#define PDC_TCS_CMD(c)          (3u + 4u * (c)) /* +0 MSGID, +1 ADDR, +2 DATA */
++#define PDC_MSGID               0x10108u
++#define PDC_ENABLE_VALUE        0x80000001u
++
++#define GMU_TCM_BYTES           0x8000u         /* 16 KiB ITCM code, then 16 KiB DTCM data */
++#define GMU_INIT_DONE           0xbabefaceu     /* downstream; newer firmware: (v & 0x1ff) == 0x100 */
++#define GMU_TIMEOUT_US          100000u         /* GPU_START_TIMEOUT, HFI_RSP_TIMEOUT */
++#define GMU_RSCC_TIMEOUT_US     10000u
++#define GMU_SPTPRAC_TIMEOUT_US  10000u          /* SPTPRAC_CTRL_TIMEOUT */
++#define GMU_STREAM              4u              /* SID 4 gmu_user, 5 gmu_kernel */
++#define GMU_STREAM_MASK         1u
++#define SPTPRAC_POWER_ON        0x778000u
++#define SPTPRAC_POWERON_STATUS  (1u << 3)
++#define OOB_GPU                 0u
++#define OOB_BOOT_SLUMBER        6u
++#define OOB_DCVS                7u
++#define DCVS_PERF_AT_LEAST_1    0x30000001u     /* perf index 1 (180 MHz), option "at least" */
++#define DCVS_BW_NO_CHANGE       0x000ff0ffu
++#define CMDDB_ARC               3u
++#define CMDDB_BCM               5u
++
++/* Layout of the 1 MiB GPU-GMU-MEM blob (offsets) and the GMU addresses of each region (downstream gmu_vma) */
++#define GMEM_PT_SIZE            0x6000u         /* level 1, two level 2, three level 3 tables */
++#define GMEM_DUMMY              0x6000u
++#define GMEM_HFI                0x7000u
++#define GMEM_DUMP               0xc000u
++#define GMEM_LOG                0x10000u
++#define GMEM_ICACHE             0x11000u
++#define GMEM_DCACHE             0x4d000u
++#define GMEM_USED               0x89000u
++#define GMU_VA_HFI              0x60100000u
++#define GMU_VA_DUMP             0x60200000u
++#define GMU_VA_LOG              0x60300000u
++#define GMU_DUMP_SIZE           0x4000u
++
++static const struct {
++	const char *name;
++	uint32_t iova, off, len;
++} gmu_regions[] = {
++	/* This order fills the tables exactly: L1, L2 0-1G, L3 0x0, L2 1-2G, L3 0x60000000, L3 0x60200000. */
++	{ "ICACHE backing", 0x00004000u, GMEM_ICACHE, 0x3c000u },
++	{ "DCACHE backing", 0x00044000u, GMEM_DCACHE, 0x3c000u },
++	{ "dummy page", 0x60000000u, GMEM_DUMMY, 0x1000u },
++	{ "HFI queues", GMU_VA_HFI, GMEM_HFI, 0x5000u },
++	{ "dump", GMU_VA_DUMP, GMEM_DUMP, GMU_DUMP_SIZE },
++	{ "log", GMU_VA_LOG, GMEM_LOG, 0x1000u },
++};
++
++/* HFI v1 (kgsl_hfi.h): queue table header, 4 queue headers of 12 dwords, queues of 1024 dwords from +0xe0 */
++#define HFI_QUEUES              4u
++#define HFI_QHDR(q)             (GMEM_HFI + 4u * (6u + 12u * (q)))
++#define HFI_QUEUE(q)            (0xe0u + 0x1000u * (q))
++#define HFI_QUEUE_DWORDS        1024u
++#define QH_STATUS               0u
++#define QH_START                1u
++#define QH_TYPE                 2u
++#define QH_SIZE                 3u
++#define QH_RX_WM                6u
++#define QH_TX_WM                7u
++#define QH_RX_REQ               8u
++#define QH_READ                 10u
++#define QH_WRITE                11u
++#define HFI_CMD_Q               0u
++#define HFI_MSG_Q               1u
++#define HFI_MSG_CMD             0u
++#define HFI_MSG_ACK             2u
++#define HFI_IRQ_MSGQ            (1u << 0)
++#define H2F_MSG_INIT            0u
++#define H2F_MSG_FW_VER          1u
++#define H2F_MSG_BW_VOTE_TBL     3u
++#define H2F_MSG_PERF_TBL        4u
++#define H2F_MSG_TEST            5u
++#define HFI_FW_VER_SUPPORTED    0x10080000u     /* 1.8, adreno-gpulist a618 */
++#define HFI_MSG_MAX             160u            /* BW_TBL with the fixed array sizes */
++#define HFI_MAX_GX_LEVELS       16u
++#define HFI_MAX_CX_LEVELS       4u
++
++static const struct {
++	uint32_t type, status;
++} hfi_queues[HFI_QUEUES] = {
++	{ 0x0a00u, 1 }, /* command: index 0, priority 10 */
++	{ 0x0a04u, 1 }, /* message: index 4, priority 10 (a615 family) */
++	{ 0x2805u, 1 }, /* debug: index 5, priority 40 */
++	{ 0x1401u, 0 }, /* DSP: index 1, priority 20, off */
++};
++
++/*
++ * Speed bin 146 (700 MHz table) in perf-index order: kgsl's DT power levels
++ * reversed, the 0 Hz level first. Corners are downstream's gfx3d voltage
++ * table (vlvl); votes are what the plan computed from this phone's cmd-db.
++ */
++#define GPU_LEVELS              8u
++static const uint32_t gpu_level_khz[GPU_LEVELS] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 700000 };
++static const unsigned gpu_level_vlvl[GPU_LEVELS] = { 0, 48, 64, 128, 192, 256, 320, 384 };
++static const uint32_t gpu_level_vote_want[GPU_LEVELS] = {
++	0, 0x00400202u, 0x00400202u, 0x00800203u, 0x00c00204u, 0x01000305u, 0x01400306u, 0x01800407u,
++};
++#define GMU_LEVELS              2u
++static const uint32_t gmu_level_khz[GMU_LEVELS] = { 0, 200000 };
++static const unsigned gmu_level_vlvl[GMU_LEVELS] = { 0, 48 };   /* 200 MHz needs MIN_SVS */
++static const uint32_t gmu_level_vote_want[GMU_LEVELS] = { 0, 0x00400202u };
++#define GPU_LEVEL_START         1u              /* 180 MHz, kgsl's initial level 6 */
++
++static vm_offset_t gm_gmu, gm_mem, gm_pdc_cfg, gm_pdc_seq;
++static uint64_t gm_mem_pa;
++static uint32_t gm_mem_len;
++static int gm_cb = -1;
++static bool gm_votes_ok;
++static uint32_t gm_gx_votes[GPU_LEVELS], gm_cx_votes[GMU_LEVELS];
++static unsigned gm_hfi_seq;
++static uint32_t gm_msg[HFI_MSG_MAX], gm_rsp[HFI_MSG_MAX];
++
++struct gmu_reg {
++	const char *name;
++	uint32_t reg;
++};
++
++/* Poll every 10 us for up to us microseconds until (reg & mask) == want. */
++static bool
++gmu_wait(uint32_t reg, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned t = 0; t < us; t += 10) {
++		if ((gmu_rd(gm_gmu, reg) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return (gmu_rd(gm_gmu, reg) & mask) == want;
++}
++
++static void
++gmu_log_regs(const char *what, const struct gmu_reg *r, unsigned n)
++{
++	for (unsigned i = 0; i < n; ++i) {
++		printf("SWEET GMU:   %s %-28s [0x%05x] = 0x%08x\n", what, r[i].name, r[i].reg, gmu_rd(gm_gmu, r[i].reg));
++	}
++}
++
++/* Write, read back, log; false on a mismatch. */
++static bool
++gmu_set(const char *name, uint32_t reg, uint32_t val)
++{
++	gmu_wr(gm_gmu, reg, val);
++	uint32_t got = gmu_rd(gm_gmu, reg);
++	printf("SWEET GMU:   %-28s [0x%05x] = 0x%08x%s\n", name, reg, got, got == val ? "" : " MISMATCH");
++	return got == val;
++}
++
++static uint32_t
++mem_rd(uint32_t off)
++{
++	return gpu_rd(gm_mem, off);
++}
++
++static void
++mem_wr(uint32_t off, uint32_t val)
++{
++	gpu_wr(gm_mem, off, val);
++}
++
++static uint32_t
++fw32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* sweet_rpmh_cmddb_query, waiting out a vote that holds the RPMh lock. */
++static int
++gmu_cmddb(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl, unsigned nmax, unsigned *n)
++{
++	for (unsigned tries = 0; tries < 10; ++tries) {
++		int error = sweet_rpmh_cmddb_query(res, slave, addr, vlvl, nmax, n);
++		if (error != EBUSY) {
++			if (error) {
++				printf("SWEET GMU:   cmd-db %s: errno %d\n", res, error);
++			}
++			return error;
++		}
++		gpu_sleep_ms(500);
++	}
++	printf("SWEET GMU:   cmd-db %s: RPMh busy\n", res);
++	return EBUSY;
++}
++
++static const struct gmu_reg gmu_survey_regs[] = {
++	{ "CM3_SYSRESET", REG_A6XX_GMU_CM3_SYSRESET },
++	{ "CM3_FW_INIT_RESULT", REG_A6XX_GMU_CM3_FW_INIT_RESULT },
++	{ "CM3_BOOT_CONFIG", REG_A6XX_GMU_CM3_BOOT_CONFIG },
++	{ "CM3_FW_BUSY", REG_A6XX_GMU_CM3_FW_BUSY },
++	{ "CM3_CFG", REG_A6XX_GMU_CM3_CFG },
++	{ "HFI_CTRL_STATUS", REG_A6XX_GMU_HFI_CTRL_STATUS },
++	{ "HFI_VERSION_INFO", REG_A6XX_GMU_HFI_VERSION_INFO },
++	{ "HFI_QTBL_ADDR", REG_A6XX_GMU_HFI_QTBL_ADDR },
++	{ "GMU2HOST_INTR_INFO", REG_A6XX_GMU_GMU2HOST_INTR_INFO },
++	{ "GMU2HOST_INTR_MASK", REG_A6XX_GMU_GMU2HOST_INTR_MASK },
++	{ "AO_HOST_INTERRUPT_STATUS", REG_A6XX_GMU_AO_HOST_INTERRUPT_STATUS },
++	{ "RPMH_CTRL", REG_A6XX_GMU_RPMH_CTRL },
++	{ "RPMH_POWER_STATE", REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE },
++	{ "SPTPRAC_PWR_CLK_STATUS", REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS },
++	{ "GENERAL_7", REG_A6XX_GMU_GENERAL_7 },
++	{ "AHB_FENCE_RANGE_0", REG_A6XX_GMU_AHB_FENCE_RANGE_0 },
++	{ "RSCC_CONTROL_REQ", REG_A6XX_GMU_RSCC_CONTROL_REQ },
++	{ "RSCC_CONTROL_ACK", REG_A6XX_GMU_RSCC_CONTROL_ACK },
++};
++
++static const struct gmu_reg gmu_rscc_regs[] = {
++	{ "RSC_STATUS0_DRV0", REG_A6XX_RSCC_RSC_STATUS0_DRV0 },
++	{ "PDC_SLAVE_ID_DRV0", REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0 },
++	{ "HIDDEN_TCS_CMD0_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR },
++	{ "HIDDEN_TCS_CMD0_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 1u },
++	{ "HIDDEN_TCS_CMD1_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2u },
++	{ "HIDDEN_TCS_CMD1_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 3u },
++	{ "HIDDEN_TCS_CMD2_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4u },
++	{ "HIDDEN_TCS_CMD2_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 5u },
++	{ "PDC_SEQ_START_ADDR", REG_A6XX_RSCC_PDC_SEQ_START_ADDR },
++	{ "PDC_MATCH_VALUE_LO", REG_A6XX_RSCC_PDC_MATCH_VALUE_LO },
++	{ "PDC_MATCH_VALUE_HI", REG_A6XX_RSCC_PDC_MATCH_VALUE_HI },
++	{ "OVERRIDE_START_ADDR", REG_A6XX_RSCC_OVERRIDE_START_ADDR },
++	{ "SEQ_BUSY_DRV0", REG_A6XX_RSCC_SEQ_BUSY_DRV0 },
++};
++
++static void
++gmu_log_pdc(vm_offset_t cfg, vm_offset_t seq, const char *when)
++{
++	printf("SWEET GMU: PDC %s: ENABLE_PDC 0x%08x SEQ_START_ADDR 0x%08x seq %08x %08x %08x %08x %08x\n", when,
++	    gpu_rd(cfg, PDC_ENABLE_PDC * 4u), gpu_rd(cfg, PDC_SEQ_START_ADDR * 4u), gpu_rd(seq, 0), gpu_rd(seq, 4),
++	    gpu_rd(seq, 8), gpu_rd(seq, 12), gpu_rd(seq, 16));
++	for (unsigned t = 0; t < 4; ++t) {
++		uint32_t b = PDC_TCS_CONTROL(t);
++		printf("SWEET GMU:   PDC TCS%u control 0x%08x enable 0x%08x wait 0x%08x", t, gpu_rd(cfg, b * 4u),
++		    gpu_rd(cfg, (b + PDC_TCS_ENABLE) * 4u), gpu_rd(cfg, (b + PDC_TCS_WAIT) * 4u));
++		for (unsigned c = 0; c < 3; ++c) {
++			uint32_t r = b + PDC_TCS_CMD(c);
++			printf(" | %#x %#x %#x", gpu_rd(cfg, r * 4u), gpu_rd(cfg, (r + 1u) * 4u), gpu_rd(cfg, (r + 2u) * 4u));
++		}
++		printf("\n");
++	}
++}
++
++bool
++sweet_gmu_survey(vm_offset_t gmu, uint64_t mem_pa, uint32_t mem_len)
++{
++	gm_gmu = gmu;
++	gm_mem_pa = mem_pa;
++	gm_mem_len = mem_len;
++	printf("SWEET GMU: 2B.0 survey: GPU SMMU, GMU, RSCC, PDC; nothing written\n");
++	gpu_pause("GPU SMMU survey (0x5040000)");
++	bool smmu = sweet_smmu_survey();
++	gpu_pause("GMU and RSCC register survey (0x506a000, 0x508d000)");
++	gmu_log_regs("GMU", gmu_survey_regs, sizeof(gmu_survey_regs) / sizeof(gmu_survey_regs[0]));
++	gmu_log_regs("RSCC", gmu_rscc_regs, sizeof(gmu_rscc_regs) / sizeof(gmu_rscc_regs[0]));
++	printf("SWEET GMU:   RSCC SEQ_MEM_0..4 %08x %08x %08x %08x %08x\n", gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0),
++	    gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 1u), gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 2u),
++	    gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 3u), gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 4u));
++	printf("SWEET GMU:   ITCM %08x %08x %08x %08x  DTCM %08x %08x %08x %08x\n",
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START), gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 1u),
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 2u), gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 3u),
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_DTCM_START), gmu_rd(gmu, REG_A6XX_GMU_CM3_DTCM_START + 1u),
++	    gmu_rd(gmu, REG_A6XX_GMU_CM3_DTCM_START + 2u), gmu_rd(gmu, REG_A6XX_GMU_CM3_DTCM_START + 3u));
++	gpu_pause("GPU PDC survey (cfg 0xb290000, seq 0xb490000; an always-on block, first EL1 access)");
++	if (!gm_pdc_cfg) {
++		gm_pdc_cfg = ml_io_map(PDC_CFG_PA, PDC_SIZE);
++	}
++	if (!gm_pdc_seq) {
++		gm_pdc_seq = ml_io_map(PDC_SEQ_PA, PDC_SIZE);
++	}
++	if (!gm_pdc_cfg || !gm_pdc_seq) {
++		printf("SWEET GMU: PDC mapping failed\n");
++		return false;
++	}
++	gmu_log_pdc(gm_pdc_cfg, gm_pdc_seq, "as found");
++	printf("SWEET GMU:   GPU-GMU-MEM pa %#llx len %#x (needs %#x)\n", mem_pa, mem_len, GMEM_USED);
++	return smmu;
++}
++
++/* Clean and invalidate to PoC through the kernel's cacheable mapping, before the uncached one takes over. */
++static void
++gmu_mem_flush(vm_offset_t va, uint32_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const vm_offset_t line = (vm_offset_t)4u << ((ctr >> 16) & 0xfu);
++	for (vm_offset_t p = va & ~(line - 1u); p < va + len; p += line) {
++		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++bool
++sweet_gmu_mem(void)
++{
++	printf("SWEET GMU: 2B.1 GMU memory and an SMMU bank for streams %u-%u\n", GMU_STREAM, GMU_STREAM | GMU_STREAM_MASK);
++	if (!gm_mem_pa || gm_mem_len < GMEM_USED || (gm_mem_pa & 0xfffu)) {
++		printf("SWEET GMU: GPU-GMU-MEM missing or too small (mkboot.sh GPUFW=1, tools 0100+)\n");
++		return false;
++	}
++	gmu_mem_flush(ml_static_ptovirt(gm_mem_pa), gm_mem_len);
++	gpu_pause("uncached mapping of GPU-GMU-MEM (ml_io_map_wcomb of kernel RAM)");
++	gm_mem = ml_io_map_wcomb(gm_mem_pa, gm_mem_len);
++	if (!gm_mem) {
++		printf("SWEET GMU: uncached mapping failed\n");
++		return false;
++	}
++	unsigned nonzero = 0;
++	for (uint32_t off = 0; off < GMEM_USED; off += 4) {
++		nonzero += mem_rd(off) != 0;
++	}
++	printf("SWEET GMU:   mapped at %#lx, %u non-zero words in the used part\n", gm_mem, nonzero);
++	struct sweet_smmu_pt pt;
++	sweet_smmu_pt_init(&pt, gm_mem, gm_mem_pa, GMEM_PT_SIZE);
++	for (unsigned i = 0; i < sizeof(gmu_regions) / sizeof(gmu_regions[0]); ++i) {
++		printf("SWEET GMU:   %s\n", gmu_regions[i].name);
++		if (!sweet_smmu_map(&pt, gmu_regions[i].iova, gm_mem_pa + gmu_regions[i].off, gmu_regions[i].len)) {
++			return false;
++		}
++	}
++	gpu_pause("SMMU context bank and stream match for the GMU (0x5040000)");
++	gm_cb = sweet_smmu_attach(GMU_STREAM, GMU_STREAM_MASK, gm_mem_pa);
++	if (gm_cb < 0) {
++		return false;
++	}
++	return sweet_smmu_faults(gm_cb, "after attach") == 0;
++}
++
++/* _load_gmu_rpmh_ucode, a618 values. */
++static const struct {
++	const char *name;
++	uint32_t reg, val;
++} gmu_rscc_init[] = {
++	{ "RSC_STATUS0_DRV0", REG_A6XX_RSCC_RSC_STATUS0_DRV0, 1u << 24 },
++	{ "PDC_SLAVE_ID_DRV0", REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0, 1 },
++	{ "HIDDEN_TCS_CMD0_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR, 0 },
++	{ "HIDDEN_TCS_CMD0_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 1u, 0 },
++	{ "HIDDEN_TCS_CMD1_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2u, 0 },
++	{ "HIDDEN_TCS_CMD1_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 3u, 0 },
++	{ "HIDDEN_TCS_CMD2_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4u, 0 },
++	{ "HIDDEN_TCS_CMD2_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 5u, 0x80000000u },
++	{ "OVERRIDE_START_ADDR", REG_A6XX_RSCC_OVERRIDE_START_ADDR, 0 },
++	{ "PDC_SEQ_START_ADDR", REG_A6XX_RSCC_PDC_SEQ_START_ADDR, 0x4520 },
++	{ "PDC_MATCH_VALUE_LO", REG_A6XX_RSCC_PDC_MATCH_VALUE_LO, 0x4510 },
++	{ "PDC_MATCH_VALUE_HI", REG_A6XX_RSCC_PDC_MATCH_VALUE_HI, 0x4514 },
++};
++static const uint32_t gmu_rscc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
++static const uint32_t gmu_pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
++/* PDC TCS commands: mx.lvl, cx.lvl, xo.lvl hlvl for TCS1 (power down) and TCS3 (power up) */
++static const char *const gmu_pdc_res[3] = { "mx.lvl", "cx.lvl", "xo.lvl" };
++static const uint32_t gmu_pdc_data[2][3] = { { 1, 0, 0 }, { 2, 2, 3 } };
++static const unsigned gmu_pdc_tcs[2] = { 1, 3 };
++
++static bool
++gmu_pdc_set(vm_offset_t base, uint32_t reg, uint32_t val)
++{
++	gpu_wr(base, reg * 4u, val);
++	uint32_t got = gpu_rd(base, reg * 4u);
++	if (got != val) {
++		printf("SWEET GMU:   PDC [0x%04x] reads 0x%08x, wrote 0x%08x: MISMATCH\n", reg, got, val);
++	}
++	return got == val;
++}
++
++bool
++sweet_gmu_rpmh(void)
++{
++	printf("SWEET GMU: 2B.2 TCM retention, RSCC and PDC microcode and TCS commands\n");
++	if (gm_cb < 0 || !gm_pdc_cfg || !gm_pdc_seq) {
++		printf("SWEET GMU: 2B.2 needs 2B.0 and 2B.1\n");
++		return false;
++	}
++	uint32_t addr[3];
++	for (unsigned i = 0; i < 3; ++i) {
++		if (gmu_cmddb(gmu_pdc_res[i], CMDDB_ARC, &addr[i], NULL, 0, NULL)) {
++			return false;
++		}
++	}
++	gpu_pause("GMU_GENERAL_7 = 1 (TCM retention), then the RSCC (0x508d000)");
++	bool ok = gmu_set("GENERAL_7", REG_A6XX_GMU_GENERAL_7, 1);
++	for (unsigned i = 0; i < sizeof(gmu_rscc_init) / sizeof(gmu_rscc_init[0]); ++i) {
++		ok = gmu_set(gmu_rscc_init[i].name, gmu_rscc_init[i].reg, gmu_rscc_init[i].val) && ok;
++	}
++	for (unsigned i = 0; i < 5; ++i) {
++		ok = gmu_set("RSCC SEQ_MEM", REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + i, gmu_rscc_seq[i]) && ok;
++	}
++	if (!ok) {
++		printf("SWEET GMU: 2B.2 stopped: RSCC write did not read back\n");
++		return false;
++	}
++	gpu_pause("PDC sequencer and TCS1/TCS3 commands (0xb490000, 0xb290000)");
++	for (unsigned i = 0; i < 5; ++i) {
++		ok = gmu_pdc_set(gm_pdc_seq, i, gmu_pdc_seq[i]) && ok;
++	}
++	for (unsigned t = 0; t < 2; ++t) {
++		uint32_t b = PDC_TCS_CONTROL(gmu_pdc_tcs[t]);
++		ok = gmu_pdc_set(gm_pdc_cfg, b + PDC_TCS_ENABLE, 7) && ok;
++		ok = gmu_pdc_set(gm_pdc_cfg, b + PDC_TCS_WAIT, 0) && ok;
++		ok = gmu_pdc_set(gm_pdc_cfg, b, 0) && ok;
++		for (unsigned c = 0; c < 3; ++c) {
++			uint32_t r = b + PDC_TCS_CMD(c);
++			ok = gmu_pdc_set(gm_pdc_cfg, r, PDC_MSGID) && ok;
++			ok = gmu_pdc_set(gm_pdc_cfg, r + 1u, addr[c]) && ok;
++			ok = gmu_pdc_set(gm_pdc_cfg, r + 2u, gmu_pdc_data[t][c]) && ok;
++		}
++	}
++	ok = gmu_pdc_set(gm_pdc_cfg, PDC_SEQ_START_ADDR, 0) && ok;
++	ok = gmu_pdc_set(gm_pdc_cfg, PDC_ENABLE_PDC, PDC_ENABLE_VALUE) && ok;
++	gmu_log_pdc(gm_pdc_cfg, gm_pdc_seq, "after");
++	printf("SWEET GMU: 2B.2 %s\n", ok ? "done: every value reads back" : "stopped: a PDC write did not read back");
++	return ok;
++}
++
++static void
++gmu_hfi_table_init(void)
++{
++	static const uint32_t tbl[6] = { 0, 54, 6, 12, HFI_QUEUES, HFI_QUEUES };
++	for (uint32_t off = GMEM_HFI; off < GMEM_HFI + 0x5000u; off += 4) {
++		mem_wr(off, 0);
++	}
++	for (unsigned i = 0; i < 6; ++i) {
++		mem_wr(GMEM_HFI + 4u * i, tbl[i]);
++	}
++	for (unsigned q = 0; q < HFI_QUEUES; ++q) {
++		uint32_t h = HFI_QHDR(q);
++		mem_wr(h + 4u * QH_STATUS, hfi_queues[q].status);
++		mem_wr(h + 4u * QH_START, GMU_VA_HFI + HFI_QUEUE(q));
++		mem_wr(h + 4u * QH_TYPE, hfi_queues[q].type);
++		mem_wr(h + 4u * QH_SIZE, HFI_QUEUE_DWORDS);
++		mem_wr(h + 4u * QH_RX_WM, 1);
++		mem_wr(h + 4u * QH_TX_WM, 1);
++		mem_wr(h + 4u * QH_RX_REQ, 1);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	gm_hfi_seq = 0;
++}
++
++/* Mainline's a6xx_rpmh_start; only with sweetgmursc=1, before the CM3 starts. */
++static bool
++gmu_rscc_start(void)
++{
++	gmu_wr(gm_gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 1u << 1);
++	bool ack = gmu_wait(REG_A6XX_GMU_RSCC_CONTROL_ACK, 1u << 1, 1u << 1, GMU_RSCC_TIMEOUT_US);
++	bool idle = gmu_wait(REG_A6XX_RSCC_SEQ_BUSY_DRV0, 0xffffffffu, 0, GMU_RSCC_TIMEOUT_US);
++	gmu_wr(gm_gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
++	printf("SWEET GMU:   RSCC start: ack %s (0x%08x), sequencer %s (0x%08x)\n", ack ? "yes" : "NO",
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_RSCC_CONTROL_ACK), idle ? "idle" : "BUSY",
++	    gmu_rd(gm_gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0));
++	return ack && idle;
++}
++
++void
++sweet_gmu_status(const char *when)
++{
++	if (!gm_gmu) {
++		return;
++	}
++	printf("SWEET GMU: %s: FW_INIT_RESULT 0x%08x FW_BUSY 0x%08x GMU2HOST 0x%08x AO_HOST_INT 0x%08x "
++	    "RPMH_POWER_STATE 0x%08x SPTPRAC 0x%08x HFI_STATUS 0x%08x\n", when,
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT), gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO), gmu_rd(gm_gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_STATUS),
++	    gmu_rd(gm_gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS), gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_CTRL_STATUS));
++	(void)sweet_smmu_faults(gm_cb, when);
++}
++
++bool
++sweet_gmu_boot(const uint8_t *fw, uint32_t len, bool rsc_start)
++{
++	printf("SWEET GMU: 2B.3 firmware in, CM3 start%s\n", rsc_start ? " (with the RSCC start handshake)" : "");
++	if (!gm_mem || gm_cb < 0) {
++		printf("SWEET GMU: 2B.3 needs 2B.1\n");
++		return false;
++	}
++	if (!fw || len != GMU_TCM_BYTES) {
++		printf("SWEET GMU: GPU-GMU is %u bytes, expected %u (16 KiB ITCM + 16 KiB DTCM)\n", len, GMU_TCM_BYTES);
++		return false;
++	}
++	uint32_t sysreset = gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_SYSRESET);
++	if (!(sysreset & 1u)) {
++		printf("SWEET GMU: CM3_SYSRESET 0x%08x: the CM3 is already running; not loaded\n", sysreset);
++		return false;
++	}
++	gmu_hfi_table_init();
++	gpu_pause("firmware into the GMU ITCM and DTCM (0x506d000, 32 KiB)");
++	const unsigned words = len / 4u;
++	for (unsigned i = 0; i < words; ++i) {
++		gmu_wr(gm_gmu, REG_A6XX_GMU_CM3_ITCM_START + i, fw32(fw + 4u * i));
++	}
++	unsigned bad = 0, first = 0;
++	for (unsigned i = 0; i < words; ++i) {
++		if (gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_ITCM_START + i) != fw32(fw + 4u * i) && !bad++) {
++			first = i;
++		}
++	}
++	printf("SWEET GMU:   %u words written, %u differ on read-back%s", words, bad, bad ? "" : "\n");
++	if (bad) {
++		printf(", first at word %u: 0x%08x, want 0x%08x\nSWEET GMU: 2B.3 stopped: TCM load\n", first,
++		    gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_ITCM_START + first), fw32(fw + 4u * first));
++		return false;
++	}
++	gpu_pause("boot registers (HFI table, fence, chip id, log, power config)");
++	bool ok = gmu_set("CM3_FW_INIT_RESULT", REG_A6XX_GMU_CM3_FW_INIT_RESULT, 0);
++	ok = gmu_set("CM3_BOOT_CONFIG", REG_A6XX_GMU_CM3_BOOT_CONFIG, 2) && ok;
++	ok = gmu_set("HFI_QTBL_ADDR", REG_A6XX_GMU_HFI_QTBL_ADDR, GMU_VA_HFI) && ok;
++	ok = gmu_set("HFI_QTBL_INFO", REG_A6XX_GMU_HFI_QTBL_INFO, 1) && ok;
++	ok = gmu_set("AHB_FENCE_RANGE_0", REG_A6XX_GMU_AHB_FENCE_RANGE_0, 0x80a008a0u) && ok;
++	ok = gmu_set("CM3_CFG", REG_A6XX_GMU_CM3_CFG, 0x4052) && ok;
++	ok = gmu_set("HFI_SFR_ADDR", REG_A6XX_GMU_HFI_SFR_ADDR, 0x06018000u) && ok;   /* chip id 6.1.8.0 */
++	ok = gmu_set("PWR_COL_CP_MSG", REG_A6XX_GMU_PWR_COL_CP_MSG, GMU_VA_LOG) && ok;
++	ok = gmu_set("SYS_BUS_CONFIG", REG_A6XX_GMU_SYS_BUS_CONFIG, 1) && ok;
++	ok = gmu_set("ICACHE_CONFIG", REG_A6XX_GMU_ICACHE_CONFIG, 1) && ok;
++	ok = gmu_set("DCACHE_CONFIG", REG_A6XX_GMU_DCACHE_CONFIG, 1) && ok;
++	ok = gmu_set("PWR_COL_INTER_FRAME_CTRL", REG_A6XX_GMU_PWR_COL_INTER_FRAME_CTRL, 0x09c40400u) && ok;
++	ok = gmu_set("RPMH_CTRL", REG_A6XX_GMU_RPMH_CTRL, gmu_rd(gm_gmu, REG_A6XX_GMU_RPMH_CTRL) | 0xf11u) && ok;
++	ok = gmu_set("CX_GMU_WFI_CONFIG", REG_A6XX_GMU_CX_GMU_WFI_CONFIG, 0) && ok;
++	if (!ok) {
++		/* Downstream never reads these back; some may be write-only. The init result decides. */
++		printf("SWEET GMU:   a boot register reads back differently; going on\n");
++	}
++	if (rsc_start) {
++		gpu_pause("RSCC start handshake (sweetgmursc=1, mainline order)");
++		(void)gmu_rscc_start();
++	}
++	(void)sweet_smmu_faults(gm_cb, "before CM3 start");
++	gpu_pause("CM3 out of reset (CM3_SYSRESET = 0), wait up to 100 ms for the init result");
++	uint64_t t0 = mach_absolute_time();
++	gmu_wr(gm_gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
++	uint32_t v = 0;
++	bool done = false;
++	for (unsigned t = 0; t <= GMU_TIMEOUT_US && !done; t += 10) {
++		v = gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT);
++		done = v == GMU_INIT_DONE || (v & 0x1ffu) == 0x100u;
++		if (!done) {
++			delay(10);
++		}
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET GMU:   FW_INIT_RESULT 0x%08x after %llu us: %s\n", v, ns / 1000u,
++	    v == GMU_INIT_DONE ? "0xBABEFACE (downstream value)" : done ? "(v & 0x1ff) == 0x100 (newer firmware)" :
++	    "NO INIT RESULT");
++	sweet_gmu_status("after CM3 start");
++	printf("SWEET GMU:   dummy page %08x %08x, log page %08x %08x %08x %08x\n", mem_rd(GMEM_DUMMY),
++	    mem_rd(GMEM_DUMMY + 4u), mem_rd(GMEM_LOG), mem_rd(GMEM_LOG + 4u), mem_rd(GMEM_LOG + 8u),
++	    mem_rd(GMEM_LOG + 12u));
++	uint32_t faults = sweet_smmu_faults(gm_cb, "after CM3 start");
++	if (!done || faults) {
++		gmu_wr(gm_gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++		printf("SWEET GMU: 2B.3 stopped: %s; CM3 back in reset (CM3_SYSRESET 0x%08x)\n",
++		    !done ? "no init result" : "SMMU fault latched", gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_SYSRESET));
++		return false;
++	}
++	printf("SWEET GMU: 2B.3 done: the GMU firmware runs\n");
++	return true;
++}
++
++/* rpmh_arc_votes_init: the first primary level >= vlvl, then the first secondary level >= that. */
++static bool
++gmu_vote(const unsigned *pri, unsigned npri, const unsigned *sec, unsigned nsec, unsigned vlvl, uint32_t *vote)
++{
++	unsigned p = 0, s = 0;
++	while (p < npri && pri[p] < vlvl) {
++		++p;
++	}
++	if (p == npri) {
++		return false;
++	}
++	while (s < nsec && sec[s] < pri[p]) {
++		++s;
++	}
++	if (s == nsec) {
++		return false;
++	}
++	*vote = pri[p] << 16 | s << 8 | p;
++	return true;
++}
++
++static bool
++gmu_votes(void)
++{
++	if (gm_votes_ok) {
++		return true;
++	}
++	unsigned gfx[16], mx[16], cx[16], ngfx = 0, nmx = 0, ncx = 0;
++	uint32_t a;
++	if (gmu_cmddb("gfx.lvl", CMDDB_ARC, &a, gfx, 16, &ngfx) || gmu_cmddb("mx.lvl", CMDDB_ARC, &a, mx, 16, &nmx) ||
++	    gmu_cmddb("cx.lvl", CMDDB_ARC, &a, cx, 16, &ncx)) {
++		return false;
++	}
++	bool ok = true;
++	for (unsigned i = 0; i < GPU_LEVELS; ++i) {
++		if (!gmu_vote(gfx, ngfx, mx, nmx, gpu_level_vlvl[i], &gm_gx_votes[i])) {
++			gm_gx_votes[i] = 0xffffffffu;
++		}
++		printf("SWEET GMU:   GPU perf %u: %6u kHz vlvl %3u vote 0x%08x%s\n", i, gpu_level_khz[i], gpu_level_vlvl[i],
++		    gm_gx_votes[i], gm_gx_votes[i] == gpu_level_vote_want[i] ? "" : " DIFFERS FROM THE PLAN");
++		ok = ok && gm_gx_votes[i] == gpu_level_vote_want[i];
++	}
++	for (unsigned i = 0; i < GMU_LEVELS; ++i) {
++		if (!gmu_vote(cx, ncx, mx, nmx, gmu_level_vlvl[i], &gm_cx_votes[i])) {
++			gm_cx_votes[i] = 0xffffffffu;
++		}
++		printf("SWEET GMU:   GMU perf %u: %6u kHz vlvl %3u vote 0x%08x%s\n", i, gmu_level_khz[i], gmu_level_vlvl[i],
++		    gm_cx_votes[i], gm_cx_votes[i] == gmu_level_vote_want[i] ? "" : " DIFFERS FROM THE PLAN");
++		ok = ok && gm_cx_votes[i] == gmu_level_vote_want[i];
++	}
++	gm_votes_ok = ok;
++	return ok;
++}
++
++/* a6xx_gmu_oob_set for the a615 family: request bit req + 16, ack bit req + 24. */
++static bool
++gmu_oob_set(unsigned req, const char *name)
++{
++	const uint32_t ack = 1u << (req + 24u);
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1u << (req + 16u));
++	bool ok = gmu_wait(REG_A6XX_GMU_GMU2HOST_INTR_INFO, ack, ack, GMU_TIMEOUT_US);
++	printf("SWEET GMU:   OOB %s (bit %u): %s, GMU2HOST_INTR_INFO 0x%08x\n", name, req + 16u,
++	    ok ? "acked" : "NO ACK in 100 ms", gmu_rd(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	if (ok) {
++		gmu_wr(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, ack);
++	}
++	return ok;
++}
++
++bool
++sweet_gmu_gx_on(void)
++{
++	printf("SWEET GMU: 2B.4 GX rail through the GMU (gfx_rail_on), then SPTPRAC\n");
++	if (!gmu_votes()) {
++		printf("SWEET GMU: 2B.4 stopped: perf votes\n");
++		return false;
++	}
++	uint32_t vote = gm_gx_votes[GPU_LEVEL_START];
++	bool ok = gmu_set("BOOT_SLUMBER_OPTION", REG_A6XX_GMU_BOOT_SLUMBER_OPTION, 0);
++	ok = gmu_set("GX_VOTE_IDX", REG_A6XX_GMU_GX_VOTE_IDX, vote & 0xffu) && ok;
++	ok = gmu_set("MX_VOTE_IDX", REG_A6XX_GMU_MX_VOTE_IDX, (vote >> 8) & 0xffu) && ok;
++	if (!ok) {
++		printf("SWEET GMU: 2B.4 stopped: the DTCM mailbox did not read back\n");
++		return false;
++	}
++	gpu_pause("OOB boot_slumber: the GMU votes the GX rail on (HOST2GMU bit 22, ack bit 30)");
++	if (!gmu_oob_set(OOB_BOOT_SLUMBER, "boot_slumber")) {
++		sweet_gmu_status("after boot_slumber");
++		return false;
++	}
++	gpu_pause("SPTPRAC on (GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000)");
++	uint32_t before = gmu_rd(gm_gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
++	gmu_wr(gm_gmu, REG_A6XX_GMU_GX_SPTPRAC_POWER_CONTROL, SPTPRAC_POWER_ON);
++	ok = gmu_wait(REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS, SPTPRAC_POWERON_STATUS, SPTPRAC_POWERON_STATUS,
++	    GMU_SPTPRAC_TIMEOUT_US);
++	printf("SWEET GMU:   SPTPRAC status 0x%08x -> 0x%08x: %s\n", before,
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS), ok ? "on" : "NOT ON in 10 ms");
++	sweet_gmu_status("after GX rail");
++	return ok;
++}
++
++/* The next message in the message queue into gm_rsp; its dwords, 0 if the queue is empty or bad. */
++static unsigned
++gmu_hfi_read(void)
++{
++	const uint32_t h = HFI_QHDR(HFI_MSG_Q), q = GMEM_HFI + HFI_QUEUE(HFI_MSG_Q);
++	uint32_t rd = mem_rd(h + 4u * QH_READ), wr = mem_rd(h + 4u * QH_WRITE);
++	if (rd == wr) {
++		return 0;
++	}
++	uint32_t size = rd < HFI_QUEUE_DWORDS ? (mem_rd(q + 4u * rd) >> 8) & 0xffu : 0;
++	if (wr >= HFI_QUEUE_DWORDS || size == 0) {
++		printf("SWEET GMU:   HFI message queue bad: read %u write %u size %u; emptied\n", rd, wr, size);
++		mem_wr(h + 4u * QH_READ, wr < HFI_QUEUE_DWORDS ? wr : 0);
++		return 0;
++	}
++	for (uint32_t i = 0; i < size; ++i) {
++		uint32_t w = mem_rd(q + 4u * ((rd + i) % HFI_QUEUE_DWORDS));
++		if (i < HFI_MSG_MAX) {
++			gm_rsp[i] = w;
++		}
++	}
++	mem_wr(h + 4u * QH_READ, (rd + size) % HFI_QUEUE_DWORDS);
++	return size;
++}
++
++/*
++ * hfi_send_cmd for HFI v1: gm_msg[1..dwords-1] is the body. Waits for the
++ * ack whose word 1 is our header; *payload gets its word 3. True if the GMU
++ * answered with error 0.
++ */
++static bool
++gmu_hfi_send(unsigned id, unsigned dwords, const char *name, uint32_t *payload)
++{
++	const uint32_t h = HFI_QHDR(HFI_CMD_Q), q = GMEM_HFI + HFI_QUEUE(HFI_CMD_Q);
++	const uint32_t hdr = id | dwords << 8 | HFI_MSG_CMD << 16 | (++gm_hfi_seq & 0xfffu) << 20;
++	gm_msg[0] = hdr;
++	uint32_t rd = mem_rd(h + 4u * QH_READ), wr = mem_rd(h + 4u * QH_WRITE);
++	uint32_t space = rd > wr ? rd - wr : HFI_QUEUE_DWORDS - wr + rd;
++	if (rd >= HFI_QUEUE_DWORDS || wr >= HFI_QUEUE_DWORDS || space <= dwords) {
++		printf("SWEET GMU:   HFI %s: command queue read %u write %u; no room\n", name, rd, wr);
++		return false;
++	}
++	for (unsigned i = 0; i < dwords; ++i) {
++		mem_wr(q + 4u * ((wr + i) % HFI_QUEUE_DWORDS), gm_msg[i]);
++	}
++	mem_wr(h + 4u * QH_WRITE, (wr + dwords) % HFI_QUEUE_DWORDS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1);
++	for (unsigned t = 0; t < GMU_TIMEOUT_US; t += 10) {
++		if (!(gmu_rd(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO) & HFI_IRQ_MSGQ)) {
++			delay(10);
++			continue;
++		}
++		gmu_wr(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, HFI_IRQ_MSGQ);
++		unsigned n;
++		while ((n = gmu_hfi_read())) {
++			if (((gm_rsp[0] >> 16) & 0xfu) != HFI_MSG_ACK || n < 3 || gm_rsp[1] != hdr) {
++				printf("SWEET GMU:   HFI %s: skipped message 0x%08x (%u dwords)\n", name, gm_rsp[0], n);
++				continue;
++			}
++			if (payload) {
++				*payload = n > 3 ? gm_rsp[3] : 0;
++			}
++			printf("SWEET GMU:   HFI %s (0x%08x): acked, error %u%s\n", name, hdr, gm_rsp[2],
++			    gm_rsp[2] ? " REJECTED" : "");
++			return gm_rsp[2] == 0;
++		}
++		delay(10);
++	}
++	printf("SWEET GMU:   HFI %s (0x%08x): NO ACK in 100 ms (cmd read %u write %u, msg read %u write %u)\n", name,
++	    hdr, mem_rd(h + 4u * QH_READ), mem_rd(h + 4u * QH_WRITE), mem_rd(HFI_QHDR(HFI_MSG_Q) + 4u * QH_READ),
++	    mem_rd(HFI_QHDR(HFI_MSG_Q) + 4u * QH_WRITE));
++	return false;
++}
++
++static void
++gmu_msg_clear(void)
++{
++	for (unsigned i = 0; i < HFI_MSG_MAX; ++i) {
++		gm_msg[i] = 0;
++	}
++}
++
++bool
++sweet_gmu_hfi(void)
++{
++	printf("SWEET GMU: 2B.5 HFI v1: start, INIT, FW_VER, PERF_TBL, BW_TBL, TEST\n");
++	if (!gm_votes_ok) {
++		printf("SWEET GMU: 2B.5 needs 2B.4\n");
++		return false;
++	}
++	static const char *const bcm[4] = { "MC0", "SH0", "ACV", "CN0" };
++	uint32_t bcm_addr[4];
++	for (unsigned i = 0; i < 4; ++i) {
++		if (gmu_cmddb(bcm[i], CMDDB_BCM, &bcm_addr[i], NULL, 0, NULL)) {
++			return false;
++		}
++	}
++	gpu_pause("HFI start (HFI_CTRL_INIT = 1)");
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HFI_CTRL_INIT, 1);
++	bool ok = gmu_wait(REG_A6XX_GMU_HFI_CTRL_STATUS, 1, 1, GMU_TIMEOUT_US);
++	uint32_t ver = gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_VERSION_INFO);
++	printf("SWEET GMU:   HFI_CTRL_STATUS 0x%08x (%s), HFI_VERSION_INFO 0x%08x (major %u)\n",
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_CTRL_STATUS), ok ? "up" : "NOT UP in 100 ms", ver, ver >> 28);
++	if (!ok || ver >> 28 >= 2) {
++		printf("SWEET GMU: 2B.5 stopped: %s\n", ok ? "the firmware speaks HFI v2; this code speaks v1" :
++		    "HFI did not start");
++		return false;
++	}
++
++	gpu_pause("HFI INIT (dump buffer 0x60200000, cold boot)");
++	gmu_msg_clear();
++	gm_msg[1] = 0;
++	gm_msg[2] = GMU_VA_DUMP;
++	gm_msg[3] = GMU_DUMP_SIZE;
++	gm_msg[4] = 1;
++	if (!gmu_hfi_send(H2F_MSG_INIT, 5, "INIT", NULL)) {
++		return false;
++	}
++
++	gpu_pause("HFI FW_VER (we support 1.8)");
++	uint32_t fwver = 0;
++	gmu_msg_clear();
++	gm_msg[1] = HFI_FW_VER_SUPPORTED;
++	if (!gmu_hfi_send(H2F_MSG_FW_VER, 2, "FW_VER", &fwver)) {
++		return false;
++	}
++	unsigned major = (fwver >> 28) & 0xfu, minor = (fwver >> 16) & 0xfffu;
++	printf("SWEET GMU:   firmware version 0x%08x = %u.%u (step %u)\n", fwver, major, minor, fwver & 0xffffu);
++	if (major != 1 || minor < 8) {
++		printf("SWEET GMU: 2B.5 stopped: expected firmware 1.8 or a later 1.x\n");
++		return false;
++	}
++
++	gpu_pause("HFI PERF_TBL v1 (8 GPU levels, 2 GMU levels)");
++	gmu_msg_clear();
++	gm_msg[1] = GPU_LEVELS;
++	gm_msg[2] = GMU_LEVELS;
++	for (unsigned i = 0; i < GPU_LEVELS; ++i) {
++		gm_msg[3u + 2u * i] = gm_gx_votes[i];
++		gm_msg[4u + 2u * i] = gpu_level_khz[i];
++	}
++	for (unsigned i = 0; i < GMU_LEVELS; ++i) {
++		gm_msg[3u + 2u * HFI_MAX_GX_LEVELS + 2u * i] = gm_cx_votes[i];
++		gm_msg[4u + 2u * HFI_MAX_GX_LEVELS + 2u * i] = gmu_level_khz[i];
++	}
++	if (!gmu_hfi_send(H2F_MSG_PERF_TBL, 3u + 2u * (HFI_MAX_GX_LEVELS + HFI_MAX_CX_LEVELS), "PERF_TBL", NULL)) {
++		return false;
++	}
++
++	/*
++	 * Mainline's a618 table: one "off" level, since the 618 GMU does no bus
++	 * scaling. Layout: hdr, bw_level_num, cnoc_cmds_num, ddr_cmds_num,
++	 * cnoc_wait, ddr_wait, cnoc_addrs[6], cnoc_data[2][6], ddr_addrs[8],
++	 * ddr_data[16][8].
++	 */
++	gpu_pause("HFI BW_TBL (one off level; MC0, SH0, ACV, CN0 from cmd-db)");
++	gmu_msg_clear();
++	gm_msg[1] = 1;
++	gm_msg[2] = 1;
++	gm_msg[3] = 3;
++	gm_msg[4] = 1;
++	gm_msg[5] = 1;
++	gm_msg[6] = bcm_addr[3];
++	gm_msg[12] = 0x40000000u;
++	gm_msg[18] = 0x60000001u;
++	for (unsigned i = 0; i < 3; ++i) {
++		gm_msg[24u + i] = bcm_addr[i];
++		gm_msg[32u + i] = 0x40000000u;
++	}
++	if (!gmu_hfi_send(H2F_MSG_BW_VOTE_TBL, HFI_MSG_MAX, "BW_TBL", NULL)) {
++		return false;
++	}
++
++	gpu_pause("HFI TEST (the last message with hfi-use-reg)");
++	gmu_msg_clear();
++	if (!gmu_hfi_send(H2F_MSG_TEST, 2, "TEST", NULL)) {
++		return false;
++	}
++	sweet_gmu_status("after HFI");
++	printf("SWEET GMU: 2B.5 done: HFI up, all five messages acked\n");
++	return true;
++}
++
++bool
++sweet_gmu_oob_gpu(void)
++{
++	printf("SWEET GMU: 2B.6 OOB_GPU, then DCVS through the registers\n");
++	gpu_pause("OOB_GPU (HOST2GMU bit 16): GX stays on for the host");
++	if (!gmu_oob_set(OOB_GPU, "gpu")) {
++		sweet_gmu_status("after OOB_GPU");
++		return false;
++	}
++	gpu_pause("DCVS perf index 1 (180 MHz) through the mailbox, OOB_DCVS (bit 23)");
++	bool ok = gmu_set("DCVS_ACK_OPTION", REG_A6XX_GMU_DCVS_ACK_OPTION, 0);
++	ok = gmu_set("DCVS_PERF_SETTING", REG_A6XX_GMU_DCVS_PERF_SETTING, DCVS_PERF_AT_LEAST_1) && ok;
++	ok = gmu_set("DCVS_BW_SETTING", REG_A6XX_GMU_DCVS_BW_SETTING, DCVS_BW_NO_CHANGE) && ok;
++	ok = ok && gmu_oob_set(OOB_DCVS, "dcvs");
++	printf("SWEET GMU:   DCVS_RETURN 0x%08x\n", gmu_rd(gm_gmu, REG_A6XX_GMU_DCVS_RETURN));
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1u << (OOB_DCVS + 24u));   /* oob_clear */
++	sweet_gmu_status("after OOB_GPU and DCVS");
++	return ok;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -16,6 +16,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_arc_vote(const char *res, unsigned vlvl, unsigned *hlvl);
+ int sweet_rpmh_cmddb_dump(void);
++int sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl, unsigned nmax, unsigned *n);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -171,7 +172,7 @@
+ 	return 0;
+ }
+ 
+-/* want is RH_VRM or RH_ARC; aux_off/aux_len (optional) locate the entry's aux data. */
++/* want is RH_VRM, RH_ARC or RH_BCM; aux_off/aux_len (optional) locate the entry's aux data. */
+ static int
+ rh_lookup(const char *res, unsigned want, uint32_t *address, uint32_t *aux_off, unsigned *aux_len)
+ {
+@@ -202,8 +203,11 @@
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+ 			uint32_t off = aux + rh_db16(e + 22);
+ 			unsigned len = rh_db16(e + 20);
+-			if (slave != want || (addr >> 16) != want || (addr & 15u) || !rh_range(off, len)) {
+-				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : "VRM", res);
++			/* BCM addresses are 4 apart (CN0 0x500a8); ARC and VRM 16. */
++			if (slave != want || (addr >> 16) != want || (addr & (want == RH_BCM ? 3u : 15u)) ||
++			    !rh_range(off, len)) {
++				printf("SWEET RPMH: invalid %s entry for %s\n",
++				    want == RH_ARC ? "ARC" : want == RH_BCM ? "BCM" : "VRM", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -445,6 +449,49 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * cmd-db lookup for the GMU tables (sweet_gmu.c): the address of an ARC
++ * (slave 3) or BCM (slave 5) resource, and for an ARC with vlvl set its
++ * level table, vlvl[hlvl], up to the first level that does not rise.
++ * Read-only: no TCS is touched.
++ */
++int
++sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl, unsigned nmax, unsigned *n)
++{
++	if (!res || !addr || (slave != RH_ARC && slave != RH_BCM) || (vlvl && (slave != RH_ARC || !n))) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t address = 0, aux = 0;
++	unsigned len = 0, count = 0;
++	int error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, slave, &address, &aux, &len);
++	}
++	for (unsigned i = 0; !error && vlvl && !(aux & 1u) && i < len / 2u && i < RH_ARC_LEVELS && i < nmax; ++i) {
++		unsigned v = rh_db16(aux + 2u * i);
++		if (i && v <= vlvl[i - 1u]) {
++			break;
++		}
++		vlvl[i] = v;
++		count = i + 1u;
++	}
++	if (!error && vlvl && !count) {
++		printf("SWEET RPMH: %s has no level table\n", res);
++		error = EINVAL;
++	}
++	if (!error) {
++		*addr = address;
++		if (n) {
++			*n = count;
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ 
+ /*
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,5 +1,5 @@
+ /*
+- * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md), stages 0, 1 and 2A.
++ * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md), stages 0, 1, 2A and 2B.
+  *
+  * Boot-arg sweetgpu=N (N >= 1) starts a thread sweetgpudelay seconds after
+  * boot (default 40, so the home screen is up first). Stage 0 (N >= 1) only
+@@ -58,6 +58,21 @@
+  *    counter when cx_gmu reads near 200 MHz, else by the root status bit)
+  *    and the GMU sees the GX head switch and its clock on: RBBM_STATUS,
+  *    RBBM_CLOCK_CNTL and the CP always-on counter, the first GX reads.
++ * 2A showed that gx_gfx3d never runs when the host drives GX. Stage 2B
++ * (sweetgpu=4, instead of 2A) lets the GMU firmware do it, as kgsl does
++ * (sweet_gmu.c, sweet_smmu.c). It needs speed bin 146 (its perf table) and
++ * the GPU-GMU and GPU-GMU-MEM blobs. sweetgmu=N (default 0) stops after step
++ * 2B.N; sweetgmursc=1 adds mainline's RSCC start handshake before the CM3
++ * starts:
++ *  2B.0 survey of the GPU SMMU, GMU, RSCC and PDC; nothing written
++ *  2B.1 GMU memory (GPU-GMU-MEM, uncached) and an SMMU bank for its streams
++ *  2B.2 RSCC and PDC microcode
++ *  2B.3 firmware into the TCMs, boot registers, CM3 start
++ *  2B.4 GX rail through the GMU (OOB boot_slumber), SPTPRAC, then the GX
++ *       GDSC, gfx3d RCG and the clock counter, read only
++ *  2B.5 HFI queues and messages
++ *  2B.6 OOB_GPU and a DCVS vote, the clock counter again, the first GX reads
++ *       if gx_gfx3d runs, then a minute of GMU status every 10 s
+  * GMU and cx_misc offsets come from the generated sweet_gpu_regs.h; GCC and
+  * gpucc offsets from the downstream drivers above. Everything stays on after
+  * the last stage that runs.
+@@ -79,6 +94,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include "sweet_gpu_regs.h"
++#include "sweet_gpu_internal.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_cmddb_dump(void);
+@@ -88,7 +104,9 @@
+ #define SWEET_GPU_DELAY_S       40u
+ #define SWEET_GPU_PAUSE_MS      2000u
+ #define GPU_BLOB_MAX            0x100000u
+-#define GPU_GMU_ITCM_SIZE       0x8000u
++#define GPU_GMU_TCM_SIZE        0x8000u         /* 16 KiB ITCM code, then 16 KiB DTCM data */
++#define GPU_GMU_MEM_SIZE        0x100000u
++#define GPU_BIN_2B              146u            /* the perf table sweet_gmu.c sends */
+ #define QFPROM_PA               0x780000u
+ #define QFPROM_GPU_SPEED_BIN    0x41a0u
+ #define GPU_SPEED_BIN_MASK      0x1fe00000u
+@@ -120,10 +138,7 @@
+ #define GPUCC_GMU_RCG           0x1120u         /* +0 CMD, +4 CFG */
+ #define GPUCC_GX_DOMAIN         0x1508u         /* bit 0: GX clamp_io */
+ #define GPUCC_CX_GDS_HW_CTRL    0x1540u         /* hw-ctrl-addr: CX GDSC status */
+-/* GMU and cx_misc (sdmmagpie-gpu.dtsi); sweet_gpu_regs.h offsets are dwords from GPU_PA */
+-#define GPU_PA                  0x05000000u
+-#define GMU_PA                  0x0506a000u
+-#define GMU_SIZE                0x31000u
++/* cx_misc (sdmmagpie-gpu.dtsi); GPU_PA and GMU_PA are in sweet_gpu_internal.h */
+ #define CX_MISC_PA              0x0509e000u
+ #define CX_MISC_SIZE            0x1000u
+ 
+@@ -209,10 +224,10 @@
+ #define MEAS_XO_DIV4_HZ         4800000u
+ #define MEAS_FAILED             0xffffffffu
+ 
+-enum { BLOB_SQE, BLOB_GMU, BLOB_ZAP_MDT, BLOB_ZAP_B02, BLOB_COUNT };
++enum { BLOB_SQE, BLOB_GMU, BLOB_ZAP_MDT, BLOB_ZAP_B02, BLOB_GMU_MEM, BLOB_COUNT };
+ 
+ static const char *const gpu_blob_names[BLOB_COUNT] = {
+-	"GPU-SQE", "GPU-GMU", "GPU-ZAP-MDT", "GPU-ZAP-B02",
++	"GPU-SQE", "GPU-GMU", "GPU-ZAP-MDT", "GPU-ZAP-B02", "GPU-GMU-MEM",
+ };
+ 
+ static struct {
+@@ -221,11 +236,11 @@
+ 	const uint8_t *va;
+ } gpu_blobs[BLOB_COUNT];
+ 
+-static int gpu_level, gpu_hang;
++static int gpu_level, gpu_hang, gpu_gmu_stop, gpu_gmu_rsc;
+ static uint32_t gpu_delay_s = SWEET_GPU_DELAY_S;
+ static int gpu_sleep_chan;
+ 
+-static void
++void
+ gpu_sleep_ms(unsigned ms)
+ {
+ 	uint64_t deadline;
+@@ -235,42 +250,13 @@
+ }
+ 
+ /* Log what comes next, then give the persistent log time to reach the disk. */
+-static void
++void
+ gpu_pause(const char *next)
+ {
+ 	printf("SWEET GPU: next: %s (in %u ms)\n", next, SWEET_GPU_PAUSE_MS);
+ 	gpu_sleep_ms(SWEET_GPU_PAUSE_MS);
+ }
+ 
+-static uint32_t
+-gpu_rd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
+-{
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = val;
+-	__asm__ volatile("dsb osh" ::: "memory");
+-}
+-
+-/* Poll every 1 us until (reg & mask) == want; false after us tries. */
+-static bool
+-gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
+-{
+-	for (unsigned i = 0; i < us; ++i) {
+-		if ((gpu_rd(base, off) & mask) == want) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return (gpu_rd(base, off) & mask) == want;
+-}
+-
+ /* Blob bytes are in RAM; read words without assuming alignment. */
+ static uint32_t
+ blob32(const uint8_t *p)
+@@ -353,9 +339,13 @@
+ 	}
+ 	if ((p = gpu_blobs[BLOB_GMU].va)) {
+ 		len = gpu_blobs[BLOB_GMU].len;
+-		/* Legacy (a618) image: the whole file goes to the CM3 ITCM; vector table first. */
++		/*
++		 * Legacy (a618) image, no header: 16 KiB of CM3 code (vector table
++		 * first) for the ITCM, then 16 KiB of DTCM data, which follows the
++		 * ITCM in the host window. One 32 KiB write fills both.
++		 */
+ 		uint32_t sp = len >= 8 ? blob32(p) : 0, reset = len >= 8 ? blob32(p + 4) : 0;
+-		bool ok = len >= 8 && len <= GPU_GMU_ITCM_SIZE && !(len & 3u) && (reset & 1u) && reset < len;
++		bool ok = len == GPU_GMU_TCM_SIZE && (reset & 1u) && reset < len / 2u;
+ 		printf("SWEET GPU: GMU %s: %u bytes, initial sp %#x, reset vector %#x\n",
+ 		    ok ? "ok" : "BAD", len, sp, reset);
+ 	}
+@@ -381,21 +371,33 @@
+ 		    gpu_blobs[BLOB_ZAP_B02].len == load_filesz ? "ok" : "BAD",
+ 		    gpu_blobs[BLOB_ZAP_B02].len, load_filesz);
+ 	}
++	if ((p = gpu_blobs[BLOB_GMU_MEM].va)) {
++		/* Zeros from mkboot.sh; stage 2B maps it for the GMU. */
++		len = gpu_blobs[BLOB_GMU_MEM].len;
++		uint32_t nonzero = 0;
++		for (uint32_t i = 0; i < len; ++i) {
++			nonzero += p[i] != 0;
++		}
++		printf("SWEET GPU: GMU-MEM %s: %u bytes, %u non-zero\n", len == GPU_GMU_MEM_SIZE && !nonzero ? "ok" : "BAD",
++		    len, nonzero);
++	}
+ }
+ 
+-static void
++/* The bin, or -1 if QFPROM could not be read. */
++static int
+ gpu_speed_bin(void)
+ {
+ 	gpu_pause("QFPROM speed-bin read at 0x7841a0");
+ 	vm_offset_t q = ml_io_map(QFPROM_PA + QFPROM_GPU_SPEED_BIN, 4);
+ 	if (!q) {
+ 		printf("SWEET GPU: QFPROM mapping failed\n");
+-		return;
++		return -1;
+ 	}
+ 	uint32_t raw = gpu_rd(q, 0);
+ 	unsigned bin = (raw & GPU_SPEED_BIN_MASK) >> GPU_SPEED_BIN_SHIFT;
+ 	printf("SWEET GPU: speed bin raw=%#x bin=%u -> %s fmax %u MHz\n", raw, bin,
+ 	    bin ? "table" : "default table,", bin ? bin * 48u / 10u : 825u);
++	return (int)bin;
+ }
+ 
+ static void
+@@ -536,18 +538,6 @@
+ 	return ok;
+ }
+ 
+-/* reg is a dword offset from GPU_PA, as in sweet_gpu_regs.h. */
+-static uint32_t
+-gmu_rd(vm_offset_t gmu, uint32_t reg)
+-{
+-	uint32_t off = reg * 4u - (GMU_PA - GPU_PA);
+-	if (reg * 4u < GMU_PA - GPU_PA || off >= GMU_SIZE) {
+-		printf("SWEET GPU: register %#x is outside the GMU block\n", reg);
+-		return 0xffffffffu;
+-	}
+-	return gpu_rd(gmu, off);
+-}
+-
+ static uint64_t
+ gmu_alwayson(vm_offset_t gmu)
+ {
+@@ -656,17 +646,6 @@
+ 	return true;
+ }
+ 
+-static void
+-gmu_wr(vm_offset_t gmu, uint32_t reg, uint32_t val)
+-{
+-	uint32_t off = reg * 4u - (GMU_PA - GPU_PA);
+-	if (reg * 4u < GMU_PA - GPU_PA || off >= GMU_SIZE) {
+-		printf("SWEET GPU: register %#x is outside the GMU block; not written\n", reg);
+-		return;
+-	}
+-	gpu_wr(gmu, off, val);
+-}
+-
+ /* The cmd-db dump or a touch-rail vote may hold the RPMh lock briefly. */
+ static bool
+ gpu_rail_vote(const char *res, unsigned vlvl)
+@@ -1028,6 +1007,116 @@
+ 	    sptp ? "on" : "NOT on");
+ }
+ 
++/*
++ * GX as the GMU left it, read only: GDSC, gfx3d RCG, SPTPRAC, then the clock
++ * counter (the gx_* clocks only with the GX GDSC on). True if the GDSC is on
++ * and gx_gfx3d runs at any rate.
++ */
++static bool
++gpu_gx_check(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu, const char *when)
++{
++	bool gdsc = (gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) != 0;
++	gpu_log_gx(cc, gmu, when, gdsc);
++	uint32_t khz[MEAS_ALL] = { 0 };
++	gpu_pause(gdsc ? "clock counter (GCC 0x162000): cx_gmu, gx_gfx3d, cx_gfx3d, gx_cxo, gx_gmu" :
++	    "clock counter (GCC 0x162000): cx_gmu only, GX GDSC off");
++	gpu_measure(gcc, cc, gdsc ? MEAS_ALL : 1u, when, khz);
++	bool counter = khz[0] >= 150000u && khz[0] <= 250000u;
++	bool runs = gdsc && khz[1] != MEAS_FAILED && khz[1] != 0;
++	printf("SWEET GPU: %s: GX GDSC %s, gx_gfx3d %s (%u kHz), counter %s\n", when, gdsc ? "on" : "OFF",
++	    runs ? "runs" : "does not run", runs ? khz[1] : 0, counter ? "trusted (cx_gmu near 200 MHz)" : "NOT trusted");
++	return runs;
++}
++
++/* Not in sweet_gpu_regs.h; dword offsets from GPU_PA (a6xx.xml) */
++#define REG_A6XX_RBBM_INT_0_STATUS      0x00201u
++#define REG_A6XX_GBIF_HALT              0x03c45u
++
++/* With GX on and gx_gfx3d running: the first GX reads. GBIF_HALT is only read. */
++static void
++gpu_gx_reads(vm_offset_t gpu, vm_offset_t gmu)
++{
++	gpu_pause("first GX reads: RBBM_STATUS (0x5000840), RBBM_INT_0_STATUS, GBIF_HALT");
++	uint32_t rbbm = gpu_rd(gpu, REG_A6XX_RBBM_STATUS * 4u);
++	printf("SWEET GPU:   RBBM_STATUS 0x%08x RBBM_INT_0_STATUS 0x%08x GBIF_HALT 0x%08x\n", rbbm,
++	    gpu_rd(gpu, REG_A6XX_RBBM_INT_0_STATUS * 4u), gpu_rd(gpu, REG_A6XX_GBIF_HALT * 4u));
++	gpu_pause("CP always-on counter (0x5002600) twice, 1 ms apart");
++	uint64_t c0 = gpu_cp_alwayson(gpu), g0 = gmu_alwayson(gmu);
++	delay(1000);
++	uint64_t c1 = gpu_cp_alwayson(gpu), g1 = gmu_alwayson(gmu);
++	printf("SWEET GPU:   CP always-on counter %llu -> %llu (+%llu); GMU counter +%llu in the same 1 ms\n",
++	    c0, c1, c1 - c0, g1 - g0);
++	printf("SWEET GPU: GX reads %s: RBBM_STATUS 0x%08x (%s), CP counter %s\n", c1 > c0 ? "work" : "with findings",
++	    rbbm, (rbbm & A6XX_RBBM_STATUS_GPU_BUSY_IGN_AHB__MASK) ? "busy" : "idle", c1 > c0 ? "runs" : "STOPPED");
++}
++
++/*
++ * Stage 2B (sweetgpu=4): the GMU firmware powers GX. sweet_gmu.c does the
++ * GMU steps 2B.0 to 2B.6; sweetgmu=N stops after 2B.N. GX is checked here
++ * with stage 2A's clock counter.
++ */
++static void
++gpu_stage2b(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu, int bin)
++{
++	printf("SWEET GPU: stage 2B (sweetgpu=%d sweetgmu=%d%s): the GMU firmware powers GX\n", gpu_level,
++	    gpu_gmu_stop, gpu_gmu_rsc == 1 ? " sweetgmursc=1" : "");
++	if (bin != (int)GPU_BIN_2B) {
++		printf("SWEET GPU: stage 2B stopped: speed bin %d; the GMU perf table is for bin %u\n", bin, GPU_BIN_2B);
++		return;
++	}
++	if (!gpu_blobs[BLOB_GMU].va || !gpu_blobs[BLOB_GMU_MEM].va) {
++		printf("SWEET GPU: stage 2B stopped: GPU-GMU or GPU-GMU-MEM missing (mkboot.sh GPUFW=1)\n");
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_REGS_SIZE);
++	if (!gpu) {
++		printf("SWEET GPU: stage 2B mapping failed\n");
++		return;
++	}
++	gpu_log_gx(cc, gmu, "as found", false);
++	int step = 0;
++	bool ok = sweet_gmu_survey(gmu, gpu_blobs[BLOB_GMU_MEM].pa, gpu_blobs[BLOB_GMU_MEM].len);
++	if (ok && gpu_gmu_stop >= 1) {
++		step = 1;
++		ok = sweet_gmu_mem();
++	}
++	if (ok && gpu_gmu_stop >= 2) {
++		step = 2;
++		ok = sweet_gmu_rpmh();
++	}
++	if (ok && gpu_gmu_stop >= 3) {
++		step = 3;
++		ok = sweet_gmu_boot(gpu_blobs[BLOB_GMU].va, gpu_blobs[BLOB_GMU].len, gpu_gmu_rsc == 1);
++	}
++	if (ok && gpu_gmu_stop >= 4) {
++		step = 4;
++		ok = sweet_gmu_gx_on();
++		ok = gpu_gx_check(gcc, cc, gmu, "after GMU rail") && ok;
++	}
++	if (ok && gpu_gmu_stop >= 5) {
++		step = 5;
++		ok = sweet_gmu_hfi();
++	}
++	if (ok && gpu_gmu_stop >= 6) {
++		step = 6;
++		ok = sweet_gmu_oob_gpu();
++		bool runs = gpu_gx_check(gcc, cc, gmu, "after OOB_GPU");
++		if (ok && runs) {
++			gpu_gx_reads(gpu, gmu);
++		}
++		ok = ok && runs;
++		for (unsigned s = 10; s <= 60; s += 10) {
++			gpu_sleep_ms(10000);
++			char when[24];
++			snprintf(when, sizeof(when), "monitor %u s", s);
++			sweet_gmu_status(when);
++			printf("SWEET GPU: %s: gx_gdscr 0x%08x\n", when, gpu_rd(cc, GPUCC_GX_GDSCR));
++		}
++	}
++	printf("SWEET GPU: stage 2B %s at 2B.%d (sweetgmu=%d); what is on stays on\n",
++	    ok ? "done" : "STOPPED by a failure", step, gpu_gmu_stop);
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -1041,18 +1130,22 @@
+ 	}
+ 	printf("SWEET GPU: stage 0 (sweetgpu=%d): firmware blobs, cmd-db, speed bin; no GPU registers\n",
+ 	    gpu_level);
+-	if (gpu_level > 3) {
+-		printf("SWEET GPU: stages above 2A are not built yet; running stages 0 to 2A\n");
++	if (gpu_level > 4) {
++		printf("SWEET GPU: stages above 2B are not built yet; running stages 0, 1 and 2B\n");
+ 	}
+ 	unsigned found = gpu_find_blobs();
+ 	gpu_check_blobs();
+-	printf("SWEET GPU: %u of %u firmware blobs present\n", found, (unsigned)BLOB_COUNT);
++	printf("SWEET GPU: %u of %u blobs present\n", found, (unsigned)BLOB_COUNT);
+ 	gpu_cmddb();
+-	gpu_speed_bin();
++	int bin = gpu_speed_bin();
+ 	printf("SWEET GPU: stage 0 done\n");
+ 	vm_offset_t gcc = 0, cc = 0, gmu = 0;
+-	if (gpu_level >= 2 && gpu_stage1(&gcc, &cc, &gmu) && gpu_level >= 3) {
+-		gpu_stage2a(gcc, cc, gmu);
++	if (gpu_level >= 2 && gpu_stage1(&gcc, &cc, &gmu)) {
++		if (gpu_level == 3) {
++			gpu_stage2a(gcc, cc, gmu);
++		} else if (gpu_level >= 4) {
++			gpu_stage2b(gcc, cc, gmu, bin);
++		}
+ 	}
+ 	if (gpu_hang == 1) {
+ 		gpu_pause("deliberate hang (sweetgpuhang=1): interrupts off, spinning; pull the log from recovery");
+@@ -1075,6 +1168,11 @@
+ 	if (gpu_delay_s > 600) {
+ 		gpu_delay_s = SWEET_GPU_DELAY_S;
+ 	}
++	(void)PE_parse_boot_argn("sweetgmu", &gpu_gmu_stop, sizeof(gpu_gmu_stop));
++	if (gpu_gmu_stop < 0 || gpu_gmu_stop > 6) {
++		gpu_gmu_stop = 0;
++	}
++	(void)PE_parse_boot_argn("sweetgmursc", &gpu_gmu_rsc, sizeof(gpu_gmu_rsc));
+ 	thread_t thread;
+ 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

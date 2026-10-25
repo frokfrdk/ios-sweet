@@ -7,6 +7,8 @@
 # it overwrites the last 4 MiB + 4 KiB of userdata). GPUFW=1 adds the Adreno 618
 # firmware from $GPUFW_DIR (default ~/ios-pixel/gpu-fw/fw) as payload blobs for
 # sweet_gpu.c (kernel 0094+); such images contain vendor firmware: keep them out of git.
+# It also adds GPU-GMU-MEM, 1 MiB of zeros that sweet_gmu.c (kernel 0100+) maps for the
+# GMU (page tables, HFI queues, cache backing); no vendor data.
 set -euo pipefail
 R="/mnt/c/Users/frokfrdk/Documents/ios 16 on Google Pixel 4a/ios-sweet-pixel"
 export PATH=~/.local/bin:$PATH
@@ -21,6 +23,8 @@ if [ "${GPUFW:-0}" = 1 ]; then
   for b in GPU-SQE=a630_sqe.fw GPU-GMU=a618_gmu.bin GPU-ZAP-MDT=a615_zap.mdt GPU-ZAP-B02=a615_zap.b02; do
     BLOBS+=(--blob "${b%%=*}=$FW/${b#*=}")
   done
+  head -c 1048576 /dev/zero > shim/out/gmu-mem.bin
+  BLOBS+=(--blob GPU-GMU-MEM=shim/out/gmu-mem.bin)
 fi
 # ADT= picks another device tree (e.g. shim/out/sunfish-hi-scale2.adt from mkadt.py --scale2).
 python3 -I tools/mkpayload.py "$K" "${ADT:-shim/out/sunfish-hi.adt}" shim/out/payload-$NAME.bin --cmdline "$B" "${BLOBS[@]}"
