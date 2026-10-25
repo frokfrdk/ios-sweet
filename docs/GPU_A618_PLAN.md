@@ -1271,7 +1271,7 @@ Fixes found on G4a or G4b are new patches and CI runs, shown before anything boo
 Stage 4 leaves these for later: memory writes and leaving secure mode (Stage 5), CP_PROTECT, interrupts,
 indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
 
-### Stage 5: zap shader and leaving secure mode (detailed plan, nothing built yet)
+### Stage 5: zap shader and leaving secure mode (patch 0109 built, not booted)
 
 Planned 2026-10-25, after G4c passed Stage 4. The owner asked to see this plan before any code.
 
@@ -1642,4 +1642,6 @@ and GX GDSC steady.
 Stage 5 (zap shader, leaving secure mode, first DRAM writes) is now planned in detail ("Stage 5" above):
 read-only SCM queries, a secure-mode baseline write, PAS INIT_IMAGE / MEM_SETUP (size 0x1000) / load /
 AUTH_AND_RESET, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` to the scratch page, and a 30 s hold, under `sweetgpu=7
-sweetcp=5 sweetzap=N`, images G5a/G5b/G5c. Nothing is built. Next, with the owner's OK: patch 0109.
+sweetcp=5 sweetzap=N`, images G5a/G5b/G5c. Patch 0109 builds it (new `sweet_zap.c`, ring helpers exported from
+`sweet_cp.c`, the `sweetgpu=7` hook; commit 8e908dd, CI 40194604743 passed, artifact `xnu-kernel`). In 5.5 the 16 writes to words 16–31 carry
+`0xc0ff1000 + word index`. Nothing is packed or booted. Next, with the owner's OK: pack G5a (`sweetzap=0`).
