@@ -1271,7 +1271,7 @@ Fixes found on G4a or G4b are new patches and CI runs, shown before anything boo
 Stage 4 leaves these for later: memory writes and leaving secure mode (Stage 5), CP_PROTECT, interrupts,
 indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
 
-### Stage 5: zap shader and leaving secure mode (patch 0109 built, not booted)
+### Stage 5: zap shader and leaving secure mode (patch 0109; G5a stopped at 5.0: PAS 13 not supported)
 
 Planned 2026-10-25, after G4c passed Stage 4. The owner asked to see this plan before any code.
 
@@ -1644,4 +1644,28 @@ read-only SCM queries, a secure-mode baseline write, PAS INIT_IMAGE / MEM_SETUP 
 AUTH_AND_RESET, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` to the scratch page, and a 30 s hold, under `sweetgpu=7
 sweetcp=5 sweetzap=N`, images G5a/G5b/G5c. Patch 0109 builds it (new `sweet_zap.c`, ring helpers exported from
 `sweet_cp.c`, the `sweetgpu=7` hook; commit 8e908dd, CI 40194604743 passed, artifact `xnu-kernel`). In 5.5 the 16 writes to words 16–31 carry
-`0xc0ff1000 + word index`. Nothing is packed or booted. Next, with the owner's OK: pack G5a (`sweetzap=0`).
+`0xc0ff1000 + word index`.
+
+**G5a result (booted once, `sweetzap=0`): Stage 5 stopped at 5.0, as the pass rule says, because `PAS_IS_SUPPORTED(13)`
+returned x0 0, x1 0.** Seen in the log:
+- Stages 0–4 passed again. Stage 4 reached 4.5 ("stage 4 done at 4.5"). The scratch page held its poison: 0 of 1024
+  words differed.
+- The SMC64 probe (fast call, 15 µs) and `IS_CALL_AVAIL` for PIL cmds 1, 2, 5 and 7 all returned x0 0, x1 1. None was
+  interrupted or busy.
+- `PAS_IS_SUPPORTED(13)` returned x0 0 (the call itself succeeded) and x1 0 ("not supported"). It took 188 µs; the
+  `IS_CALL_AVAIL` calls took 4–5 µs.
+- `RBBM_SECVID_TRUST_CNTL` read 0x00000001.
+- The MDT checks all held: ELF32, machine 164, 3 program headers, metadata = the whole 6860-byte file, segment 2 at
+  carve-out + 0 (0x7c0 bytes, relocatable), MEM_SETUP size 0x1000, B02 1984 bytes.
+- The carve-out read and the metadata copy did not run; the stage stopped first.
+- No fault and no panic. The phone kept running to the end of the log.
+
+Not known (guesses):
+- Whether TZ would still accept `INIT_IMAGE` for PAS 13. The not-supported answer may only mean that this
+  `IS_SUPPORTED` table leaves the GPU out. Mainline's zap loader does not call `PAS_IS_SUPPORTED` (from memory, not
+  checked).
+- Whether the hypervisor answered instead of TZ. The longer time suggests the call did more work than the others, but
+  proves nothing.
+
+Per this plan, 5.0 = 0 means a new plan, not a fallback. Next, with the owner's OK: research how the stock sunfish
+kernel loads `a615_zap` (PAS id, whether it checks support, any hypervisor call). Use it for hardware facts only.
