@@ -1774,4 +1774,26 @@ G5b is packed from out-0110:
 - The blob addresses are the same as G5a2's.
 - The 828xr ADT and all firmware are in the payload.
 
-Not booted. Next, with the owner's OK: boot G5b.
+**G5b result (booted 2026-10-26 09:36, `sweetzap=3`): 5.0–5.3 PASSED; the zap shader authenticated ("stage 5 done
+at 5.3").** Seen in the log:
+- **5.0:** as on G5a2.
+- **5.1:** the secure-mode `CP_MEM_WRITE` **landed**: word 0 = 0xc0ffee00, so writes are *not* dropped in secure
+  mode on this setup. The marker 0x5ee75001 landed and RPTR = WPTR = 2065. No fault; the other 1023 words were
+  untouched.
+- **5.2:** `PAS_INIT_IMAGE(13, 0x10258f000)` returned x0 0, x1 0 after **3 INTERRUPTED resumes**, in 17.1 ms. So
+  the resume path works, and metadata above 4 GiB is accepted (risk 1 did not happen). `PAS_MEM_SETUP(13,
+  0x97715000, 0x1000)` returned 0 in 254 µs.
+- **5.3:** all 496 words of segment 2 were written into the carve-out (first word 0x016ff021), and 0 read back
+  differently. `PAS_AUTH_AND_RESET(13)` returned x0 0, x1 0 in 1.58 ms.
+- **After 5.3**, the CP dump is unchanged: RBBM_STATUS 0x1, HW_FAULT 0, PROTECT_STATUS 0. SMMU bank 0/4 FSR 0x400
+  as always. The GMU is the same as before. No panic.
+- No crypto bandwidth vote was needed (at least for this one load).
+
+**What this changes for 5.4–5.5 (observation plus a guess):** since a secure-mode write already lands, a landed
+0xc0ffee01 in 5.5 cannot by itself prove that 5.4 left secure mode. The proof for 5.4 is instead:
+- `CP_SET_SECURE_MODE 0` does not hang the CP (mainline says it hangs without a zap), and its marker lands;
+- 5.5's writes land with no fault.
+
+Whether the write path differs in secure mode (for example, which SMMU context or "secure" attribute the GPU uses)
+is not known. Next, with the owner's OK: pack G5c (`sweetzap=6`) from out-0110. No code change is needed; the 5.5
+pass rule already checks the words.
