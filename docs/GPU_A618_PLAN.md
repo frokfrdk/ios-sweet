@@ -722,6 +722,23 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
 - Next: 2B.6 (`sweetgmu=6`, same 0105 kernel): OOB_GPU, the DCVS vote through registers, and the first GX register
   reads (RBBM_STATUS, the CP always-on counter). This is the first GX register access. Only with the owner's OK.
 
+**Result on G3k (2026-10-25 19:07, 0105 kernel, `sweetgmu=6`): 2B.6 PASSED. Stage 2 (GX power) is complete.**
+- Log flush #389, 6158 lines, no panic. 2B.1–2B.5 as on G3j. Owner: phone "same as before".
+- OOB_GPU acked (GMU2HOST bit 24). DCVS perf index 1: the three mailbox writes read back, OOB_DCVS acked (bit 31),
+  DCVS_RETURN 0.
+- After DCVS the GMU has set up the GPU PLL (mode 0xd1000005, L 0x12) and moved gfx3d onto it. Measured:
+  **gx_gfx3d 180001 kHz** and cx_gfx3d 180001 kHz (the 180 MHz perf level), cx_gmu 200002 kHz, gx_cxo 19201 kHz.
+  gx_gmu reads 0 now (it read 200 MHz on G2m; not understood, noted only).
+- GX GDSC 0xf8222000 (on), SPTPRAC 0x28. RPMH_POWER_STATE reads 0 after DCVS (0xf after HFI); meaning unknown.
+- **First GX reads work: RBBM_STATUS 0x00000001** (only bit 0, CP_AHB_BUSY_CX_MASTER, which is probably our own
+  AHB read; the GPU is otherwise idle), RBBM_INT_0_STATUS 0, GBIF_HALT 0.
+- **CP always-on counter runs:** +21938 over the "1 ms" wait, against +21931 on the GMU counter in the same wait,
+  so the two counters agree (the wait itself was about 1.14 ms at 19.2 MHz).
+- One minute of monitoring at 10 s steps: FW_INIT_RESULT stays 0xbabeface, GX GDSC stays on, no SMMU fault
+  (bank 4 FSR 0x400 = FORMAT only).
+- Stage 2 pass rule met: the always-on counter advances, RBBM_STATUS reads, no SMMU fault, phone stable.
+- Next: Stage 3 (the GPU's own SMMU context bank, stream 0). It needs a new patch, written only with the owner's OK.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
