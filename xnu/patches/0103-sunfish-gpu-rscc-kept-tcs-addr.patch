@@ -1,0 +1,79 @@
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -233,6 +233,25 @@
+ 	return got == val;
+ }
+ 
++/*
++ * gmu_set for a register boot firmware may have set and write-protected: a write that
++ * leaves the old value in place is accepted and logged; any other readback still fails.
++ */
++static bool
++gmu_set_or_kept(const char *name, uint32_t reg, uint32_t val)
++{
++	uint32_t old = gmu_rd(gm_gmu, reg);
++	gmu_wr(gm_gmu, reg, val);
++	uint32_t got = gmu_rd(gm_gmu, reg);
++	if (got != val && got == old) {
++		printf("SWEET GMU:   %-28s [0x%05x] = 0x%08x kept (wrote 0x%08x; firmware value, accepted)\n",
++		    name, reg, got, val);
++		return true;
++	}
++	printf("SWEET GMU:   %-28s [0x%05x] = 0x%08x%s\n", name, reg, got, got == val ? "" : " MISMATCH");
++	return got == val;
++}
++
+ static uint32_t
+ mem_rd(uint32_t off)
+ {
+@@ -409,23 +428,27 @@
+ 	return sweet_smmu_faults(gm_cb, "after attach") == 0;
+ }
+ 
+-/* _load_gmu_rpmh_ucode, a618 values. */
++/*
++ * _load_gmu_rpmh_ucode, a618 values. kept: on G3e the HIDDEN_TCS_CMDn_ADDR writes were
++ * ignored (preset 0x82204514/10/20 stayed); kgsl writes them and never reads them back.
++ */
+ static const struct {
+ 	const char *name;
+ 	uint32_t reg, val;
++	bool kept;
+ } gmu_rscc_init[] = {
+-	{ "RSC_STATUS0_DRV0", REG_A6XX_RSCC_RSC_STATUS0_DRV0, 1u << 24 },
+-	{ "PDC_SLAVE_ID_DRV0", REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0, 1 },
+-	{ "HIDDEN_TCS_CMD0_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR, 0 },
+-	{ "HIDDEN_TCS_CMD0_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 1u, 0 },
+-	{ "HIDDEN_TCS_CMD1_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2u, 0 },
+-	{ "HIDDEN_TCS_CMD1_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 3u, 0 },
+-	{ "HIDDEN_TCS_CMD2_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4u, 0 },
+-	{ "HIDDEN_TCS_CMD2_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 5u, 0x80000000u },
+-	{ "OVERRIDE_START_ADDR", REG_A6XX_RSCC_OVERRIDE_START_ADDR, 0 },
+-	{ "PDC_SEQ_START_ADDR", REG_A6XX_RSCC_PDC_SEQ_START_ADDR, 0x4520 },
+-	{ "PDC_MATCH_VALUE_LO", REG_A6XX_RSCC_PDC_MATCH_VALUE_LO, 0x4510 },
+-	{ "PDC_MATCH_VALUE_HI", REG_A6XX_RSCC_PDC_MATCH_VALUE_HI, 0x4514 },
++	{ "RSC_STATUS0_DRV0", REG_A6XX_RSCC_RSC_STATUS0_DRV0, 1u << 24, false },
++	{ "PDC_SLAVE_ID_DRV0", REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0, 1, false },
++	{ "HIDDEN_TCS_CMD0_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR, 0, true },
++	{ "HIDDEN_TCS_CMD0_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 1u, 0, false },
++	{ "HIDDEN_TCS_CMD1_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2u, 0, true },
++	{ "HIDDEN_TCS_CMD1_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 3u, 0, false },
++	{ "HIDDEN_TCS_CMD2_ADDR", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4u, 0, true },
++	{ "HIDDEN_TCS_CMD2_DATA", REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 5u, 0x80000000u, false },
++	{ "OVERRIDE_START_ADDR", REG_A6XX_RSCC_OVERRIDE_START_ADDR, 0, false },
++	{ "PDC_SEQ_START_ADDR", REG_A6XX_RSCC_PDC_SEQ_START_ADDR, 0x4520, false },
++	{ "PDC_MATCH_VALUE_LO", REG_A6XX_RSCC_PDC_MATCH_VALUE_LO, 0x4510, false },
++	{ "PDC_MATCH_VALUE_HI", REG_A6XX_RSCC_PDC_MATCH_VALUE_HI, 0x4514, false },
+ };
+ static const uint32_t gmu_rscc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
+ static const uint32_t gmu_pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
+@@ -462,7 +485,8 @@
+ 	gpu_pause("GMU_GENERAL_7 = 1 (TCM retention), then the RSCC (0x508d000)");
+ 	bool ok = gmu_set("GENERAL_7", REG_A6XX_GMU_GENERAL_7, 1);
+ 	for (unsigned i = 0; i < sizeof(gmu_rscc_init) / sizeof(gmu_rscc_init[0]); ++i) {
+-		ok = gmu_set(gmu_rscc_init[i].name, gmu_rscc_init[i].reg, gmu_rscc_init[i].val) && ok;
++		ok = (gmu_rscc_init[i].kept ? gmu_set_or_kept : gmu_set)(gmu_rscc_init[i].name, gmu_rscc_init[i].reg,
++		    gmu_rscc_init[i].val) && ok;
+ 	}
+ 	for (unsigned i = 0; i < 5; ++i) {
+ 		ok = gmu_set("RSCC SEQ_MEM", REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + i, gmu_rscc_seq[i]) && ok;
