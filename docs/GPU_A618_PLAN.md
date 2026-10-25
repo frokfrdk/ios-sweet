@@ -1406,10 +1406,10 @@ Read-only SMCs, the first SIP calls ours has made:
 ✅ Pass when every SMC returns x0 0 with x1 1, the file checks hold, and the copies compare equal. A
 `PAS_IS_SUPPORTED` of 0 stops the stage. We would then need a different plan, not a fallback.
 
-*(G5a hit exactly that stop: `PAS_IS_SUPPORTED(13)` = 0. See "5.0 revised" just below, which is proposed and
-not yet approved.)*
+*(G5a hit exactly that stop: `PAS_IS_SUPPORTED(13)` = 0. "5.0 revised" just below replaces this rule; patch
+0110.)*
 
-#### 5.0 revised after G5a (proposed, not approved; would be patch 0110)
+#### 5.0 revised after G5a (approved; patch 0110)
 
 **What the stock sunfish kernel does** (android-msm-sunfish-4.14, read for hardware facts only, no code copied):
 - The DT (`sdmmagpie-gpu.dtsi`) has `pil_gpu: qcom,kgsl-hyp` with compatible `qcom,pil-tz-generic`, `qcom,pas-id =
@@ -1738,6 +1738,14 @@ owner's OK, found:
 - There is no hyp_assign for the zap.
 - Stock votes crypto-core bus bandwidth before INIT_IMAGE and AUTH_AND_RESET.
 
-That gives "5.0 revised" (in Stage 5 above; proposed, not approved): `PAS_IS_SUPPORTED` becomes log only, with
-PAS 1/4/9/18 as a baseline. Next, with the owner's OK: write patch 0110 for it, then CI, then pack G5a2
-(`sweetzap=0`).
+That gives "5.0 revised" (in Stage 5 above): `PAS_IS_SUPPORTED` becomes log only, with PAS 1/4/9/18 as a
+baseline. The owner approved it.
+
+Patch 0110 (commit 5b29b1f) changes only `zap_survey` in `sweet_zap.c`:
+- `IS_CALL_AVAIL` must give 1 for cmds 1, 2 and 5; cmd 7 is logged only.
+- `PAS_IS_SUPPORTED` is asked for 13, 1, 4, 9 and 18. Each answer is logged as "PAS n reads ...", and the SMC must
+  still return x0 0.
+- The `sup` term is gone from the pass rule.
+
+The local clang check was clean, and the series 0094–0110 applies on 0093. CI run 40197408369 passed in 9m01s (artifact `xnu-kernel`). Nothing
+is packed or booted. Next, with the owner's OK: pack G5a2 (`sweetzap=0`, otherwise as G5a).
