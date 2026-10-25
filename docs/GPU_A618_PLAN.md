@@ -752,6 +752,17 @@ runs all of 2B, then:
   and the GPU sends no traffic yet, so the first real walk is stage 4's first CP fetch.
 - Test image: G3l = 0106 kernel, `sweetgpu=5 sweetgmu=6`, only with the owner's OK.
 
+**Result on G3l (2026-10-25 19:38): Stage 3 PASSED.**
+- Log flush #135, 5158 lines, no panic. Survey: IAS 36, OAS 36 bits. 2B done at 2B.6 as on G3k.
+- Table at 0x102579000 (GPU-GMU-MEM +0x89000); 0x80000000..0x1ffffffff mapped 1:1 in 1 GiB blocks.
+- Stream 0 → SMR2 0x80000000 (stuck), S2CR 0x00000000 (translate, bank 0). Bank 0 read back:
+  SCTLR 0x00001027, TCR 0x0080201c (T0SZ 28), TCR2 0x00038011, TTBR0 0x0000000102579000. sCR0 unchanged 0x00200626.
+  So the hypervisor lets EL1 program bank 0 and a stream-0 SMR, as it did for bank 4 (observation).
+- Bank 0 FSR 0x400 (FORMAT only), sGFSR 0; RBBM_STATUS 0x1, RBBM_STATUS3 0 (not stalled).
+- 30 s monitor: bank 0 and bank 4 clean, GMU alive (0xbabeface).
+- Not tested, as planned: an actual walk (ATOS off, no GPU traffic). Stage 4's first CP fetch is that test.
+- Next: Stage 4 (CP first light: SQE load, hardware init list, ring, CP_ME_INIT). New patch only with the owner's OK.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
