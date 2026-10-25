@@ -683,6 +683,21 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
   request, not here (guess). Phone booted to the UI as before; no visible change.
 - Next: 2B.5 (`sweetgmu=5`), HFI init with the GMU (same kernel).
 
+**Result on G3i (2026-10-25 18:29, same 0104 kernel, `sweetgmu=5`): HFI up, but the INIT ack was skipped.**
+- 2B.1–2B.4 as on G3h (cx_gmu 200001 kHz, gx_gfx3d 9600 kHz).
+- BW table addresses from cmd-db: MC0 0x50000, SH0 0x5003c, ACV 0x5000c, CN0 0x500a8 (as planned).
+- **HFI start: HFI_CTRL_STATUS 0x1 (up), HFI_VERSION_INFO 0** (major 0, so HFI v1 as expected).
+- INIT sent with header 0x00100500 (id 0, 5 dwords, type 0, seq 1). The GMU consumed it (command queue read 5 =
+  write 5) and posted one message: **header 0x0002047e = id 126 (F2H ACK), 4 dwords, type 2**. Our matcher requires
+  word 1 to equal our whole header, so it logged "skipped message 0x0002047e" and timed out ("NO ACK in 100 ms").
+  Type and size passed, so word 1 differed from 0x00100500 (observation); the log does not show word 1 or the error
+  word, so how it differs is unknown.
+- Mainline `a6xx_hfi_wait_for_ack` matches an ack by id 126 (HFI_F2H_MSG_ACK) and the **sequence number** (bits 31:20)
+  of word 1 only. Guess: this firmware rewrites another field of the returned header.
+- Nothing after INIT was sent. GMU and GX left on. Phone booted to the UI as before.
+- Next (proposal, patch 0105): match acks the mainline way (id 126 + seqnum of word 1), and log every word of each
+  ack and each skipped message, so the returned header and error code are visible.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
