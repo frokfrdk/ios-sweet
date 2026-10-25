@@ -739,6 +739,19 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
 - Stage 2 pass rule met: the always-on counter advances, RBBM_STATUS reads, no SMMU fault, phone stable.
 - Next: Stage 3 (the GPU's own SMMU context bank, stream 0). It needs a new patch, written only with the owner's OK.
 
+**Stage 3 built (patch 0106, owner approved, commit 721eab3, CI 40178628271 passed).** `sweetgpu=5` with `sweetgmu=6`
+runs all of 2B, then:
+- One level-1 table (4 KiB) in GPU-GMU-MEM at +0x89000, just past the GMU's part, so mkboot is unchanged.
+- 1 GiB blocks map 0x80000000..0x1_ffff_ffff 1:1 (attr 0 normal non-cacheable, read/write, AF, nG).
+- SMMU bank 0 (kgsl's GPU bank) for stream 0, mask 0, through `sweet_smmu_attach` with a 36-bit input range
+  (T0SZ 28; IDR2 says IAS 36). The GMU keeps its 32-bit bank 4. Every write is read back as in 2B.1.
+- Then the bank's fault registers, RBBM_STATUS3 bit 24 (stalled on an SMMU fault), and both banks every 10 s for 30 s.
+- Differences from the plan above: no "all streams" SMR (stream 0 only, as planned), no separate global register dump
+  (2B.0's survey already logs them), and the 8–16 GB GPU VA window is left for stage 4.
+- Pass: every register reads back, no fault on bank 0 or bank 4, RBBM_STATUS3 not stalled, phone stable. ATOS is off
+  and the GPU sends no traffic yet, so the first real walk is stage 4's first CP fetch.
+- Test image: G3l = 0106 kernel, `sweetgpu=5 sweetgmu=6`, only with the owner's OK.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
