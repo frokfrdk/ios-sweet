@@ -667,6 +667,22 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
 - Open questions (guesses): whether the four ignored boot registers matter (cache configs reading 0 may mean they
   are write-only or locked like the RSCC addresses). Next: 2B.4 (`sweetgmu=4`), the GX rail vote through the GMU.
 
+**Result on G3h (2026-10-25 18:16, same 0104 kernel, `sweetgmu=4`): 2B.4 PASSED; the GX side is powered.**
+- 2B.1–2B.3 as on G3g (0xBABEFACE after 43 us, same four non-fatal boot-register mismatches).
+- Perf table from cmd-db (gfx.lvl 0x30050, mx.lvl 0x30010, cx.lvl 0x30000): all eight GPU votes and the GMU's
+  two match the expected table exactly (perf 1 = 180 MHz, vote 0x00400202).
+- Mailbox BOOT_SLUMBER_OPTION 0, GX_VOTE_IDX 2, MX_VOTE_IDX 2 read back.
+- **OOB boot_slumber acked** (GMU2HOST_INTR_INFO 0x40000000). SPTPRAC status 0x28 (bit 3 on); it read 0x28 right
+  before our SPTPRAC write too, so the GMU had already switched it on during boot_slumber (observation).
+- **GX GDSC on:** gx_gdscr 0x00222001 → 0xf8222000, gx_domain 0x003c0000. No SMMU fault.
+- Clocks (0099 counter, trusted: cx_gmu 199999 kHz): **gx_gfx3d runs at 9600 kHz**, cx_gfx3d 9600 kHz, gx_cxo 19200 kHz,
+  gx_gmu 0. gfx3d RCG cmd/cfg 0x2/0x0 and GPU PLL0 mode 0x01000005 with L = 0: the gfx3d clock is still on its
+  boot source (XO/2), not the GPU PLL. That answers 2A's open question: the GX branch needs the GX rail, which only
+  the GMU vote provides.
+- Pass rule met (OOB acked, SPTPRAC bit 3, GX GDSC on, gx_gfx3d counts). 180 MHz is expected after 2B.6's DCVS
+  request, not here (guess). Phone booted to the UI as before; no visible change.
+- Next: 2B.5 (`sweetgmu=5`), HFI init with the GMU (same kernel).
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
