@@ -1271,7 +1271,7 @@ Fixes found on G4a or G4b are new patches and CI runs, shown before anything boo
 Stage 4 leaves these for later: memory writes and leaving secure mode (Stage 5), CP_PROTECT, interrupts,
 indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
 
-### Stage 5: zap shader and leaving secure mode (patch 0109; G5a stopped at 5.0: PAS 13 not supported)
+### Stage 5: zap shader and leaving secure mode (passed on G5c, patches 0109–0110)
 
 Planned 2026-10-25, after G4c passed Stage 4. The owner asked to see this plan before any code.
 
@@ -1803,4 +1803,27 @@ G5c is packed from out-0110:
 - The blob addresses are the same as before.
 - The 828xr ADT and all firmware are in the payload.
 
-Not booted. Next, with the owner's OK: boot G5c.
+**G5c result (booted 2026-10-26 09:48, `sweetzap=6`): STAGE 5 PASSED ("stage 5 done at 5.6").** Seen in the log:
+- **5.0–5.3** passed again:
+  - The 5.1 secure-mode write landed again.
+  - INIT_IMAGE returned 0 after 2 INTERRUPTED resumes, in 16.3 ms.
+  - MEM_SETUP returned 0 in 257 µs.
+  - The B02 load had 0 mismatches.
+  - AUTH_AND_RESET returned 0 in 1.61 ms.
+- **5.4:** `CP_SET_SECURE_MODE 0` did **not** hang. The marker 0x5ee75004 landed, RPTR = WPTR = 2069, and
+  HW_FAULT, PROTECT_STATUS and INT_0_STATUS stayed 0. SMMU bank 0/4 FSR stayed 0x400, as always.
+- **5.5:**
+  - Word 0 = 0xc0ffee01, idle after 10 µs.
+  - One submission of 17 writes (word 1023 = 0xc0ffee02, words 16–31) was idle after 10 µs.
+  - The CPU compared the whole page: 0 of 1024 words differ.
+- **5.6:**
+  - At 10/20/30 s, word 2 = 0xc0ff2001/2/3 and the markers 0x5ee75601/2/3 landed.
+  - Each check found 0 of 1024 words differ, RBBM_STATUS 0x1, no fault, and the GMU steady.
+  - RPTR = WPTR = 2159 at the end.
+- The phone kept running after the hold: userspace went on launching daemons. No panic.
+
+So the GPU now runs outside secure mode with the zap loaded, and its CP writes to DRAM through SMMU bank 0 are
+CPU-visible. Stages 0–5 are done.
+
+Not known: whether anything differs between secure and non-secure writes, since both landed. Next (to plan, with
+the owner's OK): Stage 6.
