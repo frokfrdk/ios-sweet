@@ -697,6 +697,10 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
 - Nothing after INIT was sent. GMU and GX left on. Phone booted to the UI as before.
 - Next (proposal, patch 0105): match acks the mainline way (id 126 + seqnum of word 1), and log every word of each
   ack and each skipped message, so the returned header and error code are visible.
+- Patch 0105 (owner approved): acks matched by id 126 + seqnum (bits 31:20 of word 1); every dword of an ack or a
+  skipped message is logged, plus "ack returns header X (sent Y)" when word 1 differs. Commit 2703ca8,
+  CI 40175446607 passed. Next image: G3j (0105 kernel,
+  `sweetgmu=5`), booted only with the owner's OK.
 
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
