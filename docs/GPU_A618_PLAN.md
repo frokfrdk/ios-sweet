@@ -1399,5 +1399,10 @@ registers and CP_PROTECT 0, SECVID_TRUST_CNTL 1, GBIF_HALT 0, GBIF_HALT_ACK 0x3)
 RBBM_GBIF_HALT (0x16) reads 0xdeafbead before and after writing 0, as do 0x17 and RBBM_NC_MODE_CNTL (0x534).
 No SMMU or CP fault; the SQE was never started. Guess, not proven: those registers do not exist on a618.
 Patch 0108 (commit 2e6dacd, CI 40183251805 passed) makes that row logged only; GBIF_HALT stays required.
-Next, each with the owner's OK: pack G4a from 0108 (same boot-args) and boot it, then G4b and G4c. Leave the
-phone on about 4 minutes: stage 4 starts about 2.5 minutes after boot.
+Leave the phone on about 4 minutes: stage 4 starts about 2.5 minutes after boot.
+
+Result on G4d (0108, `sweetcp=2`): stage 4 done at 4.2. Every required 4.1 row read back. Logged rows that
+differ: RBBM_GBIF_HALT and RBBM_NC_MODE_CNTL (0xdeafbead), RBBM_PERFCTR_GPU_BUSY_MASKED (0x002f7fff),
+UCHE_GMEM_RANGE_MAX_LO (0x0017f000: the low 12 bits are not kept), CP_ROQ_THRESHOLDS_2 (0) and UCHE_CLIENT_PF
+(0x1). 4.2's SQE and ring registers all read back, RPTR 0, RBBM_STATUS 0x1, no CP or SMMU fault. GBIF_HALT_ACK
+still reads 0x3. Next, with the owner's OK: G4b (0108, `sweetcp=4`), the SQE start and ME_INIT.
