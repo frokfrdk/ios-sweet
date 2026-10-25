@@ -1748,4 +1748,9 @@ Patch 0110 (commit 5b29b1f) changes only `zap_survey` in `sweet_zap.c`:
 - The `sup` term is gone from the pass rule.
 
 The local clang check was clean, and the series 0094–0110 applies on 0093. CI run 40197408369 passed in 9m01s (artifact `xnu-kernel`). Nothing
-is packed or booted. Next, with the owner's OK: pack G5a2 (`sweetzap=0`, otherwise as G5a).
+is booted. G5a2 is packed from out-0110:
+- The boot-args are identical to G5a's.
+- The blob addresses are the same as G5a's.
+- The 828xr ADT and all firmware are in the payload.
+
+Next, with the owner's OK: boot G5a2.
