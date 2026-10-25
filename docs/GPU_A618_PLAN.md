@@ -1390,7 +1390,7 @@ stage sections above.
 
 Stage 4 (CP first light) is now planned in detail ("Stage 4" above): survey, the init list, SQE and ring
 registers, SQE start, ME_INIT, register markers with a ring-wrap test, and a 30 s hold, under `sweetgpu=6
-sweetcp=N`. Nothing of it is built. With the owner's go-ahead:
-1. Write patch 0107 (`sweet_cp.c`, the bump allocator in `sweet_gmu.c`, the `sweetgpu=6` hook). Show it,
-   push it and run CI.
+sweetcp=N`. Patch 0107 builds it (`sweet_cp.c`, the bump allocator in `sweet_gmu.c`, the `sweetgpu=6`
+hook; commit 5f906bf, CI 40181166244 passed, artifact `xnu-kernel`). Not booted. With the owner's go-ahead:
+1. Download the 0107 kernel to `xnu/out-0107` and pack G4a, G4b and G4c (828xr ADT). Show the details.
 2. Boot G4a (`sweetcp=2`: the writes, CP not started) first. G4b and G4c follow, each with its own OK.
