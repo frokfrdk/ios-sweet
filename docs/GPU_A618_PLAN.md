@@ -1391,6 +1391,13 @@ stage sections above.
 Stage 4 (CP first light) is now planned in detail ("Stage 4" above): survey, the init list, SQE and ring
 registers, SQE start, ME_INIT, register markers with a ring-wrap test, and a 30 s hold, under `sweetgpu=6
 sweetcp=N`. Patch 0107 builds it (`sweet_cp.c`, the bump allocator in `sweet_gmu.c`, the `sweetgpu=6`
-hook; commit 5f906bf, CI 40181166244 passed, artifact `xnu-kernel`). Not booted. With the owner's go-ahead:
-1. Download the 0107 kernel to `xnu/out-0107` and pack G4a, G4b and G4c (828xr ADT). Show the details.
-2. Boot G4a (`sweetcp=2`: the writes, CP not started) first. G4b and G4c follow, each with its own OK.
+hook; commit 5f906bf, CI 40181166244 passed, artifact `xnu-kernel`).
+
+Result on G4a (0107, `sweetcp=2`, second boot; the first was switched off before stage 3): 2B and stage 3
+passed again, 4.0 passed (SQE at 0x10257e000, ring 0x102586000, tripwire 0x10258a000, all read back; CP
+registers and CP_PROTECT 0, SECVID_TRUST_CNTL 1, GBIF_HALT 0, GBIF_HALT_ACK 0x3). 4.1 stopped at its second row:
+RBBM_GBIF_HALT (0x16) reads 0xdeafbead before and after writing 0, as do 0x17 and RBBM_NC_MODE_CNTL (0x534).
+No SMMU or CP fault; the SQE was never started. Guess, not proven: those registers do not exist on a618.
+Patch 0108 (commit 2e6dacd, CI 40183251805 passed) makes that row logged only; GBIF_HALT stays required.
+Next, each with the owner's OK: pack G4a from 0108 (same boot-args) and boot it, then G4b and G4c. Leave the
+phone on about 4 minutes: stage 4 starts about 2.5 minutes after boot.
