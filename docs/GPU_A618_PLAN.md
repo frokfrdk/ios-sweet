@@ -641,6 +641,18 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
 - Next (proposal): write them as kgsl does, but treat a kept firmware value as expected (log it, do not stop);
   every other RSCC value must still read back.
 
+**Result on G3f (2026-10-25 17:09, patch 0103, `sweetgmu=3`): RSCC passed; 2B.2 stopped at the PDC, phone fine.**
+- 2B.1 as on G3e. RSCC: the three HIDDEN_TCS_CMDn_ADDR logged "kept" (same preset values); everything else read back.
+- PDC: sequencer words, TCS1/TCS3 enable (0x7), every CMD ADDR (0x30010 mx, 0x30000 cx, 0x30090 xo) and DATA
+  (TCS1 1/0/0, TCS3 2/2/3) read back; ENABLE_PDC reads 0x80000001.
+- **The six CMD MSGID writes (0x10108) read back 0x10100**: bits 16 (write) and 8 (response required) stuck, the low
+  byte (8, the length field in the RPMh TCS msgid layout) reads 0. Before 2B.2 these registers read 0.
+- The stop rule stopped 2B after the PDC block, so **the PDC was left enabled** with TCS1/TCS3 loaded; the GMU stays in
+  reset, so nothing triggers it (guess). Phone booted to the UI as before.
+- Guess: the PDC does not implement (or does not return) the msgid length bits; kgsl writes 0x10108 and never reads
+  back. Next (proposal): for the six MSGID writes only, accept a readback that differs from the written value only in
+  bits 7:0 (log it); every other PDC value must still read back.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
