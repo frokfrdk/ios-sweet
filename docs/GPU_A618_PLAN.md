@@ -583,6 +583,22 @@ It answers these questions:
 
 ✅ Pass when every read returns without a fault and the tables are in the log.
 
+**Result on G3a (2026-10-25, kernel 0100, `sweetgpu=4 sweetgmu=0`): PASSED.** All reads returned, no panic,
+the phone stayed usable, and the log ran ~2900 lines past "stage 2B done at 2B.0". Observed:
+- **SMMU:** IDR0 0x48016605, IDR1 0x20008005, IDR2 0x00007511, sCR0 0x00200626, sGFSR 0. So: **5** stream-match
+  groups (not 8 banks as planned), 3 SID bits, **5** context banks of 4 KiB from +0x8000, OAS 36 bits, stage 1
+  and 4K tables supported. The SMMU is **on** (CLIENTPD 0) and unmatched streams fault (USFCFG 1).
+- **All 5 SMRs are free and every S2CR is "fault"; all 5 banks are zero.** Nothing (bootloader, hypervisor,
+  TrustZone) left a GPU context, so 2B.1's attach will take bank 4 and SMR 0. CB0 stays free for Stage 3.
+- **GMU:** CM3 in reset (SYSRESET 1), FW_INIT_RESULT 0, HFI all zero, CM3_CFG 0x52, RPMH_POWER_STATE 0xf,
+  SPTPRAC 0xd4. The TCMs hold non-zero words (ITCM 2060a47b…, DTCM 98aef028…), so they are not cleared at reset.
+- **RSCC:** PDC_SLAVE_ID 1, PDC_SEQ_START 0x4520, MATCH_LO/HI 0x4510/0x4514: already the values 2B.2 writes.
+  HIDDEN_TCS_CMD0/1/2_ADDR read 0x82204514/0x82204510/0x82204520 with DATA 0 (2B.2 writes them to 0, as both
+  kernels do; whether these are reset values is a guess). SEQ_MEM_0..4 and SEQ_BUSY are 0.
+- **PDC: EL1 reads work** (risk 2 is gone). ENABLE_PDC 0, SEQ_START 0, seq words 0, TCS0–3 all zero: not
+  programmed.
+- **gmu-mem:** pa 0x1024f0000, 1 MiB, all zero; the layout needs 0x89000.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
