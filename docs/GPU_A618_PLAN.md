@@ -1048,7 +1048,7 @@ G3b and G3c may need fixes in between. Those are new patches and CI runs, shown 
 
 ✅ Pass when the readback matches and no fault is latched.
 
-### Stage 4: CP first light (detailed plan, nothing built yet)
+### Stage 4: CP first light (passed on G4c, patches 0107–0108)
 
 Planned 2026-10-25, after G3l passed Stage 3. The owner asked to see this plan before any code.
 
@@ -1271,18 +1271,238 @@ Fixes found on G4a or G4b are new patches and CI runs, shown before anything boo
 Stage 4 leaves these for later: memory writes and leaving secure mode (Stage 5), CP_PROTECT, interrupts,
 indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
 
-### Stage 5: zap shader (leave secure mode)
+### Stage 5: zap shader and leaving secure mode (detailed plan, nothing built yet)
 
-1. First a harmless SCM query: `PAS_IS_SUPPORTED(13)` over SMCCC SIP (svc 2, cmd 7).
-2. `PAS_INIT_IMAGE(13, metadata)`. The metadata is the `.mdt` header plus program headers plus the hash
-   segment, in one physically contiguous page.
-3. `PAS_MEM_SETUP(13, 0x97715000, 0x2000)`.
-4. Copy the LOAD segment (`.b02`, paddr 0x5000 relocated to the carve-out). Then `PAS_AUTH_AND_RESET(13)`.
-   Retry on INTERRUPTED (1) and EBUSY (-12), as their 0130 does.
-5. Ring: `CP_SET_SECURE_MODE 0`, then `CP_MEM_WRITE 0xc0ffee01`.
-6. Because of the `secvid-set-once` quirk, **never** write `RBBM_SECVID_TRUST_CNTL` ourselves.
+Planned 2026-10-25, after G4c passed Stage 4. The owner asked to see this plan before any code.
 
-✅ Pass when the marker lands in DRAM. That is the GPU's first visible write.
+**Idea.** Do what mainline's a6xx `hw_init` does right after `CP_ME_INIT`: have TrustZone load and
+authenticate the zap shader (PAS id 13), then send `CP_SET_SECURE_MODE 0` on the ring. Then test the GPU's
+first writes to DRAM with `CP_MEM_WRITE` to the scratch page. Stage 4 left the CP running in secure mode,
+where (by their 0130 finding) the ring writes nothing to normal memory. This is the first stage that calls
+TrustZone for something other than PSCI.
+
+**Sources, read in this session:**
+- Mainline Linux 6.18.54 (the WSL kernel tree): `firmware/qcom/qcom_scm.c` (`qcom_scm_pas_init_image`,
+  `_mem_setup`, `_auth_and_reset`, `_pas_supported`, `__qcom_scm_is_call_available`, `__get_convention`),
+  `qcom_scm-smc.c` (`__scm_smc_call`, the INTERRUPTED, EBUSY and WAITQ loops), `qcom_scm.h` (ids, error
+  codes, `QCOM_SCM_ARGS`), `soc/qcom/mdt_loader.c` (`qcom_mdt_read_metadata`, `qcom_mdt_pas_init`,
+  `__qcom_mdt_load`), `drm/msm/adreno/adreno_gpu.c` (`zap_shader_load_mdt`) and `a6xx_gpu.c`
+  (`a6xx_zap_shader_init` and the zap block of `hw_init`), and `adreno_pm4.xml` (opcodes).
+- The firmware files, parsed in WSL (below).
+- Our PSCI `smc #0` helper from patch 0065, which already works on this phone (`CPU_ON`, 8 cores).
+
+**What mainline does:**
+1. `qcom_mdt_pas_init`: build the metadata (ELF header segment plus hash segment), copy it into a
+   physically contiguous, 4 KiB aligned, **non-cacheable** buffer ("to avoid XPU violations"), then call
+   `PAS_INIT_IMAGE(13, pa)`. If any loadable segment has the relocatable flag (bit 27), also call
+   `PAS_MEM_SETUP(13, carve-out pa, align_4k(max p_paddr + p_memsz) - min p_paddr)`.
+2. `__qcom_mdt_load`: copy each loadable segment to `carve-out + (p_paddr - min p_paddr)` through a
+   write-combined mapping, zero-fill `p_memsz - p_filesz`.
+3. `PAS_AUTH_AND_RESET(13)`. `-EOPNOTSUPP` means "no zap on this target"; we do not take that path.
+4. On the ring: `CP_SET_SECURE_MODE` with payload 0, flush, and `a6xx_idle`. With no zap (`-ENODEV`) mainline
+   writes `RBBM_SECVID_TRUST_CNTL = 0` instead. Our `secvid-set-once` quirk forbids that, and this
+   plan never does it.
+5. The zap is loaded once per boot (`static bool loaded`). Later power-ups skip it. Power collapse is Stage 9.
+
+**The SCM calls** (SMCCC, SIP owner, 64-bit, from `qcom_scm.h`). The function id is
+`type << 31 | 1 << 30 | 2 << 24 | svc << 8 | cmd`. Mainline uses fast calls (type 1) for the atomic
+convention probe and standard calls (type 0) for the rest. x1 = arginfo
+(`nargs | type_i << (4 + 2i)`, VAL 0, RO 1, RW 2), x2..x5 = args. The results come back in x0 (status) and
+x1 (`result[0]`).
+
+| Call | x0 (function id) | x1 arginfo | x2.. | Wanted result |
+|---|---|---|---|---|
+| convention probe = `IS_CALL_AVAIL` (svc 6, cmd 1), fast | 0xc2000601 | 0x1 | 0x02000601 | x0 0, x1 1 |
+| `IS_CALL_AVAIL` for PIL cmds 1, 2, 5, 7 | 0x42000601 | 0x1 | 0x02000201 / 202 / 205 / 207 | x0 0, x1 1 each |
+| `PAS_IS_SUPPORTED` (svc 2, cmd 7) | 0x42000207 | 0x1 | 13 | x0 0, x1 1 |
+| `PAS_INIT_IMAGE` (cmd 1) | 0x42000201 | 0x82 (VAL, RW) | 13, metadata pa | x0 0, x1 0 |
+| `PAS_MEM_SETUP` (cmd 2) | 0x42000202 | 0x3 | 13, 0x97715000, 0x1000 | x0 0, x1 0 |
+| `PAS_AUTH_AND_RESET` (cmd 5) | 0x42000205 | 0x1 | 13 | x0 0, x1 0 |
+
+Never called: `PAS_SHUTDOWN` (cmd 6) and `SET_REMOTE_STATE`. A half-done PAS session is cleared by the
+reboot that ends every test boot.
+
+How x0 is handled, as in `qcom_scm-smc.c`:
+- **1, INTERRUPTED:** call again with x0 = 1, the same x1–x5, and the x6 the call returned (Qualcomm's
+  "A6 quirk": x6 carries the session). Up to 1000 times.
+- **-12, EBUSY:** sleep 30 ms and repeat the original call, up to 20 times (mainline's numbers).
+- **2, WAITQ_SLEEP:** needs the wait-queue service, which we do not implement. Log it and stop.
+- **-1 / -2 / -3 / -4 / -5:** ERROR / EINVAL_ARG / EINVAL_ADDR / EOPNOTSUPP / ENOMEM. Log the name and stop.
+- x0–x7 are logged for every call, together with the retry counts and the time taken.
+
+The SMC is issued from the GPU thread with interrupts on (as for PSCI). The helper is a new
+`sweet_scm_call()` modelled on our 0065 PSCI helper: x0–x7 in, x0–x3 and x6 out, x8–x17 clobbered.
+
+**The firmware** (parsed in WSL from `~/ios-pixel/gpu-fw/fw/`):
+- `a615_zap.mdt` is ELF32 (class 1, machine 164 = QDSP6 header convention), 6860 B, entry 0x5000,
+  3 program headers:
+
+| # | p_type | p_offset | p_paddr | p_filesz | p_memsz | p_flags | Meaning |
+|---|---|---|---|---|---|---|---|
+| 0 | NULL | 0 | 0 | 0x94 | 0 | 0x07000000 | the ELF header segment (MDT type 7) |
+| 1 | NULL | 0x1000 | 0x6000 | 0x1a38 | 0x2000 | 0x02200000 | hash segment (MDT type 2) |
+| 2 | LOAD | 0x3000 | 0x5000 | 0x7c0 | 0x7c0 | 0x08000007 | the code; **relocatable** (bit 27) |
+
+- So the metadata is 0x94 + 0x1a38 = 6860 B. Because the hash follows the header in the file, the
+  metadata is **the whole `.mdt` file**, which is exactly our `GPU-ZAP-MDT` blob. `.b00` and `.b01` are its
+  two halves (checked byte for byte).
+- The `GPU-ZAP-B02` blob (1984 B = 0x7c0) is segment 2.
+- min p_paddr = 0x5000. max = align_4k(0x5000 + 0x7c0) = 0x6000. **`MEM_SETUP` size = 0x1000**: the
+  old draft's 0x2000 was the carve-out size, not mainline's formula. Segment 2 goes to carve-out offset 0.
+- The carve-out 0x97715000 (0x2000, from the Pixel DT) lies below XNU's RAM (0x1_0000_0000+ in
+  high-memory mode), so XNU never allocates it. It is inside Stage 3's identity map.
+
+**What we already have from Stages 2B–4:** OOB_GPU held, the SQE running and idle after ME_INIT and 4.5's
+markers, `cp_emit` / `cp_kick` / `cp_wait_idle` / `cp_marker` / `cp_dump` / `cp_clean`, and the scratch page
+filled with 0x5ee7dead. Both blobs have been in every image since 0094.
+
+**Boot-args:**
+- `sweetgpu=7` selects Stage 5. It needs `sweetgmu=6`, and Stage 4 must pass in the same boot with
+  `sweetcp=5` or more, because the zap comes after ME_INIT as in mainline. The test images use `sweetcp=5`,
+  which skips 4.6's 30 s hold. `sweetgpu=6` stays exactly as on G4c.
+- The new `sweetzap=N` (0–6, default 0) stops after step 5.N.
+
+**New code (patch 0109):**
+- `sweet_zap.c` (new, about 350 lines): `sweet_scm_call()` with the retry rules, the MDT checks, steps
+  5.0–5.6, and the "SCM log" line per call.
+- `sweet_cp.c`: export the ring helpers (`emit`, `kick`, `wait_idle`, `marker`, `dump`, `clean`, `halt`) and
+  the scratch page va/pa through `sweet_gpu_internal.h`. Nothing in stage 4's behaviour changes.
+- `sweet_gpu.c`: parse `sweetzap`; after `sweet_cp_run()` succeeds with `gpu_level >= 7`, call
+  `sweet_zap_run(gpu_zap_stop, MDT blob, B02 blob)`. The "stages above N not built" message moves to
+  `gpu_level > 7`.
+- No `mkboot.sh` change: both zap blobs are already in the image, and the metadata copy fits in GPU-GMU-MEM.
+
+**Memory** (GPU-GMU-MEM offsets after Stage 4's areas; PAs as on G4c, where the tripwire/scratch page was
+0x10258a000):
+
+| Offset | Size | PA on G4c layout | Use |
+|---|---|---|---|
+| (stage 4) | 4 KiB | 0x10258a000 | scratch page: 0x5ee7dead, now the `CP_MEM_WRITE` target |
+| next | 8 KiB | 0x10258b000 | metadata copy (6860 B, rest zero): contiguous, 4 KiB aligned, mapped non-cacheable like mainline's `dma_alloc_coherent` buffer |
+| carve-out | 4 KiB used of 8 | 0x97715000 | segment 2, written through a device mapping (`ml_io_map`) |
+
+After `PAS_INIT_IMAGE` the CPU never touches the metadata copy again. After `PAS_AUTH_AND_RESET` it never
+touches the carve-out again, because TrustZone locks both with the XPU, and a CPU access would abort.
+
+**Register writes in Stage 5:** none by the CPU except the doorbell `CP_RB_WPTR`, and `CP_SQE_CNTL = 0`
+when a step fails after 5.1. Everything else goes through TrustZone or the ring. **Never** written:
+`RBBM_SECVID_TRUST_CNTL`. It is also never *read* after 5.3 (see risk 5).
+
+**The "zap dump"** = stage 4's CP dump, the bank 0 FSR, CP_HW_FAULT, CP_PROTECT_STATUS and words 0–3 and
+1023 of the scratch page. It is logged after every step and on any stop.
+
+#### 5.0 Survey: SCM queries and the files (`sweetzap=0`)
+
+Read-only SMCs, the first SIP calls ours has made:
+1. The convention probe, then `IS_CALL_AVAIL` for PIL cmds 1, 2, 5 and 7, then `PAS_IS_SUPPORTED(13)`.
+2. Check the MDT blob: ELF magic, class 1, e_phnum 3, the three headers as in the table above, segment 0
+   filesz + hash filesz == blob length. Compute min/max/relocate the way `qcom_mdt_pas_init` does, and
+   log the `MEM_SETUP` size it gives (want 0x1000).
+3. Check the B02 blob: length == segment 2's p_filesz (0x7c0), and p_memsz ≤ 0x2000 (fits the carve-out).
+4. Log RBBM_SECVID_TRUST_CNTL (G4 read 0x1) for the last time.
+5. Map the carve-out and read its first and last words (it should be ordinary memory: a reboot resets the
+   XPU). Allocate the metadata area, copy the MDT, read it back.
+
+✅ Pass when every SMC returns x0 0 with x1 1, the file checks hold, and the copies compare equal. A
+`PAS_IS_SUPPORTED` of 0 stops the stage. We would then need a different plan, not a fallback.
+
+#### 5.1 Secure-mode baseline (`sweetzap=1`)
+
+While the GPU is still in secure mode, put one `CP_MEM_WRITE` on the ring: header `0x703d8003` (PKT7 opcode
+0x3d, count 3), scratch page pa low, high, value `0xc0ffee00` to word 0. Then a register marker
+(0x5ee75001). Wait idle (1 s).
+
+✅ Pass when the CP goes idle, RPTR = WPTR, the marker lands, and no fault is latched. Word 0 is **logged
+either way**: 0x5ee7dead confirms their finding (writes are dropped in secure mode), and 0xc0ffee00 means
+it does not apply here. Either answer is useful, and only a hang or a fault stops the stage. The test shows
+that 5.5's marker can tell the two states apart.
+
+#### 5.2 `PAS_INIT_IMAGE` and `PAS_MEM_SETUP` (`sweetzap=2`)
+
+1. `dsb sy`, then `PAS_INIT_IMAGE(13, metadata pa)`. TrustZone checks the signature on the hash segment
+   here.
+2. `PAS_MEM_SETUP(13, 0x97715000, 0x1000)`, only if 5.0 found the relocatable flag (it did).
+
+✅ Pass when both return x0 0 and x1 0. On EINVAL_ADDR from INIT_IMAGE, the likely cause is risk 1.
+
+#### 5.3 Load and `PAS_AUTH_AND_RESET` (`sweetzap=3`)
+
+1. Copy B02 into the carve-out at offset 0 as 496 32-bit words (device memory: no unaligned access, no
+   cache). Read every word back. Leave the rest of the page as it was (p_memsz = p_filesz, so there is no
+   zero-fill). `dsb sy`.
+2. `PAS_AUTH_AND_RESET(13)`. Log the time taken.
+3. Zap dump.
+
+✅ Pass when the readback matches, AUTH returns x0 0 and x1 0, and nothing new is latched in the CP or
+SMMU. The GPU is still in secure mode at this point.
+
+#### 5.4 Leave secure mode (`sweetzap=4`)
+
+Ring: `0x70e60001` (PKT7 `CP_SET_SECURE_MODE` 0x66, count 1), `0x00000000`, then a register marker
+(0x5ee75004). Kick, then wait idle, 1 s (mainline's `a6xx_idle`).
+
+✅ Pass when the CP is idle with RPTR = WPTR, the marker lands, and CP_HW_FAULT, CP_PROTECT_STATUS and
+bank 0's FSR stay 0. Mainline's comment says this packet hangs the CP without a zap, so a hang here
+points at 5.3 even if AUTH returned 0.
+
+#### 5.5 First GPU writes to DRAM (`sweetzap=5`)
+
+1. `CP_MEM_WRITE 0xc0ffee01` to word 0 of the scratch page. Wait idle, `dsb sy`, read the word from the CPU
+   (the mapping is non-cacheable, so no invalidate is needed).
+2. Then in one submission: `0xc0ffee02` to word 1023 (the end of the page) and 16 writes of
+   `0xc0ff1000 + i` to words 16–31.
+3. Compare the whole page: the written words hold their values, and every other word is still 0x5ee7dead
+   (word 0 may hold 5.1's value only if 5.1 found writes allowed).
+
+✅ Pass when every write lands, nothing else in the page changed, and no fault is latched. **This is the
+GPU's first visible write to DRAM**, and it is what fences and Stage 6 build on.
+
+#### 5.6 Hold (`sweetzap=6`, the whole of Stage 5)
+
+For 30 s, every 10 s: `CP_MEM_WRITE 0xc0ff2000 + n` to word 2 and a register marker, then the zap dump, the
+GX GDSC and the GMU state. Afterwards leave the SQE running and idle, outside secure mode, with OOB_GPU held.
+
+✅ Pass (Stage 5 as a whole) when every write and marker lands, nothing is latched, RBBM_STATUS is idle
+between them, and the phone stays stable.
+
+#### Test boots
+
+One kernel (0109) and three images. All use `sweetgpu=7 sweetgmu=6 sweetcp=5` and the 828xr ADT, and
+differ only in `sweetzap`. `shim/out` has no G5* names yet. Each boot needs the owner's OK. Leave the phone
+on about 5 minutes.
+
+| Image | `sweetzap` | Beyond G4c | Purpose |
+|---|---|---|---|
+| G5a | 0 | read-only SMC queries, file checks, metadata copy | TrustZone answers, and supports PAS 13 |
+| G5b | 3 | the secure baseline, INIT_IMAGE, MEM_SETUP, the load, AUTH_AND_RESET | TrustZone accepts our zap |
+| G5c | 6 | `CP_SET_SECURE_MODE 0`, the DRAM writes, the hold | Stage 5 complete |
+
+Fixes found on G5a or G5b are new patches and CI runs, shown before anything boots.
+
+#### Risks for Stage 5, most uncertain first
+
+1. **TrustZone refuses the metadata buffer.** Ours is above 4 GiB (0x1_0258_b000 on the G4c layout).
+   Mainline's coherent buffer is usually below 4 GiB, and some TrustZone builds may want a 32-bit address.
+   EINVAL_ADDR (-3) or an XPU error would say so. The fix would be a buffer below 4 GiB, outside XNU's RAM.
+   Which range to use is the owner's decision, because Android-era carve-outs live there.
+2. **The hypervisor filters SIP calls from our EL1.** PSCI passes through. The PIL calls should too, since
+   Android's kgsl makes the same ones. An SMC that never returns stalls one core (G0H: iOS keeps running,
+   and the log survives).
+3. **Signature or anti-rollback failure in INIT_IMAGE / AUTH_AND_RESET.** The files come from the sunfish
+   factory image's `vendor.img`, so the key is right. Nothing confirms that build matches the phone's
+   TrustZone version, and an older zap could be refused for rollback. The x0/x1 codes are logged.
+4. **CP_SET_SECURE_MODE hangs** even though AUTH passed. Dump, halt the SQE, and stop. The zap normally runs
+   from the carve-out, so the first suspect is the load offset (MEM_SETUP base vs p_paddr).
+5. **A read of a locked GPU register aborts.** After the zap, `RBBM_SECVID_TRUST_CNTL` may be protected, and
+   `CP_AHB_CNTL = 1` (4.1) makes bad AHB accesses return an error, which can become a CPU abort. So 0xf400
+   is not read after 5.3.
+6. **The 5.1 baseline hangs or faults the CP.** That is unlikely, given their finding that the write is
+   just dropped. If it happens, 5.1 becomes optional in a follow-up patch, and G5b is re-run without it.
+7. **WAITQ_SLEEP (2) from TrustZone.** Newer firmware uses it, and this 2019 firmware probably does not. We
+   stop rather than implement it.
+
+Stage 5 leaves these for later: CP_PROTECT, interrupts, indirect buffers, `CACHE_FLUSH_TS` fences (Stage 6),
+and reloading the zap after power collapse (Stage 9).
 
 ### Stage 6: kernel GPU service and user client
 
@@ -1377,7 +1597,8 @@ indirect buffers and fences (Stage 6), HWCG and power collapse (Stage 9).
    SMMU, RSCC/PDC, the firmware start and HFI at once; its own risk list is at the end of Stage 2B.
 2. **The hypervisor and the GPU SMMU.** Trapped global registers, or stage-2 holes. This now comes up in
    2B.1, before Stage 3.
-3. **TrustZone PAS for the zap on Pixel firmware.** It may need GPU clocks on, or the metadata in specific memory.
+3. **TrustZone PAS for the zap on Pixel firmware.** It may need the metadata in specific memory (below 4 GiB);
+   see Stage 5's risk list.
 4. **sweetgl's a5xx assumptions on a6xx.** Pitch rules, params, nogmem/nofp16 workarounds.
 5. **Licence** of the sweetgl code (section 5).
 6. **Build cost.** Mesa on GitHub macOS runners; mitigated by caching.
@@ -1416,4 +1637,9 @@ Result on G4c (0108, `sweetcp=6`): **stage 4 passed.** 4.5: the first marker lan
 RPTR 11), then all 80 batches of 64 (each idle within 10 us), two ring wraps, last value 0x5ee723ff, RPTR = WPTR
 2059. The ring past ME_INIT was still zero beforehand and the tripwire page was unchanged after. 4.6: markers
 0x5ee72001..3 at 10, 20 and 30 s, RBBM_STATUS 0x1, CP_HW_FAULT and CP_PROTECT_STATUS 0, no SMMU fault, GMU
-and GX GDSC steady. Next, with the owner's OK: plan stage 5 (zap shader) in detail.
+and GX GDSC steady.
+
+Stage 5 (zap shader, leaving secure mode, first DRAM writes) is now planned in detail ("Stage 5" above):
+read-only SCM queries, a secure-mode baseline write, PAS INIT_IMAGE / MEM_SETUP (size 0x1000) / load /
+AUTH_AND_RESET, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` to the scratch page, and a 30 s hold, under `sweetgpu=7
+sweetcp=5 sweetzap=N`, images G5a/G5b/G5c. Nothing is built. Next, with the owner's OK: patch 0109.
