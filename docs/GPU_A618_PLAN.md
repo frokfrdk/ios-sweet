@@ -616,6 +616,17 @@ one SMR per SID with mask 0, plus a probe that writes an SMR without the valid b
 "every SMR write is dropped" from "this value is refused". If SMRs cannot be written at all, the fallback is to
 reuse whatever the hypervisor allows (to be investigated from the downstream arm-smmu driver).
 
+**Result on G3d (2026-10-25 16:23, patch 0101, `sweetgmu=3`): the attach worked; a false fault check stopped 2B.**
+- SMR0 = 0x80000004 and SMR1 = 0x80000005 (valid, mask 0) both **read back as written**; S2CR0/1 = 0x4 (bank 4).
+  So masked SMRs are refused but single-ID ones are accepted (observed); the probe did not run.
+- Bank 4 read back SCTLR 0x1027, TCR 0x802020, TCR2 0x38011, TTBR0 0x00040001024f0000; sCR0 unchanged.
+- The fault check after attach saw sGFSR 0 and **bank 4 FSR 0x00000400**, and 2B stopped. That value is FSR.FORMAT
+  (bits 10:9 = 0b10, AArch64 descriptor format), a read-only field, not a fault: `sweet_smmu_faults` returns the
+  raw FSR instead of masking the fault bits (TF..UUT bits 1–8, SS bit 30, MULTI bit 31, mask 0xc00001fe). Bug in 0100.
+- The stop path left the attach in place (SMRs valid, bank 4 enabled); GMU still in reset, so nothing uses it.
+  No RSCC, PDC, TCM or CM3 writes happened. Phone booted to the UI as before.
+- Next: mask the FSR fault bits in `sweet_smmu_faults` (patch 0102), then repeat with `sweetgmu=3`.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
