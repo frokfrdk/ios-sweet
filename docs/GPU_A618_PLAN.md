@@ -1769,3 +1769,9 @@ is booted. G5a2 is packed from out-0110:
 Open risk for 5.2: the metadata pa is above 4 GiB. Stock sets no 32-bit mask, but nothing proves TZ accepts it. If it
 does not, INIT_IMAGE should fail with an error (for example -3 EINVAL_ADDR) rather than hang (guess). Next, with the
 owner's OK: pack G5b (`sweetzap=3`: 5.1 baseline, 5.2 INIT_IMAGE + MEM_SETUP, 5.3 load + AUTH_AND_RESET).
+G5b is packed from out-0110:
+- Its boot-args differ from G5a2's only in `sweetzap=3`.
+- The blob addresses are the same as G5a2's.
+- The 828xr ADT and all firmware are in the payload.
+
+Not booted. Next, with the owner's OK: boot G5b.
