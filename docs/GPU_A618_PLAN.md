@@ -1405,4 +1405,10 @@ Result on G4d (0108, `sweetcp=2`): stage 4 done at 4.2. Every required 4.1 row r
 differ: RBBM_GBIF_HALT and RBBM_NC_MODE_CNTL (0xdeafbead), RBBM_PERFCTR_GPU_BUSY_MASKED (0x002f7fff),
 UCHE_GMEM_RANGE_MAX_LO (0x0017f000: the low 12 bits are not kept), CP_ROQ_THRESHOLDS_2 (0) and UCHE_CLIENT_PF
 (0x1). 4.2's SQE and ring registers all read back, RPTR 0, RBBM_STATUS 0x1, no CP or SMMU fault. GBIF_HALT_ACK
-still reads 0x3. Next, with the owner's OK: G4b (0108, `sweetcp=4`), the SQE start and ME_INIT.
+still reads 0x3.
+
+Result on G4b (0108, `sweetcp=4`): stage 4 done at 4.4, the CP runs. 4.3: with CP_SQE_CNTL=1 on the empty
+ring, RPTR stays 0 and the GPU idle at 1 ms, 100 ms and 1 s, CP_HW_FAULT and CP_PROTECT_STATUS 0, and no fault on
+SMMU bank 0 or 4, so the SQE's microcode fetch through bank 0 worked. 4.4: ME_INIT was consumed, RPTR 9 and idle
+after 10 us, no fault. The SQE stays running. Next, with the owner's OK: G4c (0108, `sweetcp=6`): markers, ring
+wrap and the 30 s hold.
