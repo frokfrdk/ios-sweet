@@ -1753,4 +1753,19 @@ is booted. G5a2 is packed from out-0110:
 - The blob addresses are the same as G5a's.
 - The 828xr ADT and all firmware are in the payload.
 
-Next, with the owner's OK: boot G5a2.
+**G5a2 result (booted once, `sweetzap=0`): revised 5.0 PASSED ("stage 5 done at 5.0").** Seen in the log:
+- Stages 0–4 passed again (4 done at 4.5). The scratch page was untouched: 0 of 1024 words differed.
+- The probe and `IS_CALL_AVAIL` for PIL cmds 1, 2, 5 and 7 all gave x0 0, x1 1.
+- `PAS_IS_SUPPORTED` gave x0 0 and x1 0 for **every** id asked: 13, 1, 4, 9 and 18. 13 took 188 µs; the others
+  took 30–37 µs. Those other subsystems certainly run on this phone, so this call means nothing on this TZ.
+  G5a's stop was a false alarm.
+- `SECVID_TRUST_CNTL` read 0x1. The MDT and B02 checks were the same as G5a's.
+- The carve-out at 0x97715000 mapped and read without a fault. The first and last words are both 0xafafafaf, a fill
+  pattern (presumably left by the bootloader or TZ; not known).
+- The metadata copy went to pa 0x10258f000, as guessed. All 6860 bytes were copied, the first word is 0x464c457f
+  (ELF magic), and 0 words differed.
+- SMMU bank 0 FSR stayed 0x400, the same as on every earlier boot. No panic.
+
+Open risk for 5.2: the metadata pa is above 4 GiB. Stock sets no 32-bit mask, but nothing proves TZ accepts it. If it
+does not, INIT_IMAGE should fail with an error (for example -3 EINVAL_ADDR) rather than hang (guess). Next, with the
+owner's OK: pack G5b (`sweetzap=3`: 5.1 baseline, 5.2 INIT_IMAGE + MEM_SETUP, 5.3 load + AUTH_AND_RESET).
