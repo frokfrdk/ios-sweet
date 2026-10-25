@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -468,6 +468,26 @@
+ 	return got == val;
+ }
+ 
++/*
++ * gmu_pdc_set for a TCS CMD MSGID: on G3f 0x10108 read back 0x10100 (the length byte reads 0;
++ * kgsl writes it and never reads it back). A readback that differs only in bits 7:0 is accepted.
++ */
++static bool
++gmu_pdc_set_msgid(vm_offset_t base, uint32_t reg, uint32_t val)
++{
++	gpu_wr(base, reg * 4u, val);
++	uint32_t got = gpu_rd(base, reg * 4u);
++	if (got != val && (got & ~0xffu) == (val & ~0xffu)) {
++		printf("SWEET GMU:   PDC [0x%04x] reads 0x%08x, wrote 0x%08x: msgid length byte differs, accepted\n",
++		    reg, got, val);
++		return true;
++	}
++	if (got != val) {
++		printf("SWEET GMU:   PDC [0x%04x] reads 0x%08x, wrote 0x%08x: MISMATCH\n", reg, got, val);
++	}
++	return got == val;
++}
++
+ bool
+ sweet_gmu_rpmh(void)
+ {
+@@ -506,7 +526,7 @@
+ 		ok = gmu_pdc_set(gm_pdc_cfg, b, 0) && ok;
+ 		for (unsigned c = 0; c < 3; ++c) {
+ 			uint32_t r = b + PDC_TCS_CMD(c);
+-			ok = gmu_pdc_set(gm_pdc_cfg, r, PDC_MSGID) && ok;
++			ok = gmu_pdc_set_msgid(gm_pdc_cfg, r, PDC_MSGID) && ok;
+ 			ok = gmu_pdc_set(gm_pdc_cfg, r + 1u, addr[c]) && ok;
+ 			ok = gmu_pdc_set(gm_pdc_cfg, r + 2u, gmu_pdc_data[t][c]) && ok;
+ 		}
