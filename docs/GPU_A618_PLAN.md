@@ -599,6 +599,23 @@ the phone stayed usable, and the log ran ~2900 lines past "stage 2B done at 2B.0
   programmed.
 - **gmu-mem:** pa 0x1024f0000, 1 MiB, all zero; the layout needs 0x89000.
 
+**Result on G3b (2026-10-25 15:06, `sweetgmu=3`): stopped at 2B.1, phone fine.** The 0100 code did:
+- uncached mapping of `gmu-mem` and the page tables for all six regions: OK (6 tables, exactly as sized);
+- bank 4 (CBA2R, CBAR, TCR2, TCR, MAIR0, TTBR0, SCTLR): every register read back as written;
+- S2CR0 = 0x4 (translate, bank 4): read back as written;
+- **SMR0 = 0x80010004 (valid, id 4, mask 1): read back 0x00000000.** Attach undone; nothing after 2B.1 ran
+  (no RSCC, PDC, TCM or CM3 writes).
+- In the undo, S2CR0 was written back to 0x000200ff (fault) but **still read 0x4**.
+
+What this suggests (guesses until tested): a writable S2CR whose "fault" write is ignored is the Qualcomm
+hypervisor behaviour mainline Linux works around in `arm-smmu-qcom.c` (on some firmware, S2CR writes of type
+fault are ignored). So the stream-mapping registers are probably hypervisor-emulated here, and the dropped SMR
+is the emulation refusing our value. The stock DT gives the GMU two single stream IDs (`gmu_user` SID 4,
+`gmu_kernel` SID 5, `#iommu-cells = <1>`, so mask 0); kgsl never writes a masked SMR. Next try (patch 0101):
+one SMR per SID with mask 0, plus a probe that writes an SMR without the valid bit and reads it back, to tell
+"every SMR write is dropped" from "this value is refused". If SMRs cannot be written at all, the fallback is to
+reuse whatever the hypervisor allows (to be investigated from the downstream arm-smmu driver).
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
