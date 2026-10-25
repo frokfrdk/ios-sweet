@@ -3,7 +3,8 @@
 Status, 2026-10-25: **Stages 0 and 1 passed on the phone (kernel 0096, image G1b). Stage 2A ran on G2, G2b
 and G2m (patches 0097–0099): the rail votes, PLL0 and the GX GDSC work, and the GMU sees GX powered. The
 GCC counter shows the GPU core clock (gx_gfx3d) does not run at all, so no GX register has been read.
-Per the 2A decision rule, the next path is 2B (the GMU powers GX).** Nothing is flashed: every test is a
+Per the 2A decision rule, the next path is 2B (the GMU powers GX). 2B is planned in detail in "Stage 2B"
+below and waits for the owner's go-ahead; nothing of it is built.** Nothing is flashed: every test is a
 `fastboot boot` image. The firmware is extracted. The hardware facts
 come from the stock DTB and the downstream sunfish kernel. ios-sailfish's GPU work has been read. Every
 stage below ends in a test you can see on the phone, and nothing advances until that test passes.
@@ -92,7 +93,7 @@ User space (`tools/sweetgl/`):
 | File | Size / layout |
 |---|---|
 | `a630_sqe.fw` | 32136 B; dword 0 = 0, then the version |
-| `a618_gmu.bin` | 32768 B, raw Cortex-M3 image with a vector table; fits the 32 KiB ITCM |
+| `a618_gmu.bin` | 32768 B, raw Cortex-M3 image: 16 KiB code for ITCM (vector table first), then 16 KiB of DTCM data (corrected in Stage 2B) |
 | `a615_zap.mdt` (+ `.b00/.b01/.b02`) | 3 program headers: NULL, NULL (hash, vaddr 0x6000), LOAD (paddr 0x5000, filesz 0x7c0) |
 
 **DTB** (`~/ios-pixel/factory/stock/sunfish-base.dts`):
@@ -491,27 +492,371 @@ Supporting facts from downstream:
 2A ends here, per its decision rule: gx_gfx3d never ran. The next path is 2B. A last cheap 2A try would be
 turning on crc_ahb and the ACD clocks, but nothing in downstream does that, so it is a guess.
 
-**2B: the real GMU path (fallback; it is what mainline Linux does for a618).**
+### Stage 2B: the GMU powers GX (detailed plan, nothing built yet)
 
-1. Load `a618_gmu.bin` into ITCM (legacy raw image; at most 0x8000 bytes).
-2. Program the GMU RSCC and the PDC sequences. The TCS command addresses come from cmd-db (Stage 0.4).
-3. Map the GMU's fixed-VA memory (HFI queues, logs) in the GPU SMMU for SIDs 4/5 (Stage 3).
-4. Release CM3 reset and wait for `0xbabeface`.
-5. HFI v1 with the `hfi-use-reg` handshake: INIT, FW_VERSION, PERF_TABLE (gfx/cx ARC votes from cmd-db),
-   BW_TABLE (a618's BCM table), TEST.
-6. Send `OOB_GPU_SET`. The GMU then powers GX.
+Planned 2026-10-25, after 2A hit its decision rule. The owner asked to see this plan before any building.
 
-This path costs more code and has more unknowns per boot, but it is proven on this exact GPU.
+**Idea.** On this GPU the GMU firmware owns GX power and the GPU core clock. 2B runs Qualcomm's own
+`a618_gmu.bin` the way the sunfish kernel's kgsl does: give it memory, load it, start it, then ask it for
+GX through its mailbox registers and HFI messages. An OOB ("out of band") request is one of those mailbox
+bits: the host sets a request bit and the GMU answers with an ack bit.
 
-✅ Pass when the always-on counter advances and `RBBM_STATUS` reads idle.
+**Sources, read in this session:**
+- The sunfish downstream kgsl: android.googlesource.com `kernel/msm`, branch
+  `android-msm-sunfish-4.14-android13-qpr3`, `drivers/gpu/msm/`: `adreno_a6xx_gmu.c`, `kgsl_gmu.c/h`,
+  `kgsl_hfi.c/h`, `kgsl_gmu_core.h`, `a6xx_reg.h`, `adreno.h`, `adreno-gpulist.h`.
+- Mainline Linux as a cross-check: `kernel/common` android-mainline, `drm/msm/adreno/a6xx_gmu.c` and
+  `a6xx_hfi.c`.
+- The ARM SMMUv2 architecture spec for the SMMU registers.
+- Our cmd-db dump (Stage 0) and the stock DTB.
+
+Both kernels are GPL-2.0. We take register offsets, values and order from them, which are hardware facts,
+and write our own code (§5).
+
+**What downstream does for a618:**
+- kgsl puts a618 in its "a615 family" (`adreno_is_a615_family`: A615, A616, A618). That family uses the
+  legacy GMU interface:
+  - The firmware is a raw image written straight into the GMU's TCMs, with no header.
+  - An OOB request sets bit `req+16` and waits for bit `req+24`.
+  - HFI is version 1, with 4 queues at the legacy indices.
+- The a618 entry in gpulist: features 64BIT, RPMH, PREEMPTION, GPMU, CONTENT_PROTECTION, IFPC,
+  IOCOHERENT. Firmware `a618_gmu.bin`, expected GMU firmware version 1.8.
+- The DT quirk `qcom,gpu-quirk-hfi-use-reg` changes two things. The GX rail comes up through mailbox
+  registers and an OOB before HFI starts. And the last HFI message is TEST.
+- The cold-boot order (`a6xx_gmu_fw_start`):
+  1. TCM retention, then the RSCC/PDC microcode (first boot only).
+  2. The firmware into the TCMs, then the boot registers and the power config.
+  3. CM3 out of reset; wait for 0xBABEFACE.
+  4. GX rail on (OOB), SPTPRAC on, HFI init, the HFI messages.
+  5. Later, OOB_GPU.
+- Mainline does the same for a618, with two differences:
+  - It does an RSCC "start" handshake before every firmware start, cold boots included. Downstream does
+    it only on warm boots.
+  - It sends a fixed one-level "off" bandwidth table for a618; its comment says the 618 GMU does no bus
+    scaling.
+
+**Firmware layout (checked in this session).** The 32 KiB image has two halves:
+- The first 16 KiB is Cortex-M3 code. Its vector table gives SP 0x00043F80 and reset 0x9.
+- The second 16 KiB is initial DTCM data: 204 non-zero bytes, all below +0x664.
+
+In the host window, ITCM (dword 0x1B400, 16 KiB) is directly followed by DTCM (0x1C400, 16 KiB). One
+32 KiB write from ITCM_START therefore fills both, and both kernels load it that way. §4's "fits the
+32 KiB ITCM" was wrong and is corrected there. The first DTCM word is 0x10110000. With kgsl's version
+macros that reads as 1.17, but whether it is a version word is a guess until FW_VER answers.
+
+**Boot-args:**
+- `sweetgpu=4` selects 2B.
+  - Stage 1 runs unchanged: CX clocks, CX GDSC, GMU clock at 200 MHz.
+  - None of the 2A writes happen: no apps-DRV `mx.lvl`/`gfx.lvl` vote, no host GX GDSC, no host gfx3d RCG.
+- The new `sweetgmu=N` (0–6) stops after step 2B.N. One kernel can then go exactly as far as the owner
+  approves, and each further step needs only new boot-args.
+
+**New code (patch 0100):**
+- `sweet_gmu.c`: RSCC/PDC, firmware load, CM3 start, OOB, HFI. About 700 lines.
+- `sweet_smmu.c`: the GPU SMMU survey, one context bank and its page tables. About 300 lines. Stage 3
+  reuses it for the GPU's own context.
+- `sweet_gpu.c`: the `sweetgpu=4` flow and the GX checks, reusing 0099's frequency counter.
+- `mkboot.sh`: with GPUFW=1, it also adds a 1 MiB zero blob `gmu-mem` through `mkpayload.py --blob`. The
+  blob holds no vendor data.
+
+#### 2B.0 Read-only survey (`sweetgmu=0`)
+
+Nothing is written beyond stage 1. Every value goes to the log.
+- **GPU SMMU** at 0x5040000 (needs the CX GDSC and `gcc_gpu_memnoc_gfx`, both on after stage 1):
+  - global: IDR0/1/2/7, sCR0, sACR, sGFSR, every SMR and S2CR;
+  - per bank (8 banks): CBAR/CBA2R, then SCTLR, TCR, TTBR0, MAIR0, FSR.
+- **RSCC** (GMU block +0x23000): RSC_STATUS0, PDC_SLAVE_ID, HIDDEN_TCS_CMD0..2, the PDC start and match
+  registers, SEQ_BUSY, SEQ_MEM_0..4; also GMU_RSCC_CONTROL_REQ/ACK.
+- **PDC**: in the cfg block (0xb290000), TCS0–TCS3, ENABLE_PDC and SEQ_START_ADDR; in the seq block
+  (0xb490000), words 0–4.
+- **GMU**: CM3_SYSRESET, FW_INIT_RESULT, BOOT_CONFIG, HFI_CTRL_STATUS, HFI_VERSION_INFO,
+  GMU2HOST_INTR_INFO/MASK, AO_HOST_INTERRUPT_STATUS, RPMH_POWER_STATE, SPTPRAC_PWR_CLK_STATUS, GBIF_HALT,
+  and the first ITCM and DTCM words.
+- **The `gmu-mem` blob**: its PA, and a check that it reads zero.
+
+It answers these questions:
+- Is the SMMU on (sCR0.CLIENTPD)?
+- Which stream-match groups and banks are in use? kgsl's `qcom,gpu-offset = <0x48000>` says the GPU
+  itself uses bank 0, and TrustZone may hold a bank for the secure stream 2.
+- Did the bootloader leave RSCC/PDC programmed?
+- Can EL1 read the PDC at all?
+
+✅ Pass when every read returns without a fault and the tables are in the log.
+
+#### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
+
+The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
+kgsl maps all GMU memory through stream 5. The DT's kgsl SMMU node has no `qcom,skip-init`, so the stock
+Android kernel programs this SMMU itself, from EL1 (an inference from the DT).
+
+**Memory.** The 1 MiB `gmu-mem` blob, page-aligned in kernel RAM like the firmware blobs.
+- It is cleaned and invalidated once through the kernel's cacheable mapping.
+- From then on it is used only through an uncached `ml_io_map_wcomb` mapping, with 32-bit stores.
+- Cache maintenance alone would not be safe: the GMU writes HFI indices into the same cache lines as ours.
+
+GMU addresses, from downstream's `gmu_vma` table and allocation order:
+
+| GMU VA | Size | Use |
+|---|---|---|
+| 0x00000000 | 16 KiB | ITCM, inside the GMU, not mapped |
+| 0x00004000 | 240 KiB | ICACHE backing |
+| 0x00040000 | 16 KiB | DTCM, inside the GMU, not mapped |
+| 0x00044000 | 240 KiB | DCACHE backing |
+| 0x60000000 | 4 KiB | dummy page; downstream allocates it first, on purpose |
+| 0x60100000 | 20 KiB | HFI queue table and 4 queues |
+| 0x60200000 | 16 KiB | dump buffer (INIT's `dbg_buffer`) |
+| 0x60300000 | 4 KiB | log (`PWR_COL_CP_MSG`) |
+
+Each uncached region starts on its own 1 MiB, as downstream allocates them. With 24 KiB of page tables this
+uses about 550 KiB of the blob.
+
+**SMMU programming**, in this order. Register names are from the SMMUv2 spec. Context banks start at
++0x8000, 4 KiB each; kgsl's `gpu-offset` (bank 0 at 0x5048000) confirms that layout.
+1. Pick a free bank (not bank 0) and a free stream-match group, from 2B.0.
+2. Set up the bank:
+   - SCTLR = 0 first.
+   - CBA2R: AArch64 format. CBAR: stage 1 with stage 2 bypass.
+   - TCR: 4 KiB granule, 32-bit input range (T0SZ 32, walks start at level 1, the 3-level tables the DT
+     asks for), non-cacheable walks, TTBR1 walks off. Output size from IDR2.
+   - MAIR0 attribute 0 = Normal non-cacheable. TTBR0 = the level-1 table.
+   - TLBIALL and TLBSYNC.
+   - Then SCTLR: translation on, fault reporting on, faults terminate.
+3. Stream match: SMR = valid, ID 4, mask 1, so it matches 4 and 5. S2CR = translate to that bank.
+4. Only if 2B.0 found the SMMU off: clear CLIENTPD. Unmatched streams keep bypassing, as now.
+5. Global TLB invalidate and sync.
+6. Read back every register written. Any mismatch stops 2B and undoes step 3.
+
+**Page tables.**
+- 1 level-1 table and 2 level-2 tables (0–1 GiB, 1–2 GiB).
+- 3 level-3 tables: 0x0–0x1FFFFF, 0x60000000–0x601FFFFF, 0x60200000–0x603FFFFF.
+- Leaf entries: access flag set, read/write at any privilege, attribute 0.
+
+**Not written:** `attach-impl-defs`, the 12 Qualcomm tuning registers in the DT. Mainline does not write
+them either; they are the fallback if the GMU later shows SMMU errors.
+
+ATOS is disabled on this SMMU, so the CPU cannot test a translation. The real test is in 2B.3: the bank's
+FSR must stay 0 while the firmware starts.
+
+✅ Pass when every write reads back, and sGFSR and the bank's FSR are 0.
+
+#### 2B.2 RSCC and PDC microcode (`sweetgmu=2`)
+
+This is downstream's `_load_gmu_rpmh_ucode`, run once per boot, after GMU_GENERAL_7 (0x1F9CC) = 1 (TCM
+retention), which downstream writes first. The RSCC sequences and the PDC TCS commands run only when the
+GMU collapses or wakes the GPU power domain. We keep the GPU active, so they should not run during the
+test. They are written anyway, because the firmware expects them.
+
+RSCC (dword offsets from 0x5000000; the block starts at 0x23400):
+
+| Register | Offset | Value |
+|---|---|---|
+| RSC_STATUS0_DRV0 | 0x23404 | 0x01000000 (bit 24: SDE clock gating off) |
+| PDC_SLAVE_ID_DRV0 | 0x2340B | 1 |
+| HIDDEN_TCS_CMD0 ADDR / DATA | 0x2340D / 0x2340E | 0 / 0 |
+| HIDDEN_TCS_CMD1 ADDR / DATA | 0x2340F / 0x23410 | 0 / 0 |
+| HIDDEN_TCS_CMD2 ADDR / DATA | 0x23411 / 0x23412 | 0 / 0x80000000 |
+| OVERRIDE_START_ADDR | 0x23500 | 0 |
+| PDC_SEQ_START_ADDR | 0x23408 | 0x4520 |
+| PDC_MATCH_VALUE_LO / HI | 0x23409 / 0x2340A | 0x4510 / 0x4514 |
+| SEQ_MEM_0..4_DRV0 | 0x23580.. | 0xA7A506A0 0xA1E6A6E7 0xA2E081E1 0xE9A982E2 0x0020E8A8 |
+
+PDC seq block (0xb490000), words 0–4: 0xFEBEA1E1 0xA5A4A3A2 0x8382A6E0 0xBCE3E284 0x002081FC.
+
+PDC cfg block (0xb290000, dword offsets): two TCS banks, each with 3 ARC commands (msgid 0x10108).
+- The command addresses come from cmd-db at run time. On this phone they are mx.lvl 0x30010, cx.lvl
+  0x30000 and xo.lvl 0x30090; mainline also uses 0x30090 for a618.
+- The data are hlvl indices into our cmd-db tables (§4).
+
+| Bank | CONTROL / ENABLE / WAIT | mx.lvl | cx.lvl | xo.lvl |
+|---|---|---|---|---|
+| TCS1 (0x1572) | 0 / 7 / 0 | 1 (vlvl 16) | 0 (off) | 0 (off) |
+| TCS3 (0x15D6) | 0 / 7 / 0 | 2 (vlvl 192) | 2 (vlvl 64; the a618 value) | 3 (vlvl 128) |
+
+Commands start at bank + 3 and are 4 dwords apart. Then PDC_GPU_SEQ_START_ADDR (0x1148) = 0 and
+PDC_GPU_ENABLE_PDC (0x1140) = 0x80000001. Every write is read back.
+
+These are votes from the GPU's own RSC. The AOP combines them with the other masters' votes, so a wrong
+GPU vote cannot pull MX or CX below what the rest of the SoC asks for.
+
+✅ Pass when every value reads back and the phone keeps running.
+
+#### 2B.3 Firmware in, CM3 start (`sweetgmu=3`)
+
+1. Fill the HFI queue table (layout in 2B.5). The boot registers point at it, so it must be ready before
+   the CM3 starts.
+2. Write the 8192 words of `a618_gmu.bin` from CM3_ITCM_START (0x1B400). Read them all back and compare
+   (FNV-1a of the read-back against the blob's).
+3. Boot registers:
+
+   | Register | Offset | Value |
+   |---|---|---|
+   | CM3_FW_INIT_RESULT | 0x1F81C | 0 |
+   | CM3_BOOT_CONFIG | 0x1F801 | 2 (TCM_BOOT) |
+   | HFI_QTBL_ADDR | 0x1F985 | 0x60100000 |
+   | HFI_QTBL_INFO | 0x1F984 | 1 |
+   | AHB_FENCE_RANGE_0 | 0x23B11 | 0x80A008A0 (downstream's mask) |
+   | CM3_CFG | 0x1F82D | 0x4052 |
+   | HFI_SFR_ADDR | 0x1F982 | 0x06018000 (chip id 0x06010800, repacked) |
+   | PWR_COL_CP_MSG | 0x1F900 | 0x60300000 (the log page; size field 0 = 1 page) |
+   | SYS_BUS_CONFIG, ICACHE_CONFIG, DCACHE_CONFIG | 0x1F40F, 0x1F400, 0x1F401 | 1 each |
+   | PWR_COL_INTER_FRAME_CTRL | 0x1F8C0 | 0x09C40400 |
+   | RPMH_CTRL | 0x1F8E8 | OR 0xF11 (interface, LLC, DDR, MX, CX and GFX votes on) |
+
+   Idle level "active": no IFPC, SPTP or NAP bits. The DT has `qcom,no-nap`, and the a618 has no SPTP_PC
+   feature. IFPC stays off for bring-up, so the GPU never collapses behind our back.
+4. CX_GMU_WFI_CONFIG (0x1F802) = 0. GBIF_HALT only if 2B.0 found it non-zero.
+5. CM3_SYSRESET (0x1F800) = 0. Poll CM3_FW_INIT_RESULT for 0xBABEFACE, for up to 100 ms.
+6. Log FW_INIT_RESULT, CM3_FW_BUSY, GMU2HOST_INTR_INFO, AO_HOST_INTERRUPT_STATUS, RPMH_POWER_STATE, the
+   bank's FSR/FAR/FSYNR0, sGFSR, and the first words of the dummy and log pages.
+
+On a timeout: CM3_SYSRESET = 1, log everything, stop.
+- If the bank shows a fault, its FAR names the GMU address that was missing.
+- If there is no fault and no 0xBABEFACE, the next try adds mainline's RSCC start handshake before step 5:
+  RSCC_CONTROL_REQ bit 1, wait for the ACK bit, wait for SEQ_BUSY 0, then REQ = 0.
+
+✅ Pass when 0xBABEFACE arrives within 100 ms and the bank's FSR is 0.
+
+#### 2B.4 GX rail through the GMU (`sweetgmu=4`)
+
+The perf table is computed at run time from the DT power levels, downstream's gfx3d voltage table and
+cmd-db, as `rpmh_arc_votes_init` does. The vote word is vlvl << 16 | mx index << 8 | gfx index.
+Expected values:
+
+| Index | GPU | Corner (vlvl) | gfx.lvl index (vlvl) | mx.lvl index (vlvl) | Vote |
+|---|---|---|---|---|---|
+| 0 | off | — | 0 | 0 | 0x00000000 |
+| 1 | 180 MHz | MIN_SVS 48 | 2 (64) | 2 (192) | 0x00400202 |
+| 2 | 267 MHz | LOW_SVS 64 | 2 (64) | 2 (192) | 0x00400202 |
+| 3 | 355 MHz | SVS 128 | 3 (128) | 2 (192) | 0x00800203 |
+| 4 | 430 MHz | SVS_L1 192 | 4 (192) | 2 (192) | 0x00C00204 |
+| 5 | 565 MHz | NOM 256 | 5 (256) | 3 (320) | 0x01000305 |
+| 6 | 650 MHz | NOM_L1 320 | 6 (320) | 3 (320) | 0x01400306 |
+| 7 | 700 MHz | TURBO 384 | 7 (384) | 4 (384) | 0x01800407 |
+
+- This is the bin-146 list reversed, with the DT's 0 Hz level 7 as index 0, the way kgsl builds it.
+- The GMU's own table: index 0 off, index 1 200 MHz. 200 MHz needs MIN_SVS, which gives cx.lvl index 2
+  (64) and mx index 2: vote 0x00400202.
+
+Then downstream's `a6xx_gmu_gfx_rail_on`, for the initial level 6 (180 MHz, perf index 1):
+1. Mailbox words in DTCM: BOOT_SLUMBER_OPTION (0x1CBF8) = 0, GX_VOTE_IDX (0x1CBF9) = 2,
+   MX_VOTE_IDX (0x1CBFA) = 2.
+2. OOB boot_slumber: HOST2GMU_INTR_SET (0x1F994) = bit 22. Poll GMU2HOST_INTR_INFO (0x1F992) for bit 30,
+   up to 100 ms. Then GMU2HOST_INTR_CLR (0x1F991) = bit 30.
+3. SPTPRAC: GX_SPTPRAC_POWER_CONTROL (0x1A881) = 0x00778000. Poll SPTPRAC_PWR_CLK_STATUS (0x1F8D0) for
+   bit 3, up to 10 ms.
+4. Reads only: the GX GDSC, GX_DOMAIN_MISC, the gfx3d RCG CMD/CFG, SPTPRAC status. Then measure
+   gx_gfx3d with 0099's counter. This answers the question 2A could not.
+
+✅ Pass when the OOB is acked, SPTPRAC bit 3 is set, the GX GDSC is on and gx_gfx3d counts. Any non-zero
+rate passes; 180 MHz is the expected one.
+
+#### 2B.5 HFI (`sweetgmu=5`)
+
+Queue table at GMU 0x60100000 (downstream's `hfi_init`):
+- Header: version 0, size 54 dwords, first queue header at dword 6, 12 dwords per header, 4 queues, all 4
+  active.
+- Queues of 4 KiB (1024 dwords) from +0xE0, the table size rounded up to 16 bytes:
+
+  | Header | Queue | GMU address | Index / priority (type word) | Status |
+  |---|---|---|---|---|
+  | 0 | command | 0x601000E0 | 0 / 10 (0x0A00) | on |
+  | 1 | message | 0x601010E0 | 4 / 10 (0x0A04) | on |
+  | 2 | debug | 0x601020E0 | 5 / 40 (0x2805) | on |
+  | 3 | DSP | 0x601030E0 | 1 / 20 (0x1401) | off |
+
+- The legacy indices 4, 5 and 1 apply to the a615 family. In every header: rx_wm 1, tx_wm 1, rx_req 1,
+  the rest 0.
+
+**Start.** HFI_CTRL_INIT (0x1F986) = 1. Poll HFI_CTRL_STATUS (0x1F980) bit 0, up to 100 ms. Log
+HFI_VERSION_INFO (0x1F981); its major (bits 31:28) should be below 2, which kgsl treats as HFI v1.
+
+**Sending a message:**
+1. Write it at the command queue's write index, wrapping at 1024. Update write_index, then a barrier.
+2. HOST2GMU_INTR_SET = 1.
+3. Poll GMU2HOST_INTR_INFO bit 0 (message queue), up to 100 ms. Both kernels poll this raw status
+   register, so the interrupt mask stays as found.
+4. Clear that bit, then read the message queue.
+
+The header word is id | dwords << 8 | type << 16 | sequence << 20. An ack has type 2. Its word 1 is our
+header (the sequence must match), and word 2 is the error code (0 is OK).
+
+**The messages:**
+1. INIT (id 0, 5 dwords): seg_id 0, dbg_buffer 0x60200000, size 0x4000, boot_state 1 (cold).
+2. FW_VER (id 1, 2 dwords): we support 1.8 (0x10080000). Word 3 of the reply is the firmware version.
+   Log it; the major must be 1 and the minor at least 8.
+3. PERF_TBL v1 (id 4, 43 dwords): 8 GPU levels and 2 GMU levels, the votes above, frequencies in kHz.
+4. BW_TBL (id 3, 160 dwords with the fixed array sizes): one "off" level, the shape mainline sends for
+   a618.
+   - DDR: 3 commands, to MC0 0x50000, SH0 0x5003c and ACV 0x5000c. Data 0x40000000 each, wait mask 1.
+   - CNOC: 1 command, to CN0. Data 0x40000000 (level 0) and 0x60000001 (level 1), wait mask 1.
+   - All addresses come from cmd-db by name. **Mainline's CNOC address 0x5007c is SN15 on this SoC; CN0
+     here is 0x500a8.** Values copied from sc7180 would be wrong.
+5. TEST (id 5, 2 dwords). It also tells the GMU that no more HFI messages follow.
+
+Because the a618 GMU does no bus scaling, the GPU's DDR bandwidth still rides on the CPU's and the
+display's DDR votes. If bandwidth becomes the limit, an apps-side BCM vote is Stage 9 work.
+
+✅ Pass when HFI_CTRL_STATUS bit 0 sets and all five messages are acked with error 0.
+
+#### 2B.6 OOB_GPU and the first GX reads (`sweetgmu=6`, the whole of 2B)
+
+1. OOB_GPU: HOST2GMU_INTR_SET = bit 16. Poll for bit 24, then clear it.
+2. Frequency through the registers (downstream's `a6xx_gmu_dcvs_nohfi`):
+   - DCVS_ACK_OPTION (0x1CBFC) = 0.
+   - DCVS_PERF_SETTING (0x1CBFD) = 0x30000001: perf index 1, option "at least".
+   - DCVS_BW_SETTING (0x1CBFE) = 0x000FF0FF: no change.
+   - OOB_DCVS: set bit 23, wait for bit 31. Read DCVS_RETURN (0x1CBFF), then clear bit 31.
+3. Measure gx_gfx3d again.
+4. The first GX reads, only if the GX GDSC is on and gx_gfx3d runs: RBBM_STATUS (0x210),
+   CP_ALWAYS_ON_COUNTER_LO/HI (0x980/0x981) twice, 1 ms apart, and RBBM_INT_0_STATUS (0x201).
+5. Leave the GMU running with OOB_GPU still set, so GX stays up. For one minute, log every 10 s:
+   FW_INIT_RESULT, AO_HOST_INTERRUPT_STATUS, RPMH_POWER_STATE, the GX GDSC and the bank's FSR.
+
+✅ Pass (Stage 2 as a whole) when the always-on counter advances, RBBM_STATUS reads, no SMMU fault is
+latched, and the phone stays stable.
+
+#### Test boots
+
+One kernel (0100) and three images that differ only in `sweetgmu`. Each boot needs the owner's OK, as
+before. Image names are checked against `shim/out` first (G2c was already taken).
+
+| Image | `sweetgmu` | Writes | Purpose |
+|---|---|---|---|
+| G3a | 0 | none beyond stage 1 | survey: SMMU, RSCC, PDC, GMU state |
+| G3b | 3 | SMMU, RSCC/PDC, the TCMs, CM3 start | the firmware boots |
+| G3c | 6 | also the OOBs, HFI and the GX reads | GX powered by the GMU |
+
+G3b and G3c may need fixes in between. Those are new patches and CI runs, shown before anything boots.
+
+#### Risks for 2B, most uncertain first
+
+1. **The hypervisor and the SMMU global registers.** Writes might be trapped or dropped. The stock kernel
+   programs this SMMU from EL1 on the same firmware, so it is probably allowed. The read-back in 2B.1
+   shows it.
+2. **PDC access from EL1.** The PDC is an always-on block. Downstream maps it from EL1, so reads probably
+   work. If not, the 2B.0 read faults and the test boot panics; the log survives.
+3. **The CM3 does not boot.** The likely causes, in order: a missing mapping (the bank's FSR/FAR names
+   it), the RSCC start handshake (mainline's order), a firmware version mismatch.
+4. **The boot_slumber ack never comes.** Either the GMU cannot vote gfx through its RSC (RSCC/PDC wrong),
+   or the vote index is wrong. RPMH_POWER_STATE and the AO interrupt status tell more.
+5. **HFI messages are rejected.** Most likely the bandwidth table. We copy mainline's a618 shape with this
+   SoC's cmd-db addresses.
+6. **A GMU left running.** It reaches only the memory we mapped, and its votes go through RPMh. The worst
+   case is extra power use or a reboot. The everyday H4 boot never sets `sweetgpu`.
+
+2B leaves these for later: the GPU's own SMMU context (stream 0, Stage 3), the SQE (Stage 4), interrupts
+(everything polls), and power collapse (IFPC and slumber, Stage 9).
 
 ### Stage 3: GPU SMMU
 
+- The SMMU code, the register survey and the first context bank (the GMU's, streams 4–5) come earlier,
+  in 2B.0–2B.1 (`sweet_smmu.c`). Stage 3 adds the GPU's own bank.
 - Same idea as their 0121:
   - CB0 stage-1 AArch64, 4K granule, T0SZ 28.
   - 1 GB identity blocks for 0x80000000–0x1_ffff_ffff.
   - MAIR normal non-cacheable.
-  - SMR0 matches all streams, S2CR0 → CB0.
+  - An SMR for stream 0 only, S2CR → CB0. **Not "all streams"** as in their 0121: streams 4–5 already
+    match the GMU's bank, and two matching SMRs would be a stream-match conflict.
   - Then TLBIALL, sync and read back.
 - Read IDR0/IDR1 first, and log every global register before and after.
 - Sunfish-specific risk: **the hypervisor may trap or refuse SMR/S2CR writes**, or stage 2 may block
@@ -641,8 +986,10 @@ while the GPU is still secure (their 0130 finding). Use `CP_SCRATCH` registers o
 
 ## 8. Risks, most uncertain first
 
-1. **GX power.** Whether the apps DRV may vote `gfx.lvl` (2A), versus the larger GMU/HFI/PDC job (2B).
-2. **The hypervisor and the GPU SMMU.** Trapped global registers, or stage-2 holes.
+1. **GX power through the GMU (2B).** 2A showed the host cannot start the GPU core clock. 2B adds the
+   SMMU, RSCC/PDC, the firmware start and HFI at once; its own risk list is at the end of Stage 2B.
+2. **The hypervisor and the GPU SMMU.** Trapped global registers, or stage-2 holes. This now comes up in
+   2B.1, before Stage 3.
 3. **TrustZone PAS for the zap on Pixel firmware.** It may need GPU clocks on, or the metadata in specific memory.
 4. **sweetgl's a5xx assumptions on a6xx.** Pitch rules, params, nogmem/nofp16 workarounds.
 5. **Licence** of the sweetgl code (section 5).
@@ -656,5 +1003,9 @@ stopped because the gfx3d RCG root stayed off with GX clamped. On G2b (patch 009
 the GMU saw GX powered, so the apps DRV can raise the GX rail. The gfx3d root still read off and SPTP did not
 come on. On G2m (patch 0099) the GCC counter confirmed the clocks around it run (cx_gmu and gx_gmu at
 200 MHz, gx_cxo at 19.2 MHz), but gx_gfx3d does not run at all, either from XO or after the 180 MHz update.
-2A has hit its decision rule. Next is planning 2B in detail: the GMU firmware in ITCM, RSCC/PDC, CM3 start,
-then HFI. It needs the owner's go-ahead.
+2A has hit its decision rule. 2B is now planned in detail ("Stage 2B" above): GMU memory and an SMMU bank
+for streams 4–5, RSCC/PDC, the firmware into the TCMs, CM3 start, the GX rail through the GMU, HFI v1,
+then OOB_GPU and the first GX reads. Nothing of it is built. With the owner's go-ahead:
+1. Write patch 0100 (`sweet_gmu.c`, `sweet_smmu.c`, the `sweetgpu=4` flow, the `gmu-mem` blob in
+   `mkboot.sh`). Show it, push it and run CI.
+2. Boot G3a (`sweetgmu=0`, read-only survey) first. G3b and G3c follow, each with its own OK.
