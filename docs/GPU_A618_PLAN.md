@@ -627,6 +627,20 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
   No RSCC, PDC, TCM or CM3 writes happened. Phone booted to the UI as before.
 - Next: mask the FSR fault bits in `sweet_smmu_faults` (patch 0102), then repeat with `sweetgmu=3`.
 
+**Result on G3e (2026-10-25 16:41, patch 0102, `sweetgmu=3`): 2B.1 passed; 2B.2 stopped at the RSCC, phone fine.**
+- 2B.1: same SMR/S2CR/bank values as G3d, FSR 0x400, no fault; attach accepted. GMU stays in reset.
+- 2B.2: GENERAL_7 = 1 (TCM retention), RSC_STATUS0 = 0x01000000, PDC_SLAVE_ID = 1, all three HIDDEN_TCS_CMDn_DATA
+  (CMD2_DATA now 0x80000000), OVERRIDE_START_ADDR, PDC_SEQ_START/MATCH_LO/MATCH_HI and SEQ_MEM 0..4 all read back
+  as written.
+- **HIDDEN_TCS_CMD0/1/2_ADDR: wrote 0, kept 0x82204514 / 0x82204510 / 0x82204520** (the values seen in the 2B.0
+  survey). The stop rule ("every RSCC value must read back") then stopped 2B before any PDC write.
+- Observation: the low halves of the preset addresses (0x4514, 0x4510, 0x4520) are the same values as
+  PDC_MATCH_VALUE_HI/LO and PDC_SEQ_START_ADDR. Guess: these three ADDR registers are set by boot firmware and
+  write-protected from EL1; mainline and downstream kgsl both write 0 to them and never read them back, so stock
+  Android probably runs with the preset values too.
+- Next (proposal): write them as kgsl does, but treat a kept firmware value as expected (log it, do not stop);
+  every other RSCC value must still read back.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
