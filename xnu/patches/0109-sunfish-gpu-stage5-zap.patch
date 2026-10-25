@@ -1,0 +1,808 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@
+ bsd/dev/sweet_gmu.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_cp.c			standard
++bsd/dev/sweet_zap.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,5 +1,6 @@
+ /*
+- * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md), stages 0, 1, 2A, 2B and 3.
++ * SM7150 Adreno 618 bring-up (docs/GPU_A618_PLAN.md), stages 0, 1, 2A, 2B and 3;
++ * stages 4 and 5 start from here.
+  *
+  * Boot-arg sweetgpu=N (N >= 1) starts a thread sweetgpudelay seconds after
+  * boot (default 40, so the home screen is up first). Stage 0 (N >= 1) only
+@@ -83,6 +84,10 @@
+  * sweetcp=N (0-6) stops after step 4.N, from reads only (0) through the init
+  * list, the ring registers, the SQE start, CP_ME_INIT and register-write
+  * markers to a 30 s hold with the SQE running (6).
++ * Stage 5 (sweetgpu=7, after stage 4 with sweetcp >= 5) is the zap shader in
++ * sweet_zap.c: sweetzap=N (0-6) stops after step 5.N, from read-only SCM
++ * queries (0) through TrustZone loading the zap (3), CP_SET_SECURE_MODE 0 (4)
++ * and the GPU's first writes to DRAM (5) to a 30 s hold (6).
+  * GMU and cx_misc offsets come from the generated sweet_gpu_regs.h; GCC and
+  * gpucc offsets from the downstream drivers above. Everything stays on after
+  * the last stage that runs.
+@@ -246,7 +251,7 @@
+ 	const uint8_t *va;
+ } gpu_blobs[BLOB_COUNT];
+ 
+-static int gpu_level, gpu_hang, gpu_gmu_stop, gpu_gmu_rsc, gpu_cp_stop;
++static int gpu_level, gpu_hang, gpu_gmu_stop, gpu_gmu_rsc, gpu_cp_stop, gpu_zap_stop;
+ static uint32_t gpu_delay_s = SWEET_GPU_DELAY_S;
+ static int gpu_sleep_chan;
+ 
+@@ -1190,8 +1195,8 @@
+ 	}
+ 	printf("SWEET GPU: stage 0 (sweetgpu=%d): firmware blobs, cmd-db, speed bin; no GPU registers\n",
+ 	    gpu_level);
+-	if (gpu_level > 6) {
+-		printf("SWEET GPU: stages above 4 are not built yet; running stages 0 to 4\n");
++	if (gpu_level > 7) {
++		printf("SWEET GPU: stages above 5 are not built yet; running stages 0 to 5\n");
+ 	}
+ 	unsigned found = gpu_find_blobs();
+ 	gpu_check_blobs();
+@@ -1209,9 +1214,16 @@
+ 				printf("SWEET GPU: stage 3 needs all of 2B (sweetgmu=6); not run\n");
+ 			} else if (gpu) {
+ 				int cb = -1;
+-				if (gpu_stage3(gpu, &cb) && gpu_level >= 6) {
+-					(void)sweet_cp_run(gpu_cp_stop, cb, gpu_blobs[BLOB_SQE].va, gpu_blobs[BLOB_SQE].len,
+-					    cc + GPUCC_GX_GDSCR);
++				if (gpu_stage3(gpu, &cb) && gpu_level >= 6 &&
++				    sweet_cp_run(gpu_cp_stop, cb, gpu_blobs[BLOB_SQE].va, gpu_blobs[BLOB_SQE].len,
++				    cc + GPUCC_GX_GDSCR) && gpu_level >= 7) {
++					if (gpu_cp_stop < 5) {
++						printf("SWEET GPU: stage 5 needs stage 4 through 4.5 (sweetcp=5 or 6); not run\n");
++					} else {
++						(void)sweet_zap_run(gpu_zap_stop, gpu_blobs[BLOB_ZAP_MDT].va,
++						    gpu_blobs[BLOB_ZAP_MDT].len, gpu_blobs[BLOB_ZAP_B02].va,
++						    gpu_blobs[BLOB_ZAP_B02].len);
++					}
+ 				}
+ 			}
+ 		}
+@@ -1246,6 +1258,10 @@
+ 	if (gpu_cp_stop < 0 || gpu_cp_stop > 6) {
+ 		gpu_cp_stop = 0;
+ 	}
++	(void)PE_parse_boot_argn("sweetzap", &gpu_zap_stop, sizeof(gpu_zap_stop));
++	if (gpu_zap_stop < 0 || gpu_zap_stop > 6) {
++		gpu_zap_stop = 0;
++	}
+ 	thread_t thread;
+ 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -1,7 +1,8 @@
+ /*
+  * Shared by the SM7150 Adreno 618 bring-up files (docs/GPU_A618_PLAN.md):
+  * sweet_gpu.c (stages 0 to 2, the 2B flow), sweet_gmu.c (GMU firmware,
+- * RSCC/PDC, HFI), sweet_smmu.c (the GPU SMMU) and sweet_cp.c (stage 4, the CP).
++ * RSCC/PDC, HFI), sweet_smmu.c (the GPU SMMU), sweet_cp.c (stage 4, the CP)
++ * and sweet_zap.c (stage 5, the zap shader).
+  */
+ #ifndef _SWEET_GPU_INTERNAL_H_
+ #define _SWEET_GPU_INTERNAL_H_
+@@ -96,6 +97,20 @@
+ 
+ /* sweet_cp.c: stage 4, CP first light; stop = sweetcp (0-6), cb = stage 3's bank, gx_gdscr = mapped GX GDSCR */
+ bool sweet_cp_run(int stop, int cb, const uint8_t *sqe, uint32_t sqe_len, vm_offset_t gx_gdscr);
++/* The ring and the scratch page for stage 5, once sweet_cp_run passed 4.4 or later */
++uint32_t sweet_cp_rd(uint32_t reg);
++uint32_t sweet_cp_pkt7(uint32_t op, uint32_t cnt);
++void sweet_cp_emit(uint32_t w);
++void sweet_cp_kick(void);                                       /* dsb sy, then CP_RB_WPTR */
++int sweet_cp_wait_idle(unsigned timeout_us);                    /* us taken, or -1 */
++bool sweet_cp_marker(uint32_t val, const char *when);          /* PKT4 to CP_SCRATCH_REG(7), kick, wait */
++void sweet_cp_dump(const char *when);
++bool sweet_cp_clean(const char *when);                          /* no SMMU, CP_HW_FAULT or PROTECT change */
++void sweet_cp_halt(void);                                       /* CP_SQE_CNTL = 0 if the SQE runs */
++volatile uint32_t *sweet_cp_scratch(uint64_t *pa);              /* 4 KiB, uncached, IOVA = PA */
++
++/* sweet_zap.c: stage 5, the zap shader; stop = sweetzap (0-6) */
++bool sweet_zap_run(int stop, const uint8_t *mdt, uint32_t mdt_len, const uint8_t *b02, uint32_t b02_len);
+ 
+ /* sweet_rpmh.c: cmd-db address of an ARC (slave 3) or BCM (slave 5) resource, and an ARC's levels */
+ int sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl,
+--- a/bsd/dev/sweet_cp.c
++++ b/bsd/dev/sweet_cp.c
+@@ -19,6 +19,8 @@
+  *  4.6 one marker every 10 s for 30 s; the SQE stays running
+  * Everything polls. When a step fails the CP state is dumped and, once the SQE
+  * runs, it is halted (CP_SQE_CNTL = 0); nothing else is undone.
++ * Stage 5 (sweet_zap.c) uses the ring and the scratch (tripwire) page through
++ * the sweet_cp_* wrappers at the end.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -570,6 +572,17 @@
+ 	return ok;
+ }
+ 
++static void
++cp_halt(void)
++{
++	if (cp_sqe_on) {
++		gpu_pause("halt the SQE (CP_SQE_CNTL = 0)");
++		cp_wr(REG_A6XX_CP_SQE_CNTL, 0);
++		cp_sqe_on = false;
++		printf("SWEET CP:   CP_SQE_CNTL now 0x%x\n", cp_rd(REG_A6XX_CP_SQE_CNTL));
++	}
++}
++
+ bool
+ sweet_cp_run(int stop, int cb, const uint8_t *sqe, uint32_t sqe_len, vm_offset_t gx_gdscr)
+ {
+@@ -609,15 +622,72 @@
+ 	}
+ 	if (!ok) {
+ 		cp_dump("at the failure");
+-		if (cp_sqe_on) {
+-			gpu_pause("halt the SQE (CP_SQE_CNTL = 0)");
+-			cp_wr(REG_A6XX_CP_SQE_CNTL, 0);
+-			cp_sqe_on = false;
+-			printf("SWEET CP:   CP_SQE_CNTL now 0x%x\n", cp_rd(REG_A6XX_CP_SQE_CNTL));
+-		}
++		cp_halt();
+ 	}
+ 	printf("SWEET CP: stage 4 %s at 4.%d (sweetcp=%d); %s\n", ok ? "done" : "STOPPED by a failure", step, stop,
+ 	    cp_sqe_on ? "the SQE stays running" : "the SQE is stopped");
+ 	return ok;
+ }
++
++/* For stage 5, after sweet_cp_run passed 4.4 or later */
++uint32_t
++sweet_cp_rd(uint32_t reg)
++{
++	return cp_rd(reg);
++}
++
++uint32_t
++sweet_cp_pkt7(uint32_t op, uint32_t cnt)
++{
++	return pkt7(op, cnt);
++}
++
++void
++sweet_cp_emit(uint32_t w)
++{
++	cp_emit(w);
++}
++
++void
++sweet_cp_kick(void)
++{
++	cp_kick();
++}
++
++int
++sweet_cp_wait_idle(unsigned timeout_us)
++{
++	return cp_wait_idle(timeout_us);
++}
++
++bool
++sweet_cp_marker(uint32_t val, const char *when)
++{
++	return cp_marker(val, when);
++}
++
++void
++sweet_cp_dump(const char *when)
++{
++	cp_dump(when);
++}
++
++bool
++sweet_cp_clean(const char *when)
++{
++	return cp_clean(when);
++}
++
++void
++sweet_cp_halt(void)
++{
++	cp_halt();
++}
++
++volatile uint32_t *
++sweet_cp_scratch(uint64_t *pa)
++{
++	*pa = cp_trip_pa;
++	return cp_trip;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_zap.c
+@@ -0,0 +1,582 @@
++/*
++ * SM7150 Adreno 618, docs/GPU_A618_PLAN.md stage 5: the zap shader, leaving
++ * secure mode, and the GPU's first writes to DRAM.
++ *
++ * Does what mainline's a6xx hw_init does after CP_ME_INIT (Linux 6.18
++ * adreno_gpu.c zap_shader_load_mdt, soc/qcom/mdt_loader.c, firmware/qcom
++ * qcom_scm.c and qcom_scm-smc.c): TrustZone loads and authenticates a615_zap
++ * (PAS id 13) through SCM calls over SMCCC, then CP_SET_SECURE_MODE 0 goes on
++ * the ring. Call ids, argument layouts and retry rules come from mainline; the
++ * code is ours. RBBM_SECVID_TRUST_CNTL is never written (secvid-set-once) and
++ * is not read once the zap is loaded.
++ * sweetzap=N stops after step 5.N:
++ *  5.0 read-only SCM queries (convention, call availability, PAS 13
++ *      supported), the MDT and B02 checks, the metadata copied into
++ *      GPU-GMU-MEM (uncached, 4 KiB aligned)
++ *  5.1 one CP_MEM_WRITE while still secure; whether it lands is only logged
++ *  5.2 PAS_INIT_IMAGE (the metadata), PAS_MEM_SETUP (the carve-out)
++ *  5.3 segment 2 into the carve-out, PAS_AUTH_AND_RESET
++ *  5.4 CP_SET_SECURE_MODE 0
++ *  5.5 CP_MEM_WRITEs to stage 4's scratch page, checked from the CPU
++ *  5.6 one write and one marker every 10 s for 30 s
++ * After PAS_INIT_IMAGE the metadata copy, and after PAS_AUTH_AND_RESET the
++ * carve-out, belong to TrustZone and are never touched again. When a step
++ * from 5.1 on fails the CP is dumped and the SQE halted; the PAS session is
++ * left to the next reboot (PAS_SHUTDOWN is never called).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "sweet_gpu_internal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* SCM over SMCCC (qcom_scm.h, qcom_scm-smc.c): SIP owner, SMC64; fast call for the probe, standard otherwise */
++#define SCM_FN(fast, svc, cmd)  (((fast) ? 0xc2000000u : 0x42000000u) | ((svc) << 8) | (cmd))
++#define SCM_FNID_SIP(svc, cmd)  (0x02000000u | ((svc) << 8) | (cmd))      /* IS_CALL_AVAIL's argument */
++#define SCM_SVC_PIL             2u
++#define SCM_SVC_INFO            6u
++#define SCM_INFO_IS_CALL_AVAIL  1u
++#define SCM_PAS_INIT_IMAGE      1u
++#define SCM_PAS_MEM_SETUP       2u
++#define SCM_PAS_AUTH_AND_RESET  5u
++#define SCM_PAS_IS_SUPPORTED    7u
++#define SCM_ARGS_VAL_RW         0x82u           /* QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW) */
++#define SCM_INTERRUPTED         1
++#define SCM_WAITQ_SLEEP         2
++#define SCM_EBUSY               (-12)
++#define SCM_INTERRUPTED_MAX     1000u
++#define SCM_EBUSY_MAX           20u             /* QCOM_SCM_EBUSY_MAX_RETRY */
++#define SCM_EBUSY_WAIT_MS       30u             /* QCOM_SCM_EBUSY_WAIT_MS */
++
++/* The zap: a6xx GPU_PAS_ID and the Pixel DT's GPU zap carve-out */
++#define ZAP_PAS_ID              13u
++#define ZAP_CARVEOUT_PA         0x97715000u
++#define ZAP_CARVEOUT_SIZE       0x2000u
++#define ZAP_MD_AREA             0x2000u         /* the metadata copy in GPU-GMU-MEM */
++
++/* ELF32 and the Qualcomm MDT flags (mdt_loader.h) */
++#define ELF32_EHDR_SIZE         52u
++#define ELF32_PHDR_SIZE         32u
++#define ELF_MAGIC               0x464c457fu
++#define ELF_PT_LOAD             1u
++#define MDT_TYPE(flags)         (((flags) >> 24) & 7u)
++#define MDT_TYPE_HASH           2u
++#define MDT_RELOCATABLE         (1u << 27)
++#define MDT_MAX_PHDRS           16u
++
++/* PM4 opcodes (adreno_pm4.xml), the scratch page and stage 5's markers */
++#define PM4_CP_MEM_WRITE        0x3du
++#define PM4_CP_SET_SECURE_MODE  0x66u
++#define ZAP_POISON              0x5ee7deadu     /* stage 4.0's fill */
++#define ZAP_PAGE_WORDS          1024u
++#define ZAP_SECVID_TRUST_CNTL   0x0f400u        /* read in 5.0 only */
++#define ZAP_TIMEOUT_US          1000000u
++
++static struct {
++	uint32_t ehdr_size, hash_off, hash_size, md_len;        /* metadata = header segment + hash segment */
++	uint32_t seg_off, seg_filesz, seg_memsz, mem_size;      /* segment 2 in the carve-out; MEM_SETUP size */
++	bool relocate;
++} zm;
++static vm_offset_t zap_md, zap_carve;
++static uint64_t zap_md_pa, zap_page_pa;
++static volatile uint32_t *zap_page;
++static uint32_t zap_want[ZAP_PAGE_WORDS];       /* what the scratch page should hold */
++
++static uint32_t
++zap_le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t
++zap_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/*
++ * One SMC. x0-x7 in; x0-x3 and x6 out, x8-x17 clobbered (SMCCC 1.0). x6 is
++ * Qualcomm's "A6 quirk": it carries the session of an interrupted call.
++ */
++static void
++zap_smc(const uint64_t in[8], uint64_t out[4], uint64_t *a6)
++{
++	register uint64_t x0 __asm__("x0") = in[0];
++	register uint64_t x1 __asm__("x1") = in[1];
++	register uint64_t x2 __asm__("x2") = in[2];
++	register uint64_t x3 __asm__("x3") = in[3];
++	register uint64_t x4 __asm__("x4") = in[4];
++	register uint64_t x5 __asm__("x5") = in[5];
++	register uint64_t x6 __asm__("x6") = *a6;
++	register uint64_t x7 __asm__("x7") = in[7];
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7) : :
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	out[0] = x0;
++	out[1] = x1;
++	out[2] = x2;
++	out[3] = x3;
++	*a6 = x6;
++}
++
++static const char *
++zap_status(int32_t s)
++{
++	switch (s) {
++	case 0: return "ok";
++	case SCM_INTERRUPTED: return "INTERRUPTED, retries used up";
++	case SCM_WAITQ_SLEEP: return "WAITQ_SLEEP, not implemented";
++	case -1: return "ERROR";
++	case -2: return "EINVAL_ARG";
++	case -3: return "EINVAL_ADDR";
++	case -4: return "EOPNOTSUPP";
++	case -5: return "ENOMEM";
++	case SCM_EBUSY: return "EBUSY, retries used up";
++	default: return "unknown";
++	}
++}
++
++/*
++ * qcom_scm_call over SMC64: INTERRUPTED is resumed with x0 = 1 and the x6 it
++ * returned, EBUSY repeats the call after 30 ms. Logs the call; true when x0
++ * ends 0, with *x1 = result[0].
++ */
++static bool
++zap_scm(const char *name, uint32_t fn, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *x1)
++{
++	uint64_t in[8] = { fn, arginfo, a2, a3, a4, 0, 0, 0 }, out[4] = { 0, 0, 0, 0 }, a6 = 0;
++	unsigned intr = 0, busy = 0;
++	uint64_t t0 = mach_absolute_time(), ns;
++	for (;;) {
++		in[0] = fn;
++		a6 = 0;
++		zap_smc(in, out, &a6);
++		while ((int32_t)out[0] == SCM_INTERRUPTED && intr < SCM_INTERRUPTED_MAX) {
++			++intr;
++			in[0] = (uint64_t)SCM_INTERRUPTED;
++			zap_smc(in, out, &a6);
++		}
++		if ((int32_t)out[0] != SCM_EBUSY || busy >= SCM_EBUSY_MAX) {
++			break;
++		}
++		++busy;
++		gpu_sleep_ms(SCM_EBUSY_WAIT_MS);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	int32_t st = (int32_t)out[0];
++	printf("SWEET ZAP:   SCM %s: x0 %#x x1 %#x x2 %#llx x3 %#llx x4 %#llx\n", name, fn, arginfo, a2, a3, a4);
++	printf("SWEET ZAP:     -> x0 %#llx (%s) x1 %#llx x2 %#llx x3 %#llx x6 %#llx; %u interrupted, %u busy, %llu us\n",
++	    out[0], zap_status(st), out[1], out[2], out[3], a6, intr, busy, ns / 1000u);
++	*x1 = out[1];
++	return st == 0;
++}
++
++/* Word i of the metadata: the header segment, then the hash segment, then zeros */
++static uint32_t
++zap_md_word(const uint8_t *mdt, uint32_t i)
++{
++	uint32_t w = 0;
++	for (uint32_t b = 0; b < 4u; ++b) {
++		uint32_t n = i * 4u + b, v = 0;
++		if (n < zm.ehdr_size) {
++			v = mdt[n];
++		} else if (n < zm.md_len) {
++			v = mdt[zm.hash_off + n - zm.ehdr_size];
++		}
++		w |= v << (8u * b);
++	}
++	return w;
++}
++
++/* Word i of segment 2 as loaded: the file bytes, then zeros up to p_memsz */
++static uint32_t
++zap_seg_word(const uint8_t *b02, uint32_t i)
++{
++	uint32_t w = 0;
++	for (uint32_t b = 0; b < 4u; ++b) {
++		uint32_t n = i * 4u + b;
++		w |= (n < zm.seg_filesz ? (uint32_t)b02[n] : 0u) << (8u * b);
++	}
++	return w;
++}
++
++/* The CP dump plus the scratch page's interesting words */
++static void
++zap_dump(const char *when)
++{
++	sweet_cp_dump(when);
++	printf("SWEET ZAP:   %s: scratch words 0-3 0x%08x 0x%08x 0x%08x 0x%08x, 1023 0x%08x\n", when, zap_page[0],
++	    zap_page[1], zap_page[2], zap_page[3], zap_page[ZAP_PAGE_WORDS - 1u]);
++}
++
++/* Scratch-page words that differ from zap_want; the first 8 are logged. */
++static unsigned
++zap_page_check(const char *when)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	unsigned bad = 0;
++	for (uint32_t i = 0; i < ZAP_PAGE_WORDS; ++i) {
++		uint32_t got = zap_page[i];
++		if (got != zap_want[i]) {
++			if (bad < 8u) {
++				printf("SWEET ZAP:   %s: scratch word %u = 0x%08x (want 0x%08x)\n", when, i, got, zap_want[i]);
++			}
++			++bad;
++		}
++	}
++	printf("SWEET ZAP:   %s: %u of %u scratch words differ from what they should hold (want 0)\n", when, bad,
++	    ZAP_PAGE_WORDS);
++	return bad;
++}
++
++/* CP_MEM_WRITE of one dword to scratch word `word`; the caller kicks. */
++static void
++zap_emit_write(uint32_t word, uint32_t val)
++{
++	uint64_t pa = zap_page_pa + word * 4u;
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_MEM_WRITE, 3));
++	sweet_cp_emit((uint32_t)pa);
++	sweet_cp_emit((uint32_t)(pa >> 32));
++	sweet_cp_emit(val);
++}
++
++/* qcom_mdt_read_metadata's and qcom_mdt_pas_init's checks and sizes, for our one LOAD segment (B02) */
++static bool
++zap_mdt_check(const uint8_t *mdt, uint32_t len, const uint8_t *b02, uint32_t b02_len)
++{
++	if (!mdt || len < ELF32_EHDR_SIZE || zap_le32(mdt) != ELF_MAGIC || mdt[4] != 1u) {
++		printf("SWEET ZAP: 5.0: GPU-ZAP-MDT missing or not ELF32 (%u bytes)\n", len);
++		return false;
++	}
++	uint32_t phoff = zap_le32(mdt + 28), phent = zap_le16(mdt + 42), phnum = zap_le16(mdt + 44);
++	printf("SWEET ZAP:   MDT %u bytes, machine %u, entry %#x, %u program headers at %#x\n", len, zap_le16(mdt + 18),
++	    zap_le32(mdt + 24), phnum, phoff);
++	if (phent != ELF32_PHDR_SIZE || phnum < 2u || phnum > MDT_MAX_PHDRS || phoff > len ||
++	    phnum * ELF32_PHDR_SIZE > len - phoff) {
++		printf("SWEET ZAP: 5.0: program headers out of range (size %u)\n", phent);
++		return false;
++	}
++	uint32_t hash = 0, load = 0, nload = 0, min = 0xffffffffu, max = 0;
++	bool reloc = false;
++	for (uint32_t i = 0; i < phnum; ++i) {
++		const uint8_t *ph = mdt + phoff + i * ELF32_PHDR_SIZE;
++		uint32_t type = zap_le32(ph), paddr = zap_le32(ph + 12), memsz = zap_le32(ph + 20), flags = zap_le32(ph + 24);
++		bool loadable = type == ELF_PT_LOAD && MDT_TYPE(flags) != MDT_TYPE_HASH && memsz != 0;
++		printf("SWEET ZAP:   phdr %u: type %u offset %#x paddr %#x filesz %#x memsz %#x flags %#010x (MDT type %u%s)%s\n",
++		    i, type, zap_le32(ph + 4), paddr, zap_le32(ph + 16), memsz, flags, MDT_TYPE(flags),
++		    (flags & MDT_RELOCATABLE) ? ", relocatable" : "", loadable ? " loadable" : "");
++		if (i > 0 && hash == 0 && MDT_TYPE(flags) == MDT_TYPE_HASH) {
++			hash = i;
++		}
++		if (loadable) {
++			++nload;
++			load = i;
++			reloc = reloc || (flags & MDT_RELOCATABLE) != 0;
++			if (paddr < min) {
++				min = paddr;
++			}
++			if ((uint64_t)paddr + memsz > max) {
++				max = (uint32_t)(((uint64_t)paddr + memsz + 0xfffu) & ~0xfffull);
++			}
++		}
++	}
++	const uint8_t *ph0 = mdt + phoff, *hp = mdt + phoff + hash * ELF32_PHDR_SIZE;
++	if (zap_le32(ph0) == ELF_PT_LOAD || hash == 0) {
++		printf("SWEET ZAP: 5.0: header 0 is LOAD or there is no hash segment\n");
++		return false;
++	}
++	zm.ehdr_size = zap_le32(ph0 + 16);
++	zm.hash_size = zap_le32(hp + 16);
++	if (zm.ehdr_size > len || zm.hash_size > len) {
++		printf("SWEET ZAP: 5.0: header or hash segment larger than the file\n");
++		return false;
++	}
++	zm.md_len = zm.ehdr_size + zm.hash_size;
++	zm.hash_off = zm.md_len == len ? zm.ehdr_size : zap_le32(hp + 4);
++	if (zm.hash_off > len - zm.hash_size || zm.md_len > ZAP_MD_AREA) {
++		printf("SWEET ZAP: 5.0: hash segment at %#x + %#x is outside the file, or the metadata is over %#x\n",
++		    zm.hash_off, zm.hash_size, ZAP_MD_AREA);
++		return false;
++	}
++	printf("SWEET ZAP:   metadata: %#x header bytes + %#x hash bytes from %#x = %u bytes%s\n", zm.ehdr_size,
++	    zm.hash_size, zm.hash_off, zm.md_len, zm.md_len == len && zm.hash_off == zm.ehdr_size ? " (the whole file)" : "");
++	if (nload != 1u || load != 2u) {
++		printf("SWEET ZAP: 5.0: want one loadable segment, header 2 (.b02); found %u, last %u\n", nload, load);
++		return false;
++	}
++	const uint8_t *lp = mdt + phoff + load * ELF32_PHDR_SIZE;
++	uint64_t paddr = zap_le32(lp + 12), base = reloc ? min : ZAP_CARVEOUT_PA;
++	zm.seg_filesz = zap_le32(lp + 16);
++	zm.seg_memsz = zap_le32(lp + 20);
++	zm.relocate = reloc;
++	zm.mem_size = max - min;
++	if (paddr < base || zm.seg_filesz > zm.seg_memsz || paddr - base + zm.seg_memsz > ZAP_CARVEOUT_SIZE ||
++	    zm.mem_size > ZAP_CARVEOUT_SIZE) {
++		printf("SWEET ZAP: 5.0: segment 2 (paddr %#llx, memsz %#x, image %#x) does not fit the %#x carve-out\n", paddr,
++		    zm.seg_memsz, zm.mem_size, ZAP_CARVEOUT_SIZE);
++		return false;
++	}
++	zm.seg_off = (uint32_t)(paddr - base);
++	printf("SWEET ZAP:   segment 2 -> carve-out + %#x, %#x bytes (memsz %#x); %srelocatable, MEM_SETUP size %#x "
++	    "(want 0x1000)\n", zm.seg_off, zm.seg_filesz, zm.seg_memsz, reloc ? "" : "not ", zm.mem_size);
++	printf("SWEET ZAP:   GPU-ZAP-B02 %u bytes (want %u)\n", b02 ? b02_len : 0u, zm.seg_filesz);
++	if (!b02 || b02_len != zm.seg_filesz) {
++		printf("SWEET ZAP: 5.0: GPU-ZAP-B02 missing or not segment 2's size\n");
++		return false;
++	}
++	return true;
++}
++
++/* 5.0: read-only SCM queries, the files, the metadata copy */
++static bool
++zap_survey(const uint8_t *mdt, uint32_t mdt_len, const uint8_t *b02, uint32_t b02_len)
++{
++	printf("SWEET ZAP: 5.0 survey: read-only SCM queries, the zap files, the metadata copy\n");
++	zap_page = sweet_cp_scratch(&zap_page_pa);
++	for (uint32_t i = 0; i < ZAP_PAGE_WORDS; ++i) {
++		zap_want[i] = ZAP_POISON;
++	}
++	zap_dump("5.0 as found");
++	unsigned page = zap_page_check("5.0");
++
++	gpu_pause("5.0 SCM: SMC64 convention probe, IS_CALL_AVAIL for PIL 1/2/5/7, PAS_IS_SUPPORTED(13)");
++	uint64_t r = 0;
++	if (!zap_scm("IS_CALL_AVAIL(INFO 1), fast", SCM_FN(1, SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 1,
++	    SCM_FNID_SIP(SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 0, 0, &r) || r != 1u) {
++		printf("SWEET ZAP: 5.0 stopped: the SMC64 convention probe did not answer 1\n");
++		return false;
++	}
++	static const struct {
++		const char *name;
++		uint32_t cmd;
++	} pil[] = {
++		{ "IS_CALL_AVAIL(PAS_INIT_IMAGE)", SCM_PAS_INIT_IMAGE },
++		{ "IS_CALL_AVAIL(PAS_MEM_SETUP)", SCM_PAS_MEM_SETUP },
++		{ "IS_CALL_AVAIL(PAS_AUTH_AND_RESET)", SCM_PAS_AUTH_AND_RESET },
++		{ "IS_CALL_AVAIL(PAS_IS_SUPPORTED)", SCM_PAS_IS_SUPPORTED },
++	};
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(pil) / sizeof(pil[0]); ++i) {
++		ok = zap_scm(pil[i].name, SCM_FN(0, SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), 1,
++		    SCM_FNID_SIP(SCM_SVC_PIL, pil[i].cmd), 0, 0, &r) && r == 1u && ok;
++	}
++	bool sup = zap_scm("PAS_IS_SUPPORTED(13)", SCM_FN(0, SCM_SVC_PIL, SCM_PAS_IS_SUPPORTED), 1, ZAP_PAS_ID, 0, 0, &r) &&
++	    r == 1u;
++	printf("SWEET ZAP:   PIL calls %s; PAS 13 %s\n", ok ? "all available" : "NOT all available",
++	    sup ? "supported" : "NOT supported");
++	printf("SWEET ZAP:   RBBM_SECVID_TRUST_CNTL %#07x = 0x%08x (the last read; never written)\n", ZAP_SECVID_TRUST_CNTL,
++	    sweet_cp_rd(ZAP_SECVID_TRUST_CNTL));
++	ok = zap_mdt_check(mdt, mdt_len, b02, b02_len) && ok && sup;
++	if (!ok) {
++		return false;
++	}
++
++	gpu_pause("5.0 map the zap carve-out 0x97715000 and read two words");
++	zap_carve = ml_io_map(ZAP_CARVEOUT_PA, ZAP_CARVEOUT_SIZE);
++	if (!zap_carve) {
++		printf("SWEET ZAP: 5.0 stopped: the carve-out mapping failed\n");
++		return false;
++	}
++	printf("SWEET ZAP:   carve-out %#x: first word 0x%08x, last word 0x%08x\n", ZAP_CARVEOUT_PA, gpu_rd(zap_carve, 0),
++	    gpu_rd(zap_carve, ZAP_CARVEOUT_SIZE - 4u));
++	zap_md = sweet_gmu_spare(ZAP_MD_AREA, &zap_md_pa);
++	if (!zap_md || (zap_md_pa & 0xfffu)) {
++		printf("SWEET ZAP: 5.0 stopped: no 4 KiB aligned room for the metadata in GPU-GMU-MEM\n");
++		return false;
++	}
++	volatile uint32_t *md = (volatile uint32_t *)zap_md;
++	for (uint32_t i = 0; i < ZAP_MD_AREA / 4u; ++i) {
++		md[i] = zap_md_word(mdt, i);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	unsigned bad = 0;
++	for (uint32_t i = 0; i < ZAP_MD_AREA / 4u; ++i) {
++		bad += md[i] != zap_md_word(mdt, i);
++	}
++	printf("SWEET ZAP:   metadata copy pa %#llx, %u bytes in a %#x area, first word 0x%08x: %u words differ\n",
++	    zap_md_pa, zm.md_len, ZAP_MD_AREA, md[0], bad);
++	return bad == 0 && page == 0 && sweet_cp_clean("5.0");
++}
++
++/* 5.1: one memory write while the GPU is still secure; the result is logged either way */
++static bool
++zap_baseline(void)
++{
++	printf("SWEET ZAP: 5.1 secure-mode baseline: CP_MEM_WRITE (header 0x%08x) 0xc0ffee00 to scratch word 0 at %#llx\n",
++	    sweet_cp_pkt7(PM4_CP_MEM_WRITE, 3), zap_page_pa);
++	gpu_pause("5.1 CP_MEM_WRITE 0xc0ffee00 while secure, then a marker");
++	zap_emit_write(0, 0xc0ffee00u);
++	bool ok = sweet_cp_marker(0x5ee75001u, "5.1");
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t got = zap_page[0];
++	if (got == ZAP_POISON) {
++		printf("SWEET ZAP:   word 0 unchanged: the write was dropped in secure mode\n");
++	} else if (got == 0xc0ffee00u) {
++		printf("SWEET ZAP:   word 0 = 0xc0ffee00: the write LANDED in secure mode\n");
++		zap_want[0] = got;
++	} else {
++		printf("SWEET ZAP:   word 0 = 0x%08x: neither the old nor the written value\n", got);
++		ok = false;
++	}
++	zap_dump("after 5.1");
++	return sweet_cp_clean("5.1") && ok && zap_page_check("5.1") == 0;
++}
++
++/* 5.2: TrustZone takes the metadata, then the carve-out */
++static bool
++zap_init_image(void)
++{
++	printf("SWEET ZAP: 5.2 PAS_INIT_IMAGE(13) with %u bytes of metadata at %#llx, then PAS_MEM_SETUP\n", zm.md_len,
++	    zap_md_pa);
++	gpu_pause("5.2 PAS_INIT_IMAGE(13): TrustZone checks the zap's signature");
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t r = 1;
++	bool ok = zap_scm("PAS_INIT_IMAGE(13)", SCM_FN(0, SCM_SVC_PIL, SCM_PAS_INIT_IMAGE), SCM_ARGS_VAL_RW, ZAP_PAS_ID,
++	    zap_md_pa, 0, &r) && r == 0;
++	zap_md = 0;     /* TrustZone's from here */
++	if (ok && zm.relocate) {
++		gpu_pause("5.2 PAS_MEM_SETUP(13, 0x97715000, size)");
++		ok = zap_scm("PAS_MEM_SETUP(13)", SCM_FN(0, SCM_SVC_PIL, SCM_PAS_MEM_SETUP), 3, ZAP_PAS_ID, ZAP_CARVEOUT_PA,
++		    zm.mem_size, &r) && r == 0;
++	}
++	zap_dump("after 5.2");
++	return sweet_cp_clean("5.2") && ok;
++}
++
++/* 5.3: segment 2 into the carve-out through the device mapping, then AUTH_AND_RESET */
++static bool
++zap_load(const uint8_t *b02)
++{
++	uint32_t words = (zm.seg_memsz + 3u) / 4u;
++	printf("SWEET ZAP: 5.3 segment 2 (%#x bytes, %u words) into the carve-out at +%#x, then PAS_AUTH_AND_RESET(13)\n",
++	    zm.seg_filesz, words, zm.seg_off);
++	gpu_pause("5.3 write the zap into the carve-out");
++	for (uint32_t i = 0; i < words; ++i) {
++		gpu_wr(zap_carve, zm.seg_off + i * 4u, zap_seg_word(b02, i));
++	}
++	unsigned bad = 0;
++	for (uint32_t i = 0; i < words; ++i) {
++		bad += gpu_rd(zap_carve, zm.seg_off + i * 4u) != zap_seg_word(b02, i);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET ZAP:   %u words written, first 0x%08x, %u read back differently\n", words, gpu_rd(zap_carve,
++	    zm.seg_off), bad);
++	if (bad != 0) {
++		return false;
++	}
++	gpu_pause("5.3 PAS_AUTH_AND_RESET(13): TrustZone authenticates and starts the zap");
++	uint64_t r = 1;
++	bool ok = zap_scm("PAS_AUTH_AND_RESET(13)", SCM_FN(0, SCM_SVC_PIL, SCM_PAS_AUTH_AND_RESET), 1, ZAP_PAS_ID, 0, 0,
++	    &r) && r == 0;
++	zap_carve = 0;  /* TrustZone's from here */
++	zap_dump("after 5.3");
++	return sweet_cp_clean("5.3") && ok;
++}
++
++/* 5.4: leave secure mode, as mainline's hw_init does once the zap is loaded */
++static bool
++zap_leave_secure(void)
++{
++	printf("SWEET ZAP: 5.4 CP_SET_SECURE_MODE 0: header 0x%08x\n", sweet_cp_pkt7(PM4_CP_SET_SECURE_MODE, 1));
++	gpu_pause("5.4 CP_SET_SECURE_MODE 0, then a marker");
++	sweet_cp_emit(sweet_cp_pkt7(PM4_CP_SET_SECURE_MODE, 1));
++	sweet_cp_emit(0);
++	bool ok = sweet_cp_marker(0x5ee75004u, "5.4");
++	zap_dump("after 5.4");
++	return sweet_cp_clean("5.4") && ok;
++}
++
++/* 5.5: the GPU's first writes to DRAM */
++static bool
++zap_writes(void)
++{
++	printf("SWEET ZAP: 5.5 GPU writes to DRAM: CP_MEM_WRITE to the scratch page at %#llx\n", zap_page_pa);
++	gpu_pause("5.5 CP_MEM_WRITE 0xc0ffee01 to scratch word 0");
++	zap_emit_write(0, 0xc0ffee01u);
++	zap_want[0] = 0xc0ffee01u;
++	sweet_cp_kick();
++	int us = sweet_cp_wait_idle(ZAP_TIMEOUT_US);
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t got = zap_page[0];
++	printf("SWEET ZAP:   word 0 = 0x%08x (want 0xc0ffee01), %s %d us\n", got, us < 0 ? "NOT idle after" : "idle after",
++	    us < 0 ? (int)ZAP_TIMEOUT_US : us);
++	bool ok = us >= 0 && got == 0xc0ffee01u;
++	if (ok) {
++		gpu_pause("5.5 word 1023 and words 16-31 in one submission");
++		zap_emit_write(ZAP_PAGE_WORDS - 1u, 0xc0ffee02u);
++		zap_want[ZAP_PAGE_WORDS - 1u] = 0xc0ffee02u;
++		for (uint32_t i = 16; i < 32u; ++i) {
++			zap_emit_write(i, 0xc0ff1000u + i);
++			zap_want[i] = 0xc0ff1000u + i;
++		}
++		sweet_cp_kick();
++		us = sweet_cp_wait_idle(ZAP_TIMEOUT_US);
++		printf("SWEET ZAP:   17 writes: %s %d us\n", us < 0 ? "NOT idle after" : "idle after",
++		    us < 0 ? (int)ZAP_TIMEOUT_US : us);
++		ok = us >= 0;
++	}
++	zap_dump("after 5.5");
++	return sweet_cp_clean("5.5") && zap_page_check("5.5") == 0 && ok;
++}
++
++/* 5.6: hold for 30 s, a DRAM write and a marker every 10 s */
++static bool
++zap_hold(void)
++{
++	printf("SWEET ZAP: 5.6 hold: a DRAM write and a marker every 10 s for 30 s\n");
++	bool ok = true;
++	for (unsigned s = 10; s <= 30u; s += 10u) {
++		gpu_sleep_ms(10000);
++		char when[24];
++		snprintf(when, sizeof(when), "5.6 hold %u s", s);
++		uint32_t v = 0xc0ff2000u + s / 10u;
++		zap_emit_write(2, v);
++		zap_want[2] = v;
++		bool m = sweet_cp_marker(0x5ee75600u + s / 10u, when);
++		zap_dump(when);
++		ok = sweet_cp_clean(when) && zap_page_check(when) == 0 && m && ok;
++	}
++	return ok;
++}
++
++bool
++sweet_zap_run(int stop, const uint8_t *mdt, uint32_t mdt_len, const uint8_t *b02, uint32_t b02_len)
++{
++	printf("SWEET ZAP: stage 5 (sweetgpu=7 sweetzap=%d): zap shader (PAS %u), leave secure mode, GPU writes to DRAM\n",
++	    stop, ZAP_PAS_ID);
++	int step = 0;
++	bool ok = zap_survey(mdt, mdt_len, b02, b02_len);
++	if (ok && stop >= 1) {
++		step = 1;
++		ok = zap_baseline();
++	}
++	if (ok && stop >= 2) {
++		step = 2;
++		ok = zap_init_image();
++	}
++	if (ok && stop >= 3) {
++		step = 3;
++		ok = zap_load(b02);
++	}
++	if (ok && stop >= 4) {
++		step = 4;
++		ok = zap_leave_secure();
++	}
++	if (ok && stop >= 5) {
++		step = 5;
++		ok = zap_writes();
++	}
++	if (ok && stop >= 6) {
++		step = 6;
++		ok = zap_hold();
++	}
++	if (!ok && step > 0) {
++		sweet_cp_dump("stage 5 at the failure");
++		sweet_cp_halt();
++	}
++	printf("SWEET ZAP: stage 5 %s at 5.%d (sweetzap=%d)\n", ok ? "done" : "STOPPED by a failure", step, stop);
++	return ok;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
