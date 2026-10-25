@@ -1406,6 +1406,70 @@ Read-only SMCs, the first SIP calls ours has made:
 ✅ Pass when every SMC returns x0 0 with x1 1, the file checks hold, and the copies compare equal. A
 `PAS_IS_SUPPORTED` of 0 stops the stage. We would then need a different plan, not a fallback.
 
+*(G5a hit exactly that stop: `PAS_IS_SUPPORTED(13)` = 0. See "5.0 revised" just below, which is proposed and
+not yet approved.)*
+
+#### 5.0 revised after G5a (proposed, not approved; would be patch 0110)
+
+**What the stock sunfish kernel does** (android-msm-sunfish-4.14, read for hardware facts only, no code copied):
+- The DT (`sdmmagpie-gpu.dtsi`) has `pil_gpu: qcom,kgsl-hyp` with compatible `qcom,pil-tz-generic`, `qcom,pas-id =
+  <13>` and `qcom,firmware-name = "a615_zap"`. So PAS 13 and our files are the right ones. The node has no clocks,
+  regulators or `qcom,mem-protect-id`.
+- `sdmmagpie.dtsi` reserves `pil_gpu_mem: gpu_region@97715000` (`removed-dma-pool`, `no-map`, size 0x2000). I
+  did not find which node links to it; the files were cut off.
+- kgsl loads the zap shader with `subsystem_get("a615_zap")` in `a6xx_microcode_load`. This runs inside
+  `a6xx_rb_start`, after the SQE base is written and **before** `CP_SQE_CNTL = 1`, so the SQE is still halted. The
+  zap is skipped when `mmu.secured` is false.
+- `subsys-pil-tz.c` **never calls `PAS_IS_SUPPORTED`**. Its command list has only INIT_IMAGE (1), MEM_SETUP (2),
+  AUTH_AND_RESET (5) and SHUTDOWN. Mainline `adreno_gpu.c` and `mdt_loader.c` (v6.6) do not call
+  `qcom_scm_pas_supported` either. So no known GPU zap loader ever asks this question.
+- The SMC calls match ours:
+  - INIT_IMAGE: arginfo `SCM_ARGS(2, VAL, RW)`, args (13, metadata pa);
+  - MEM_SETUP: arginfo `SCM_ARGS(3)`, args (13, start, size);
+  - AUTH_AND_RESET: arginfo `SCM_ARGS(1)`, arg 13.
+- The metadata is the whole `.mdt`. Stock copies it into a `dma_alloc_attrs` buffer marked
+  `DMA_ATTR_STRONGLY_ORDERED`, with the mask set to the full `dma_addr_t` width (no 4 GiB limit). It frees the
+  buffer straight after INIT_IMAGE. There is no hyp_assign of the metadata.
+- The region is assigned to a subsystem VMID only when the node has `qcom,mem-protect-id`; `kgsl-hyp` has none.
+  The relocatable MEM_SETUP size is the 4 KiB-aligned span, 0x1000, as we have it.
+- **Bandwidth vote:** before INIT_IMAGE and before AUTH_AND_RESET, stock calls `scm_pas_enable_bw()`. That is an
+  msm-bus vote for `MSM_BUS_MASTER_CRYPTO_CORE_0`, presumably so TZ's hash checks have crypto-to-DDR bandwidth.
+  Stock fails INIT_IMAGE if it cannot vote. **We have no such vote.**
+- The secure-mode exit is `adreno_set_unsecured_mode`. With a zap handle it emits `cp_secure_mode(0)` on the ring,
+  as our 5.4 does. Without a zap handle (only when `mmu.secured` is false) it writes `RBBM_SECVID_TRUST_CNTL = 0`
+  directly. The DT sets `qcom,gpu-quirk-secvid-set-once`, which only stops the TSB base/size writes from
+  repeating.
+
+**Guess (not proven):** `PAS_IS_SUPPORTED` answers from a table that leaves out PAS 13, or the hypervisor answers
+it. Since neither loader asks, a 0 says nothing about whether INIT_IMAGE will accept PAS 13. Only 5.2 can show
+that.
+
+**Revised 5.0 (`sweetzap=0`), read-only like before:**
+1. The probe and `IS_CALL_AVAIL` for PIL cmds 1, 2, 5 and 7, as before.
+2. `PAS_IS_SUPPORTED` becomes **log only**, for 13 and, as a baseline, PAS 1 (ADSP), 4 (modem), 9 (video) and
+   18 (CDSP). These are mainline's ids; I have not checked them against this phone's DT. If those all read 0 as
+   well, the call simply means nothing here. If they read 1 and only 13 reads 0, it is a warning to carry into
+   5.2, not a stop.
+3. The MDT/B02 checks and the `SECVID_TRUST_CNTL` read, unchanged.
+4. Steps 4–5 from above, which G5a never reached: map the carve-out (0x97715000, 0x2000) and read words, then copy
+   the metadata and read it back.
+
+✅ Pass when: every SMC returns x0 0; `IS_CALL_AVAIL` gives x1 1 for cmds 1, 2 and 5 (cmd 7 is log only); the file
+checks hold; and the copies compare equal. `PAS_IS_SUPPORTED` values are logged and never stop the stage.
+
+**Changes for 5.2–5.3 (same patch, for the later boots):**
+- No crypto bandwidth vote is added yet. Display, CPU and GPU traffic already keep DDR busy, so I guess the crypto
+  engine still reaches memory, only maybe slower. If 5.2 or 5.3 returns -1, or takes over 1 s, the next plan adds an
+  RPMh BCM vote for the crypto master. We already have the cmd-db lookups from stage 0.
+- Order: we keep mainline's order (zap after CP init, with the SQE running after 4.5). Stock instead loads it with
+  the SQE halted. If AUTH_AND_RESET fails only with a running SQE, a later variant can halt it first with
+  `sweet_cp_halt`, call AUTH, then restart.
+- Keep `SECVID_TRUST_CNTL` never written. The direct write is stock's no-zap path only, and on this phone the
+  register is probably locked (guess).
+
+**Images:** G5a2 = patch 0110, `sweetzap=0`, otherwise the same as G5a. After it passes: G5b (`sweetzap=3`, through
+AUTH_AND_RESET), then G5c (6).
+
 #### 5.1 Secure-mode baseline (`sweetzap=1`)
 
 While the GPU is still in secure mode, put one `CP_MEM_WRITE` on the ring: header `0x703d8003` (PKT7 opcode
@@ -1667,5 +1731,13 @@ Not known (guesses):
 - Whether the hypervisor answered instead of TZ. The longer time suggests the call did more work than the others, but
   proves nothing.
 
-Per this plan, 5.0 = 0 means a new plan, not a fallback. Next, with the owner's OK: research how the stock sunfish
-kernel loads `a615_zap` (PAS id, whether it checks support, any hypervisor call). Use it for hardware facts only.
+Per this plan, 5.0 = 0 means a new plan, not a fallback. Research of the stock sunfish kernel, done with the
+owner's OK, found:
+- PAS 13 and `a615_zap` are right.
+- The stock loader and mainline never call `PAS_IS_SUPPORTED`.
+- There is no hyp_assign for the zap.
+- Stock votes crypto-core bus bandwidth before INIT_IMAGE and AUTH_AND_RESET.
+
+That gives "5.0 revised" (in Stage 5 above; proposed, not approved): `PAS_IS_SUPPORTED` becomes log only, with
+PAS 1/4/9/18 as a baseline. Next, with the owner's OK: write patch 0110 for it, then CI, then pack G5a2
+(`sweetzap=0`).
