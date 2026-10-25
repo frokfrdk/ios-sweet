@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -67,6 +67,8 @@
+ #define IDR1_PAGESIZE           (1u << 31)
+ #define IDR2_PTFS_4K            (1u << 12)
+ #define TLBSTATUS_ACTIVE        (1u << 0)
++/* FSR fault bits: TF..UUT (1-8), SS (30), MULTI (31); FORMAT (10:9) is read-only info */
++#define CB_FSR_FAULT            0xc00001feu
+ #define SMR_VALID               (1u << 31)
+ #define SMR_ID_MASK             0x7fffu
+ #define SMMU_ATTACH_MAX         4u              /* streams per attach */
+@@ -426,7 +428,7 @@
+ 	return bank;
+ }
+ 
+-/* Logs the global and (cb >= 0) the bank's fault registers; returns sGFSR | FSR, 0 if clean. */
++/* Logs the global and (cb >= 0) the bank's fault registers; returns sGFSR | FSR fault bits, 0 if clean. */
+ uint32_t
+ sweet_smmu_faults(int cb, const char *when)
+ {
+@@ -444,6 +446,6 @@
+ 		printf("SWEET SMMU: %s: sGFSR 0x%08x sGFSYNR0 0x%08x sGFAR %#llx\n", when, gfsr,
+ 		    gpu_rd(smmu, SMMU_sGFSYNR0), smmu_rd64(smmu, SMMU_sGFAR));
+ 	}
+-	return gfsr | fsr;
++	return gfsr | (fsr & CB_FSR_FAULT);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
