@@ -702,6 +702,26 @@ reuse whatever the hypervisor allows (to be investigated from the downstream arm
   CI 40175446607 passed. Next image: G3j (0105 kernel,
   `sweetgmu=5`), booted only with the owner's OK.
 
+**Result on G3j (2026-10-25 18:48, 0105 kernel, `sweetgmu=5`): 2B.5 PASSED, all five HFI messages acked with error 0.**
+- Log flush #133, 5032 lines, no panic. 2B.1–2B.4 as on G3i.
+- Every ack is 4 dwords: header id 126, then word 1 = **our header with the size byte (bits 15:8) cleared**
+  (INIT 0x00100500 → 0x00100000, FW_VER 0x00200201 → 0x00200001, and so on), error 0, payload. The same length-byte
+  clearing was seen in the PDC MSGID readback (0104). The ack's own sequence number counts up by 1 per ack.
+
+| Message | Sent header | Ack word 1 | Error | Payload |
+|---|---|---|---|---|
+| INIT | 0x00100500 | 0x00100000 | 0 | 0x0e550e55 |
+| FW_VER | 0x00200201 | 0x00200001 | 0 | **0x10110000 = firmware 1.17** |
+| PERF_TBL (8 GPU, 2 GMU levels) | 0x00302b04 | 0x00300004 | 0 | 0x0e550e55 |
+| BW_TBL | 0x0040a003 | 0x00400003 | 0 | 0x0e550e55 |
+| TEST | 0x00500205 | 0x00500005 | 0 | 0x0e550e55 |
+
+- 0x0e550e55 looks like a filler for "no payload" (guess).
+- After HFI: FW_INIT_RESULT 0xbabeface, FW_BUSY 1, RPMH_POWER_STATE 0xf, SPTPRAC 0x28, HFI_STATUS 1.
+  SMMU: no global fault, bank 4 FSR 0x400 (FORMAT only, no fault).
+- Next: 2B.6 (`sweetgmu=6`, same 0105 kernel): OOB_GPU, the DCVS vote through registers, and the first GX register
+  reads (RBBM_STATUS, the CP always-on counter). This is the first GX register access. Only with the owner's OK.
+
 #### 2B.1 GMU memory and an SMMU context for streams 4–5 (`sweetgmu=1`)
 
 The GMU reaches memory only through the GPU SMMU, as stream 5 (`gmu_kernel`) and stream 4 (`gmu_user`).
