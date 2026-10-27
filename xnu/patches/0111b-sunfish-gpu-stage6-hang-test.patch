@@ -1,0 +1,167 @@
+--- a/bsd/dev/sweet_cp.c
++++ b/bsd/dev/sweet_cp.c
+@@ -704,6 +704,17 @@
+ 	cp_halt();
+ }
+ 
++/* cp_halt without the gpu_pause, for a service that is stopping on an error */
++void
++sweet_cp_halt_now(void)
++{
++	if (cp_sqe_on) {
++		cp_wr(REG_A6XX_CP_SQE_CNTL, 0);
++		cp_sqe_on = false;
++		printf("SWEET CP:   SQE halted at once; CP_SQE_CNTL now 0x%x\n", cp_rd(REG_A6XX_CP_SQE_CNTL));
++	}
++}
++
+ volatile uint32_t *
+ sweet_cp_scratch(uint64_t *pa)
+ {
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -111,6 +111,7 @@
+ void sweet_cp_dump(const char *when);
+ bool sweet_cp_clean(const char *when);                          /* no SMMU, CP_HW_FAULT or PROTECT change */
+ void sweet_cp_halt(void);                                       /* CP_SQE_CNTL = 0 if the SQE runs */
++void sweet_cp_halt_now(void);                                   /* the same, without the pause */
+ volatile uint32_t *sweet_cp_scratch(uint64_t *pa);              /* 4 KiB, uncached, IOVA = PA */
+ 
+ /* sweet_zap.c: stage 5, the zap shader; stop = sweetzap (0-6) */
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -51,6 +51,7 @@
+ #define GS_RBBM_INT_CLEAR_CMD           0x00037u
+ #define GS_RBBM_INT_0_MASK              0x00038u
+ #define GS_RBBM_INT_0_STATUS            0x00201u
++#define GS_RBBM_STATUS                  0x00210u
+ #define GS_CP_RB_RPTR                   0x00806u
+ #define GS_CP_INTERRUPT_STATUS          0x00823u
+ #define GS_CP_PROTECT_CNTL              0x0084fu
+@@ -69,6 +70,7 @@
+ #define GS_INT_CACHE_FLUSH_TS   (1u << 20)
+ #define GS_INT_ERRORS           0x03c00242u     /* AHB 1, ASYNCFIFO 6, HW_ERROR 9, ATB_BUS 22, HANG 23, UCHE_OOB 24, TRAP 25 */
+ #define GS_INT_FATAL            0x01800200u     /* HW_ERROR, HANG_DETECT, UCHE_OOB: the service stops */
++#define GS_INT_HANG             (1u << 23)      /* RBBM_HANG_DETECT: expected, not fatal, during 6.5's test */
+ #define PROT_RDONLY(reg, len)   ((((uint32_t)(len) & 0x3fffu) << 18) | ((uint32_t)(reg) & 0x3ffffu))
+ #define PROT_NORDWR(reg, len)   (PROT_RDONLY(reg, len) | (1u << 31))
+ 
+@@ -173,8 +175,9 @@
+ static uint32_t gs_base_cpint;                  /* CP_INTERRUPT_STATUS in 6.0 */
+ static volatile uint32_t gs_sent;               /* last seqno on the ring; the fence word is the last retired */
+ static volatile uint32_t gs_int_err;            /* error bits the poller has seen */
+-static volatile uint64_t gs_progress_us, gs_hang_us;
+-static volatile bool gs_dead, gs_hang_test, gs_hang_seen;
++static volatile uint64_t gs_progress_us, gs_hang_us, gs_hw_hang_us;
++static volatile bool gs_dead, gs_hang_test, gs_hang_seen, gs_hw_hang_seen;
++static volatile uint32_t gs_hw_hang_n;          /* RBBM_HANG_DETECT latches seen in test mode */
+ static bool gs_ready, gs_window, gs_latches;
+ static uint32_t gs_cur_khz = 180000u, gs_max_khz = 180000u;
+ static uint32_t gs_win_used[GS_WIN_PAGES / 32u];        /* 1 = window page in use */
+@@ -273,7 +276,7 @@
+ 	return ok && !gs_dead;
+ }
+ 
+-/* Stop for good: dump, halt the SQE. Waiters see the dead flag. */
++/* Stop for good: halt the SQE at once (no pause), then dump. Waiters see the dead flag. */
+ static void
+ gs_kill(const char *why)
+ {
+@@ -283,8 +286,8 @@
+ 	gs_dead = true;
+ 	gs_ready = false;
+ 	printf("SWEET GSVC: service DEAD until reboot: %s\n", why);
++	sweet_cp_halt_now();
+ 	gs_dump(why);
+-	sweet_cp_halt();
+ }
+ 
+ /* Scratch-page words that differ from gs_snap (the first 8 logged) */
+@@ -790,7 +793,9 @@
+ /*
+  * The poller: fence and RBBM_INT_0_STATUS every 1 ms while work is
+  * outstanding. Fatal error bits, or 2 s without progress (fence, RPTR or
+- * IB1_REM_SIZE), stop the service, except during 6.5's test.
++ * IB1_REM_SIZE), stop the service. In 6.5's test mode the hardware
++ * RBBM_HANG_DETECT is expected: its latency is logged and it is cleared, not
++ * fatal, and the 2 s rule logs instead of stopping.
+  */
+ static void
+ gs_poller(void *arg, wait_result_t result)
+@@ -804,18 +809,30 @@
+ 		if (gs_dead) {
+ 			return;
+ 		}
++		/* test mode is read before the status, so 6.5 can drain bit 23 and then leave test mode */
++		bool test = gs_hang_test;
+ 		uint32_t st = gs_rd(GS_RBBM_INT_0_STATUS);
+ 		if (st) {
+ 			gs_wr(GS_RBBM_INT_CLEAR_CMD, st);
+-			if (st & GS_INT_ERRORS) {
+-				gs_int_err |= st & GS_INT_ERRORS;
++			uint32_t hw = test ? st & GS_INT_HANG : 0;
++			if (hw) {
++				if (!gs_hw_hang_seen) {
++					gs_hw_hang_us = gs_now_us();
++					gs_hw_hang_seen = true;
++					printf("SWEET GSVC: poller: RBBM_HANG_DETECT (RBBM_INT_0_STATUS 0x%08x, RBBM_STATUS 0x%08x); "
++					    "test mode: cleared, not fatal\n", st, gs_rd(GS_RBBM_STATUS));
++				}
++				gs_hw_hang_n += 1u;
++			}
++			uint32_t err = st & GS_INT_ERRORS & ~hw;
++			if (err) {
++				gs_int_err |= err;
+ 				gs_fence[3] += 1u;
+ 				if (logged++ < GS_ERR_LOG_MAX) {
+-					printf("SWEET GSVC: poller: RBBM_INT_0_STATUS 0x%08x has error bits 0x%08x\n", st,
+-					    st & GS_INT_ERRORS);
++					printf("SWEET GSVC: poller: RBBM_INT_0_STATUS 0x%08x has error bits 0x%08x\n", st, err);
+ 				}
+ 			}
+-			if (st & GS_INT_FATAL) {
++			if (st & GS_INT_FATAL & ~hw) {
+ 				gs_kill("fatal error bit in RBBM_INT_0_STATUS");
+ 				return;
+ 			}
+@@ -1302,6 +1319,8 @@
+ 	}
+ 	gpu_pause("6.5 the CP waits on purpose; the detector runs in test mode");
+ 	gs_hang_seen = false;
++	gs_hw_hang_seen = false;
++	gs_hw_hang_n = 0;
+ 	gs_hang_test = true;
+ 	uint32_t seq = 0;
+ 	if (!gs_submit_locked(&ib, 1, true, &seq)) {
+@@ -1313,10 +1332,13 @@
+ 		gpu_sleep_ms(5);
+ 	}
+ 	uint64_t ms = gs_hang_seen ? (gs_hang_us - t0) / 1000u : 0;
+-	printf("SWEET GSVC:   detector %s after %llu ms (want 2000-2100); word 12 0x%08x fence %u sent %u\n",
++	uint64_t hw_ms = gs_hw_hang_seen && gs_hw_hang_us > t0 ? (gs_hw_hang_us - t0) / 1000u : 0;
++	printf("SWEET GSVC:   software detector %s after %llu ms (want 2000-2100); word 12 0x%08x fence %u sent %u\n",
+ 	    gs_hang_seen ? "fired" : "did NOT fire in 3 s", ms, gs_page[12], gs_fence[0], gs_sent);
++	printf("SWEET GSVC:   hardware RBBM_HANG_DETECT %s after %llu ms, %u latch(es) so far (want fired)\n",
++	    gs_hw_hang_seen ? "fired" : "did NOT fire", hw_ms, gs_hw_hang_n);
+ 	gs_dump("6.5 while waiting");
+-	bool ok = gs_hang_seen && ms >= 2000u && ms <= 2100u && gs_page[12] != 0xc0ff6501u;
++	bool ok = gs_hang_seen && ms >= 2000u && ms <= 2100u && gs_hw_hang_seen && gs_page[12] != 0xc0ff6501u;
+ 
+ 	gs_page[11] = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -1324,8 +1346,15 @@
+ 	int r = gs_wait_seq(seq, 10);
+ 	printf("SWEET GSVC:   released: fence %u %s after %llu us, word 12 0x%08x (want 0xc0ff6501)\n", seq,
+ 	    r == 0 ? "reached" : "NOT reached", gs_now_us() - t1, gs_page[12]);
++	/* drain a bit-23 latch left from the wait, then leave test mode: a later one is fatal */
++	uint32_t st = gs_rd(GS_RBBM_INT_0_STATUS) & GS_INT_HANG;
++	if (st) {
++		gs_wr(GS_RBBM_INT_CLEAR_CMD, st);
++		gs_hw_hang_n += 1u;
++	}
+ 	gs_hang_test = false;
+ 	gs_hang_seen = false;
++	printf("SWEET GSVC:   RBBM_HANG_DETECT latches in test mode: %u\n", gs_hw_hang_n);
+ 	ok = ok && r == 0 && gs_page[12] == 0xc0ff6501u;
+ 	if (r == ETIMEDOUT) {
+ 		r = gs_wait_seq(seq, GS_WAIT_MS);

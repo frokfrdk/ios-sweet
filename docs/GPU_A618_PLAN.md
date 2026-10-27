@@ -1568,7 +1568,7 @@ Fixes found on G5a or G5b are new patches and CI runs, shown before anything boo
 Stage 5 leaves these for later: CP_PROTECT, interrupts, indirect buffers, `CACHE_FLUSH_TS` fences (Stage 6),
 and reloading the zap after power collapse (Stage 9).
 
-### Stage 6: kernel GPU service and user client (patch 0111 written; not booted)
+### Stage 6: kernel GPU service and user client (0111 booted to 6.4; 0111b written, not booted)
 
 Planned 2026-10-26, after G5c passed Stage 5. The owner asked to see this plan before any code.
 
@@ -1586,6 +1586,16 @@ Planned 2026-10-26, after G5c passed Stage 5. The owner asked to see this plan b
 - 6.5 waits on scratch word **11** and writes word **12**, because 6.3 already uses words 8 and 10.
 - In 6.2, if `INT_0_STATUS` bit 20 does not latch and clear, the step logs it as a finding (risk 4) and
   goes on. It is not a stop.
+
+**Patch 0111b (2026-10-27, after G6c)** changes 6.5 and the kill path:
+- G6c showed that the hardware `RBBM_HANG_DETECT` (`INT_0_STATUS` bit 23, `HANG_INT_CNTL`
+  (1<<30)|0x1fffff) fires during the deliberate `CP_WAIT_REG_MEM`, long before the 2 s software rule. In
+  0111 it was fatal, so 6.5 killed the service.
+- In 6.5's test mode only, bit 23 is now expected: the poller logs its latency from the submit, clears it
+  and counts repeats. It is not added to the error bits. Outside test mode it stays fatal.
+- 6.5 drains a leftover bit 23 after the release, before it leaves test mode. The poller reads the test
+  flag before the status, so that drain cannot race into a kill.
+- `gs_kill` now halts the SQE at once (`sweet_cp_halt_now`, no 2 s `gpu_pause`) and dumps after that.
 
 **Idea.** Turn the CP that Stage 5 left running (outside secure mode, writes reaching DRAM) into a small
 service that other code can use. First add what mainline's `hw_init` and `a6xx_submit` do and we skipped:
@@ -1890,7 +1900,8 @@ Test, without losing the CP for later steps:
 4. Then a normal submit, to show that nothing stuck.
 
 ✅ Pass when the detector fires in the window, the CP resumes and finishes after the release, and no error
-bit latches. If the CP does *not* resume, the real rule runs (SQE halted, service dead), the step fails,
+bit latches. Since 0111b, the hardware `RBBM_HANG_DETECT` (bit 23) must also fire during the wait; its
+latency is logged, and it is not counted as an error bit in test mode. If the CP does *not* resume, the real rule runs (SQE halted, service dead), the step fails,
 and the image's later steps are skipped.
 
 #### 6.6 Clock steps (`sweetsvc=6`)
@@ -2268,7 +2279,16 @@ CPU-visible. Stages 0–5 are done.
 Not known: whether anything differs between secure and non-secure writes, since both landed. Next (to plan, with
 the owner's OK): Stage 6.
 
-**Stage 6 planned and approved (2026-10-26); patch 0111 written, not booted.** The detailed plan is under
+**Stage 6 (2026-10-27): 0111 passes 6.0–6.4 on the phone; 0111b written for 6.5, not booted.**
+- G6a passed 6.0–6.1, G6b 6.0–6.3, G6c 6.0–6.4. Fence 1 lands in 23 µs; bit 20 latches and clears; the
+  window at 8 GiB, IBs and remap work; the self-test has 0 bad pixels (copy 3.3 ms).
+- G6c stopped at 6.5: the hardware hang detector (bit 23) fired during the deliberate wait and was fatal.
+  The CP did resume after the release. 0111b makes bit 23 expected in 6.5's test mode (see the top of
+  "Stage 6").
+- While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
+  is missing.
+
+The detailed plan is under
 "Stage 6" above, with 0111's deviations listed at its top. In short:
 - patch 0111 (kernel only) for steps 6.0–6.7, with the new boot-arg `sweetsvc`;
 - images G6a (1), G6b (3), G6c (5) and G6d (7);
