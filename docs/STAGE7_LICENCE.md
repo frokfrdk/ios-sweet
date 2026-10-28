@@ -10,7 +10,7 @@ and the kernel side of 8(a) need nothing from ios-sailfish. This is not legal ad
   "CA calls these six EAGL methods", "dyld asks AMFI op 0x5a"); the code that expresses them is.
 - **Most of Stage 7 is Mesa, and Mesa is MIT.** The GL driver, the a618 support and the register XML
   can be used freely with the notice kept. Upstream ios-sweet is MIT too.
-- **Our fork is on GitHub.** If it is public, whatever lands in it is published (redistribution is
+- **Our fork (frokfrdk/ios-sweet) is public**, so whatever lands in it is published (redistribution is
   exactly what a missing licence forbids).
 - Section 2 of `GPU_A618_PLAN.md` was written from reading their repository. Strictly, that rules out a
   textbook clean room (where the reader and the writer are different people). What is still clear is
