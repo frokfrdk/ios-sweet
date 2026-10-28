@@ -22,6 +22,8 @@ cat > "$OUT/ios-arm64.ini" <<EOF
 [binaries]
 c = '$CC'
 cpp = '$CXX'
+objc = '$CC'
+objcpp = '$CXX'
 ar = '$AR'
 strip = '$STRIP'
 pkg-config = 'false'
@@ -37,8 +39,12 @@ endian = 'little'
 [built-in options]
 c_args = [$FLAGS, '-DSWEETDRM', '-I$SWEETDRM_INC']
 cpp_args = [$FLAGS, '-DSWEETDRM', '-I$SWEETDRM_INC']
+objc_args = [$FLAGS]
+objcpp_args = [$FLAGS]
 c_link_args = [$FLAGS]
 cpp_link_args = [$FLAGS]
+objc_link_args = [$FLAGS]
+objcpp_link_args = [$FLAGS]
 default_library = 'static'
 EOF
 
