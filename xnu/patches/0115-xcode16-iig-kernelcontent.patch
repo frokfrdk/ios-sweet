@@ -33,3 +33,19 @@
  
  	message->objects[0] = 0;
  	if ((action = OSDynamicCast(OSAction, object))) {
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,13 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/*
++	 * SWEET: Xcode 16's iig reads the message body from here in kernel code
++	 * (as xnu-11215 does); every IORPC the kernel builds sets it.
++	 */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
