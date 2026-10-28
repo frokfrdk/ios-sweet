@@ -2309,6 +2309,21 @@ the owner's OK): Stage 6.
   inside the 2000–2100 ms window. After the release, fence 90 landed in 23 µs and the word read back as
   expected. There were no SMMU or CP faults, and iOS kept running. SweetGPUReady was not published, as
   required at sweetsvc=5. Next is G6d (sweetsvc=7).
+- **G6d (2026-10-28, same kernel, sweetsvc=7): 6.0–6.7 PASSED; the kernel part of Stage 6 is complete.**
+  - 6.6 clock steps: perf 4 measured 430,000 kHz and perf 5 measured 565,002 kHz. Both were within 1 %,
+    and DCVS_RETURN was 0 both times. So the perf-index order guessed from 2B.5 is right for 4 and 5.
+  - 6.6 self-tests: 0 bad pixels at both clocks. The 64×64 copy took 3.30 ms at 180 MHz, 2.18 ms at
+    430 MHz and 2.15 ms at 565 MHz. The copy is barely faster at 565 than at 430, which by the 6.6 rule
+    points at memory bandwidth (the DDR vote is still "no change"). A BW-index step is the planned
+    follow-up. This is a guess until it is measured.
+  - "service ready": chip_id 0x06010800, gmem 0x80000 at 0x100000, cur 565002 / max 565000 kHz, window
+    0x200000000 + 64 MiB.
+  - 6.7 hold: 6 rounds through the C API, each with 0 bad pixels and 0 window pages in use afterwards.
+    There were no SMMU faults, no CP HW_FAULT and no hang latches outside 6.5's test, and GX stayed on.
+  - Then "published SweetGPUReady", and "SweetGPU registered": SweetGPU::start from 0112 ran on the phone.
+    iOS kept booting (fairplayd, bluetoothd) and the touch driver kept running.
+  - Next: G6e (sweetgpu-test through the user client). It waits on the owner's choice of how the tool gets
+    onto the phone.
 - While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
   is missing.
 
