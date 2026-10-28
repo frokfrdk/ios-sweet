@@ -38,7 +38,13 @@ and the kernel side of 8(a) need nothing from ios-sailfish. This is not legal ad
    parallel the owner asks for a licence. When the EAGL shim is reached, use theirs if a licence has
    arrived, or write our own if not. Nothing is lost while waiting.
 
-## What I need from the owner
+## Decision (owner, 2026-10-28): option 2, write everything ourselves
 
-- Pick 1, 2 or 3.
-- For 1 or 3: whether you want a draft of the message to joranv1 (you send it yourself).
+No contact with joranv1. Rules from here on:
+
+- No code, scripts, patches or tables from ios-sailfish are copied or adapted, including `eagl.c`,
+  `sweet_drm.c`, `sweetgl.c`, `gen-dispatch.py`, `mesa.patch` and their build scripts.
+- Allowed sources: Mesa (MIT, keep its notices), upstream ios-sweet (MIT), Apple's public SDK headers
+  and docs, our own disassembly of iOS 16 binaries from our own root (kept local, never committed), and
+  the facts already noted in `GPU_A618_PLAN.md` section 2 (what is needed, not how they wrote it).
+- New files say in their header comment which public sources they follow.

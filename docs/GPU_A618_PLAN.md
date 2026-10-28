@@ -164,6 +164,9 @@ reference for hardware sequences, and write our own code. The options:
 
 Stages 0–6 need nothing from their code, so the licence question blocks only Stage 7.
 
+**Decided 2026-10-28 (owner): option 2, everything is our own code.** Rules and allowed sources are
+in `docs/STAGE7_LICENCE.md`.
+
 ## 6. Stages
 
 Each stage is a kernel patch in `xnu/patches/` built by the GitHub Actions workflow, booted with
@@ -2093,6 +2096,64 @@ Stage 6 leaves these for later:
    updates are same-size in-place block writes, like `dscpatch.ps1`.
 
 ✅ Pass when the home screen renders through Mesa, with `CA_*` debug showing the GLES context.
+
+#### Stage 7 planned in detail (2026-10-28, option 2: all our own code; nothing built)
+
+Facts from Mesa 26.2.5 (read locally, MIT):
+
+- On darwin `system_has_kms_drm` is false, so Mesa sets `dep_libdrm = null_dep` and does not build
+  `src/freedreno/drm`. We supply our own libdrm subset and a small meson change.
+- libdrm calls freedreno makes: `drmCommandWriteRead` (13), `drmIoctl` (6), `drmCommandWrite` (6),
+  `drmGetVersion`/`drmFreeVersion`, `drmGetCap`, `drmOpenWithType`, the Prime and Syncobj calls (fence
+  fds; stub them as unsupported).
+- msm ioctls: GET_PARAM, SET_PARAM, GEM_NEW, GEM_INFO (7 call sites), GEM_CPU_PREP, GEM_MADVISE,
+  GEM_SUBMIT, WAIT_FENCE, SUBMITQUEUE_NEW/QUERY/CLOSE. Params asked: CHIP_ID, GPU_ID, GMEM_SIZE,
+  GMEM_BASE, MAX_FREQ, TIMESTAMP, PRIORITIES, FAULTS, SUSPENDS, UCHE_TRAP_BASE, VA_SIZE, SYSPROF.
+- **Framebuffer fetch** (which CA's blend-filter layers need) is enabled only when
+  `fd_device_version() >= FD_VERSION_GMEM_BASE`, so our `drmGetVersion` must report an msm minor at
+  least that high.
+- `os_mmap` is a macro in `src/util/os_mman.h`; BO mapping goes through it.
+- `src/gallium/frontends/hgl` (Haiku) is the smallest existing GL frontend and the model for ours.
+
+Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can run in parallel):
+
+- **7.0 Mesa build job.** A macOS CI job (separate workflow, so kernel runs don't wait on it): Mesa
+  26.2.5 at a pinned commit, our own meson cross file for iphoneos arm64, `-Dgallium-drivers=freedreno
+  -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled
+  -Dgles1=disabled -Dgles2=enabled -Dllvm=disabled -Dshader-cache=disabled -Dzstd=disabled
+  -Dexpat=disabled -Dbuild-tests=false`, static, plus our patch (meson: build freedreno/drm on darwin
+  against our libdrm subset; `os_mmap` → our map hook). Cache the build. ✅ when it links and
+  `nm` shows the freedreno screen entry points. Exact option names are checked against
+  `meson.options` when writing it.
+- **7.1 `sweetdrm`** (our libdrm subset + msm emulation) over the SweetGPU selectors 10–16:
+  GEM_NEW → bo new, GEM_INFO → iova and a map cookie, CPU_PREP / WAIT_FENCE → wait, GEM_SUBMIT →
+  submit (a6xx submits are iova-based, so no relocations), SUBMITQUEUE_* → fake ids, MADVISE → ok,
+  GET_PARAM from `info` (chip 0x06010800, GPU_ID 618, GMEM 0x80000 at 0x100000). TIMESTAMP needs the
+  always-on counter: a new selector or a field on the fence page (kernel patch). ✅ a host-side unit
+  test against a fake SweetGPU, then on the phone in 7.2.
+- **7.2 Offscreen test binary.** Gallium directly (no GL frontend yet): create the screen through
+  sweetdrm, clear and draw a triangle into a linear resource, read back, report through sel 16 as
+  sweetgpu-test does. `FD_MESA_DEBUG=nogmem,noubwc` first. Deploying it is a root edit (owner OK).
+- **7.3 GL frontend** modelled on hgl: a surfaceless GLES context, rendering only into FBOs, the GL
+  entry points exported for the EAGL shim. ✅ the 7.2 test redone through GL calls.
+- **7.4 EAGL research** (local only; nothing from Apple goes into git): disassemble QuartzCore and
+  OpenGLES from our root to list exactly what `CA::OGL::GLESContext` calls on `EAGLContext`, how it
+  gets the GL dispatch, binds IOSurfaces and presents. Output: our own interface notes, which define
+  7.5.
+- **7.5 EAGL shim**, written from the 7.4 notes.
+- **7.6 Kernel plumbing**: `sweetenv=` (exec-time env vars), AMFI op 0x5a in the 0092 handler, an
+  `IOAcceleratorES` stub without `MetalPluginName`.
+- **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.
+
+Risks to check early (guesses):
+
+- **The GPU VA window is 64 MiB** (0x200000000 + 0x4000000). Three 6 MB CA surfaces plus textures and
+  Mesa's own BOs may not fit, so the window probably needs to grow before 7.7.
+- Checked: only *kernel* BOs are contiguous (`kmem_alloc_contig`, used by 6.x and 8a.1). The user
+  client's bo new is an IOBufferMemoryDescriptor imported page by page (G6h: 24-page BO fine), so
+  Mesa's BOs can be scattered. Still open: how many BOs and pages the window bookkeeping allows.
+- CA's surfaces are 3328 bytes per row (64-aligned), which suits a6xx's linear pitch rule; other
+  surfaces CA samples may not be.
 
 ### Stage 8: present path
 
