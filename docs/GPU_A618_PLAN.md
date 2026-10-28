@@ -2303,6 +2303,12 @@ the owner's OK): Stage 6.
 - G6c stopped at 6.5: the hardware hang detector (bit 23) fired during the deliberate wait and was fatal.
   The CP did resume after the release. 0111b makes bit 23 expected in 6.5's test mode (see the top of
   "Stage 6").
+- **G6c2 (2026-10-28, kernel 0111b + 0112, CI 40643167242, sweetsvc=5): 6.0–6.5 PASSED.** The 6.4
+  self-test again had 0 bad pixels. In 6.5 the hardware RBBM_HANG_DETECT latched after 186 ms (one latch,
+  RBBM_STATUS 0x00800005). It was logged and cleared, not fatal. The software detector fired after 2011 ms,
+  inside the 2000–2100 ms window. After the release, fence 90 landed in 23 µs and the word read back as
+  expected. There were no SMMU or CP faults, and iOS kept running. SweetGPUReady was not published, as
+  required at sweetsvc=5. Next is G6d (sweetsvc=7).
 - While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
   is missing.
 
