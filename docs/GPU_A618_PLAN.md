@@ -2335,6 +2335,12 @@ the owner's OK): Stage 6.
       IOBMD inTaskWithOptions with kIOMapWriteCombineCache.
     - Next: 0112c makes user BOs cacheable (no WC) and cleans/invalidates them to PoC around submit/wait,
       like imports and the kernel's own BOs.
+  - G6g (0112c, same args as G6f): **no freeze, the full sweetgpu-test session ran**.
+    - All 6 bo new calls, the IOSurface import, 4 submit+wait (seqno 116–119) and all frees returned 0.
+    - Both bad submits were refused (kIOReturnBadArgument).
+    - Close: "last seqno 119 retired, 0 leaked". No GPU/SMMU errors, and iOS kept running.
+    - Still open: the tool's pixel checks (PASS/FAIL) go to /dev/console, which isn't in the persistent
+      log. 6U's pass rule needs that verdict logged.
   - (Before G6e) Next: G6e (sweetgpu-test through the user client). It waits on the owner's choice of how the tool gets
     onto the phone.
 - While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
