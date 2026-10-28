@@ -15,8 +15,8 @@ env:
 
 jobs:
   build:
-    # same Xcode 15 / iPhoneOS SDK as xnu.yml
-    runs-on: macos-14
+    # same Xcode / iPhoneOS SDK as xnu.yml
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
 
       - name: sweetdrm
         run: |
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           cd tools/sweetgl/sweetdrm
           INC="-I$RUNNER_TEMP/mesa/include -Iinclude"
@@ -55,7 +55,7 @@ jobs:
 
       - name: Build
         run: |
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           xcodebuild -version
           meson --version; bison --version | head -1

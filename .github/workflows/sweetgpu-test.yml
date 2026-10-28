@@ -10,15 +10,15 @@ on:
 
 jobs:
   build:
-    # same Xcode 15 / iPhoneOS SDK as xnu.yml
-    runs-on: macos-14
+    # same Xcode / iPhoneOS SDK as xnu.yml
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Build sweetgpu-test
         run: |
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           xcodebuild -version
           # the iPhoneOS SDK has no IOKit headers; the tool declares the calls it uses
