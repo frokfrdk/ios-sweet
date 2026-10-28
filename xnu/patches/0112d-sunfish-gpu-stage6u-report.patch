@@ -1,0 +1,92 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -22,6 +22,10 @@
+  *           kIOReturnNotResponding once the service is dead
+  *   sel 15  info: struct sweet_gpu_info out; the fence page is mapped
+  *           read-only into the task (word 0 = last retired seqno)
++ *   sel 16  report: struct in, a line of text (at most 192 bytes) that the
++ *           kernel logs as "SWEET GPUUC: report from <proc>: <text>", for
++ *           tools whose stdout is not in the persistent log (0112d); the first
++ *           64 per client are logged, the rest are dropped
+  *
+  * Other selectors return kIOReturnUnsupported (logged once each). Closing
+  * waits for this client's last seqno (2 s cap), then frees its BOs. A BO
+@@ -87,6 +91,7 @@
+ 	kSweetGPUSubmit         = 13,
+ 	kSweetGPUWait           = 14,
+ 	kSweetGPUInfo           = 15,
++	kSweetGPUReport         = 16,
+ };
+ 
+ #define SWEET_GPU_PAGE          4096u           /* GPU pages; XNU's are 16 KiB */
+@@ -95,6 +100,8 @@
+ #define SWEET_GPU_WAIT_MAX_MS   10000u
+ #define SWEET_GPU_CLOSE_WAIT_MS 2000u
+ #define SWEET_GPU_UC_PAUSE_MS   2000u
++#define SWEET_GPU_REPORT_MAX    192u
++#define SWEET_GPU_REPORT_LINES  64u
+ 
+ /* sweetgpuucslow=1: log what comes next, then give the persistent log time to reach the disk */
+ static int sweet_gpu_uc_slow = -1;
+@@ -205,6 +212,7 @@
+ 	bool fSubmitted;
+ 	IOMemoryMap *fFenceMap;
+ 	uint64_t fLogged;                       /* unsupported selectors already logged */
++	uint32_t fReports;                      /* report lines logged */
+ 
+ 	struct sweet_gpu_bo *slot(uint32_t handle);
+ 	void release(struct sweet_gpu_bo *bo);
+@@ -215,6 +223,7 @@
+ 	IOReturn submit(IOExternalMethodArguments *args);
+ 	IOReturn wait(IOExternalMethodArguments *args);
+ 	IOReturn info(IOExternalMethodArguments *args);
++	IOReturn report(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -538,6 +547,36 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/* No lock: fReports is only a log budget */
++IOReturn
++SweetGPUUserClient::report(IOExternalMethodArguments *args)
++{
++	uint32_t len = args->structureInputSize;
++	if (args->structureInputDescriptor != NULL || args->structureInput == NULL || len == 0 ||
++	    len > SWEET_GPU_REPORT_MAX) {
++		return kIOReturnBadArgument;
++	}
++	if (fReports >= SWEET_GPU_REPORT_LINES) {
++		return kIOReturnSuccess;
++	}
++	char text[SWEET_GPU_REPORT_MAX + 1];
++	const unsigned char *in = (const unsigned char *)args->structureInput;
++	uint32_t n = 0;
++	for (; n < len && in[n] != '\0'; n++) {
++		text[n] = in[n] >= 0x20 && in[n] < 0x7f ? (char)in[n] : '?';
++	}
++	while (n > 0 && text[n - 1] == ' ') {
++		n--;
++	}
++	text[n] = '\0';
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	fReports++;
++	IOLog("SWEET GPUUC: report from %s: %s%s\n", name, text,
++	    fReports == SWEET_GPU_REPORT_LINES ? " (the last report logged for this client)" : "");
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ SweetGPUUserClient::clientClose(void)
+ {
+@@ -593,6 +632,8 @@
+ 	case kSweetGPUInfo:
+ 		ret = info(args);
+ 		break;
++	case kSweetGPUReport:
++		return report(args);    /* not paused or logged as a step: it is the log */
+ 	default: {
+ 		uint32_t bit = selector < 63 ? selector : 63;
+ 		if (!(fLogged & (1ULL << bit))) {

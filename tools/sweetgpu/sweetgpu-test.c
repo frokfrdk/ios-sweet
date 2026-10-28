@@ -11,14 +11,17 @@
  *      and no seqno retires
  *
  * Prints "sweetgpu-test: PASS, 0 bad pixels" or "... FAIL ..." and exits 0/1.
+ * Once SweetGPU is open, every line also goes to the kernel log through
+ * selector 16 (report, 0112d), as "SWEET GPUUC: report from sweetgpu-test: ...".
  *
- * Run at boot by the launchd job com.sweet.gpu-test (stdout to /dev/console, so the
- * persistent log keeps it): it does nothing unless the boot-args contain
+ * Run at boot by the launchd job com.sweet.gpu-test (stdout to /dev/console, which
+ * the persistent log does not keep, hence the reports): it does nothing unless the boot-args contain
  * sweetgputest=1, and then waits up to 15 min for SweetGPU, which only appears
  * after the kernel's 6.7 hold, minutes after launchd starts it.
  * Built in CI: xcrun -sdk iphoneos clang ... -framework IOKit -framework
  * IOSurface -framework CoreFoundation, then codesign -s - (ad hoc).
  */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -51,7 +54,8 @@ size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
 /* The ABI in iokit/Kernel/arm/SweetGPU.cpp */
 #define SWEET_GPU_ABI           1u
 #define SWEET_GPU_MAX_IBS       16u
-enum { SEL_BO_NEW = 10, SEL_BO_FREE, SEL_BO_IMPORT, SEL_SUBMIT, SEL_WAIT, SEL_INFO };
+enum { SEL_BO_NEW = 10, SEL_BO_FREE, SEL_BO_IMPORT, SEL_SUBMIT, SEL_WAIT, SEL_INFO, SEL_REPORT };
+#define REPORT_MAX              192u
 struct sweet_gpu_ib {
 	uint32_t handle, offset, size_dw;
 };
@@ -82,6 +86,28 @@ _Static_assert(sizeof(struct sweet_gpu_info) == 56, "info ABI");
 #define WAIT_MS                 1000u
 
 static io_connect_t conn;
+
+/* A line to stdout and, once SweetGPU is open, to the kernel log (selector 16) */
+static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void
+say(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	fputs(line, stdout);
+	if (conn) {
+		const char *text = strncmp(line, "sweetgpu-test: ", 15) == 0 ? line + 15 : line;
+		size_t n = strcspn(text, "\n");
+		n = n < REPORT_MAX ? n : REPORT_MAX;
+		if (n > 0) {
+			IOConnectCallMethod(conn, SEL_REPORT, NULL, 0, text, n, NULL, NULL, NULL, NULL);
+		}
+	}
+}
 
 static uint32_t
 parity(uint32_t v)
@@ -122,7 +148,7 @@ bo_free(struct bo *b)
 		uint64_t in = b->h;
 		kern_return_t kr = IOConnectCallMethod(conn, SEL_BO_FREE, &in, 1, NULL, 0, NULL, NULL, NULL, NULL);
 		if (kr) {
-			printf("sweetgpu-test: bo free %u: 0x%x\n", b->h, kr);
+			say("sweetgpu-test: bo free %u: 0x%x\n", b->h, kr);
 		}
 		b->h = 0;
 	}
@@ -137,7 +163,7 @@ submit(const struct sweet_gpu_ib *ibs, uint32_t n, uint32_t *seq)
 	memcpy(s.ib, ibs, n * sizeof(*ibs));
 	uint64_t out = 0;
 	uint32_t on = 1;
-	__asm__ volatile("dsb sy" ::: "memory");        /* write-combined CPU writes out before the GPU reads */
+	__asm__ volatile("dsb sy" ::: "memory");        /* CPU writes done; the kernel cleans the BOs to PoC (0112c) */
 	kern_return_t kr = IOConnectCallMethod(conn, SEL_SUBMIT, NULL, 0, &s, 8 + n * sizeof(*ibs), &out, &on, NULL, NULL);
 	*seq = (uint32_t)out;
 	return kr;
@@ -154,7 +180,7 @@ run(uint32_t h, uint32_t dw, const char *what)
 		kr = IOConnectCallMethod(conn, SEL_WAIT, in, 2, NULL, 0, NULL, NULL, NULL, NULL);
 	}
 	if (kr) {
-		printf("sweetgpu-test: %s: submit/wait 0x%x\n", what, kr);
+		say("sweetgpu-test: %s: submit/wait 0x%x\n", what, kr);
 	}
 	return kr;
 }
@@ -176,12 +202,12 @@ check(volatile const uint32_t *p, uint32_t stride_words, int pattern, const char
 		uint32_t got = p[(i / W) * stride_words + i % W];
 		if (got != want) {
 			if (bad < 4) {
-				printf("sweetgpu-test:   %s: pixel (%u,%u) 0x%08x, want 0x%08x\n", what, i % W, i / W, got, want);
+				say("sweetgpu-test:   %s: pixel (%u,%u) 0x%08x, want 0x%08x\n", what, i % W, i / W, got, want);
 			}
 			++bad;
 		}
 	}
-	printf("sweetgpu-test: %s: %u bad pixels\n", what, bad);
+	say("sweetgpu-test: %s: %u bad pixels\n", what, bad);
 	return bad;
 }
 
@@ -197,10 +223,10 @@ test_bos(void)
 	kr = kr ? kr : bo_new(4u * clear_dw, &c);
 	kr = kr ? kr : bo_new(4u * copy_dw, &d);
 	if (kr) {
-		printf("sweetgpu-test: bo new: 0x%x\n", kr);
+		say("sweetgpu-test: bo new: 0x%x\n", kr);
 		goto out;
 	}
-	printf("sweetgpu-test: BOs at gpu 0x%llx 0x%llx 0x%llx 0x%llx\n", a.gva, b.gva, c.gva, d.gva);
+	say("sweetgpu-test: BOs at gpu 0x%llx 0x%llx 0x%llx 0x%llx\n", a.gva, b.gva, c.gva, d.gva);
 	for (uint32_t i = 0; i < WORDS; ++i) {
 		a.cpu[i] = POISON;
 		b.cpu[i] = POISON;
@@ -268,7 +294,7 @@ test_surface(void)
 	IOSurfaceRef s = IOSurfaceCreate(props);
 	CFRelease(props);
 	if (s == NULL) {
-		printf("sweetgpu-test: IOSurfaceCreate failed\n");
+		say("sweetgpu-test: IOSurfaceCreate failed\n");
 		return UINT32_MAX;
 	}
 	uint32_t bad = UINT32_MAX, rowdw = (uint32_t)(IOSurfaceGetBytesPerRow(s) / 4u);
@@ -277,15 +303,15 @@ test_surface(void)
 	uint32_t n = 3;
 	kern_return_t kr = IOConnectCallMethod(conn, SEL_BO_IMPORT, &in, 1, NULL, 0, out, &n, NULL, NULL);
 	if (kr) {
-		printf("sweetgpu-test: import of surface %llu: 0x%x\n", in, kr);
+		say("sweetgpu-test: import of surface %llu: 0x%x\n", in, kr);
 		goto out;
 	}
 	imp = (struct bo){ (uint32_t)out[0], out[1], NULL, (uint32_t)out[2] };
-	printf("sweetgpu-test: surface %llu (%u bytes per row) imported at gpu 0x%llx, %u bytes\n", in, rowdw * 4u,
+	say("sweetgpu-test: surface %llu (%u bytes per row) imported at gpu 0x%llx, %u bytes\n", in, rowdw * 4u,
 	    imp.gva, imp.size);
 	const uint32_t ib_dw = H * (3u + W);
 	if ((kr = bo_new(4u * ib_dw, &ib))) {
-		printf("sweetgpu-test: bo new: 0x%x\n", kr);
+		say("sweetgpu-test: bo new: 0x%x\n", kr);
 		goto out;
 	}
 	IOSurfaceLock(s, 0, NULL);
@@ -327,7 +353,7 @@ test_bad(void)
 	struct bo b = { 0 };
 	kern_return_t kr = bo_new(size, &b);
 	if (kr) {
-		printf("sweetgpu-test: bo new: 0x%x\n", kr);
+		say("sweetgpu-test: bo new: 0x%x\n", kr);
 		return 0;
 	}
 	struct sweet_gpu_info i0, i1;
@@ -338,7 +364,7 @@ test_bad(void)
 	info(&i1);
 	bo_free(&b);
 	int ok = k1 == kIOReturnBadArgument && k2 == kIOReturnBadArgument && i0.last_retired == i1.last_retired;
-	printf("sweetgpu-test: bad submits: IB past its BO 0x%x, foreign handle 0x%x (want 0x%x both); last retired %u -> %u: %s\n",
+	say("sweetgpu-test: bad submits: IB past its BO 0x%x, foreign handle 0x%x (want 0x%x both); last retired %u -> %u: %s\n",
 	    k1, k2, kIOReturnBadArgument, i0.last_retired, i1.last_retired, ok ? "refused" : "NOT refused");
 	return ok;
 }
@@ -370,10 +396,10 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (!asked_for()) {
-		printf("sweetgpu-test: no sweetgputest=1 in the boot-args, nothing to do\n");
+		say("sweetgpu-test: no sweetgputest=1 in the boot-args, nothing to do\n");
 		return 0;
 	}
-	printf("sweetgpu-test: waiting up to %u s for SweetGPU (published after the kernel's 6.7 hold)\n", WAIT_MAX_S);
+	say("sweetgpu-test: waiting up to %u s for SweetGPU (published after the kernel's 6.7 hold)\n", WAIT_MAX_S);
 	io_service_t svc = 0;
 	unsigned waited = 0;
 	while (!(svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("SweetGPU"))) && waited < WAIT_MAX_S) {
@@ -381,21 +407,21 @@ main(void)
 		waited += WAIT_STEP_S;
 	}
 	if (!svc) {
-		printf("sweetgpu-test: FAIL, no SweetGPU service after %u s (needs sweetgpu=8 sweetsvc=7 and 6.7 passed)\n",
+		say("sweetgpu-test: FAIL, no SweetGPU service after %u s (needs sweetgpu=8 sweetsvc=7 and 6.7 passed)\n",
 		    waited);
 		return 1;
 	}
-	printf("sweetgpu-test: SweetGPU found after %u s\n", waited);
+	say("sweetgpu-test: SweetGPU found after %u s\n", waited);
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);
 	if (kr) {
-		printf("sweetgpu-test: IOServiceOpen: 0x%x (root only)\n", kr);
+		say("sweetgpu-test: IOServiceOpen: 0x%x (root only)\n", kr);
 		return 1;
 	}
 	struct sweet_gpu_info in;
 	kr = info(&in);
 	volatile const uint32_t *fence = (volatile const uint32_t *)(uintptr_t)in.fence_user_va;
-	printf("sweetgpu-test: info 0x%x: abi %u chip_id 0x%08x gmem %#x at %#x, %u/%u kHz, flags %#x, last retired %u, "
+	say("sweetgpu-test: info 0x%x: abi %u chip_id 0x%08x gmem %#x at %#x, %u/%u kHz, flags %#x, last retired %u, "
 	    "fence page 0x%llx (word 0 %u), window 0x%llx + 0x%llx\n", kr, in.abi, in.chip_id, in.gmem_size, in.gmem_base,
 	    in.cur_khz, in.max_khz, in.flags, in.last_retired, in.fence_user_va, fence ? fence[0] : 0, in.window_base,
 	    in.window_size);
@@ -406,10 +432,11 @@ main(void)
 	uint32_t bad = bad_bo == UINT32_MAX || bad_surf == UINT32_MAX ? UINT32_MAX : bad_bo + bad_surf;
 	ok = ok && bad == 0 && refused;
 	if (bad == UINT32_MAX) {
-		printf("sweetgpu-test: FAIL, a pixel test did not run\n");
+		say("sweetgpu-test: FAIL, a pixel test did not run\n");
 	} else {
-		printf("sweetgpu-test: %s, %u bad pixels\n", ok ? "PASS" : "FAIL", bad);
+		say("sweetgpu-test: %s, %u bad pixels\n", ok ? "PASS" : "FAIL", bad);
 	}
 	IOServiceClose(conn);
+	conn = 0;
 	return ok ? 0 : 1;
 }
