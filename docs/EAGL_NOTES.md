@@ -97,8 +97,16 @@ The slot numbers were matched to names through OpenGLES's exported trampolines (
 
 OpenGLES matches the `IOAcceleratorES` (or `IOAcceleratorESLegacy`) service. libGFXShared reads
 `IOGLESBundleName` / `IOGLESMetalBundleName` / `IOGLESDefaultUseMetal` and loads
-`/System/Library/Extensions/<name>.bundle`. The approach below does not use this path, so plan item
-7.6's `IOAcceleratorES` stub may not be needed (to re-check in 7.5).
+`/System/Library/Extensions/<name>.bundle`. The approach below does not use this path.
+
+The stub is still worth having, for a different reason (observed 2026-10-28):
+- QuartzCore's `CAMetalContextCreate` once-block loops up to 300 times. Each pass looks up
+  `IOServiceMatching("IOAcceleratorES")`, walks the iterator, and sleeps 100000 µs if nothing was
+  found. So with no such service, backboardd waits **30 s** before Metal fails and CA tries GLES.
+- The callee identities (matching, iterate, release, usleep) come from the call shape. The stubs
+  were not resolved.
+- xnu patch 0114 adds the stub (`SweetAccel.cpp`, boot-arg `sweetaccel=1`). It has no
+  MetalPluginName or GLES bundle, and it is published with SweetGPU.
 
 ## What this means for 7.5 (proposal)
 
