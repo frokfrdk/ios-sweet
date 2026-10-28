@@ -2322,7 +2322,13 @@ the owner's OK): Stage 6.
     There were no SMMU faults, no CP HW_FAULT and no hang latches outside 6.5's test, and GX stayed on.
   - Then "published SweetGPUReady", and "SweetGPU registered": SweetGPU::start from 0112 ran on the phone.
     iOS kept booting (fairplayd, bluetoothd) and the touch driver kept running.
-  - Next: G6e (sweetgpu-test through the user client). It waits on the owner's choice of how the tool gets
+  - G6e (2026-10-28; 0112, root v6g with sweetgpu-test as a launchd job, sweetgputest=1): **froze**.
+    - The log shows 6.0–6.7 passing as in G6d. It ends at "SWEET GPUUC: SweetGPU registered", with nothing
+      after it: no "open by", no panic, and none of the ~5 s FTS lines.
+    - Reading (guess): the hang is in the tool's first user-client calls within ~5 s of registration. The
+      1 s log flush loses the last second, so the exact step is unknown.
+    - Next: 0112b. The user client logs, then pauses 2 s before each step (as gpu_pause in 0094).
+  - (Before G6e) Next: G6e (sweetgpu-test through the user client). It waits on the owner's choice of how the tool gets
     onto the phone.
 - While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
   is missing.
