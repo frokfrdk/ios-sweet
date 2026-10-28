@@ -2171,6 +2171,25 @@ unusable. Use the a6xx **2D blitter** (`CP_BLIT`, `BLIT_OP_SCALE`), which needs 
     frame is a CPU copy).
   - Pass: the UI looks as on H4; FBSTAT copy avg falls (CPU time = clean + submit); no fallback in 10 minutes.
 
+**8a.1 written (patch 0113, 2026-10-28; not built on CI, not booted).**
+- `sweet_gsvc.c` runs `gs_blit_step` after 6.7 and before the user client is published, when `sweetblit` > 0.
+- Three copies, each with a 3-page IB BO: 64x64 (pitch 256), 828x1 and 828x1792 (pitch 3328).
+  - The source is a hash pattern (every byte varies, so channel swaps show). The 16 bytes of row padding hold a
+    poison that must survive.
+  - Each line logs bad pixels, changed padding words, the submit-to-fence time, and the two CCU flush timestamp words.
+  - An `ENOMEM` from the 6 MB contiguous BOs counts as skipped, not failed.
+- The IB, in order:
+  - Set up: CCU colour/depth flush (timestamped) and invalidate, `CP_SET_MARKER` RM6_BLIT2DSCALE, WFI, and
+    `RB_CCU_CNTL` 0x08000000 (sysmem: colour at 64 KiB).
+  - With `sweetblit=2` only: the a618 magic registers.
+  - `RB/GRAS_A2D_BLT_CNTL` 0x00f03000, `RB_A2D_PIXEL_CNTL` 0, `SP_A2D_OUTPUT_INFO` 0xf180.
+  - Source `TPL1_A2D_SRC_TEXTURE_*` (info 0x00500030) and destination `RB_A2D_DEST_BUFFER_*`.
+  - The rectangles, then WFI (blit_wfi_quirk) and `CP_BLIT` op 3.
+  - A CCU colour flush, then WFI.
+- None of these registers is in a630_protect.
+- Pass: 0 bad pixels and 0 changed padding in at least 2 of 3 copies with none failed; window pages 0 afterwards;
+  `gs_clean`. A failure is logged and doesn't kill the service, unless the poller finds a fatal error.
+
 **Test boots.** G6h carries 8a.0 (proposal: G6g's args plus `sweetfbstat=1`). After that: B1 = G6h args +
 `sweetblit=1`. Later, with Stage 7: B2 (`sweetfb_gpucopy=1`) and B3 (`=2`). All are `fastboot boot` only, and no root
 change is needed.

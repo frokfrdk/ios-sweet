@@ -1,0 +1,287 @@
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -28,6 +28,10 @@
+  * the GPU side is Normal non-cacheable, as the identity map. When a step
+  * fails the svc dump is logged, the SQE halted and the service marked dead
+  * until reboot; nothing else is undone.
++ * sweetblit=1 (patch 0113, plan 8a.1) adds a 2D blitter self-test after
++ * 6.7: CP_BLIT copies of linear BGRA8 up to the 828x1792 canvas, before the
++ * user client is published. sweetblit=2 first writes the a618 "magic"
++ * registers that Mesa's context restore sets.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -41,6 +45,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_gpu_internal.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -139,6 +144,54 @@
+ #define ST_CLEAR                0xff336699u
+ #define ST_POISON               0x5ee7deadu
+ 
++/*
++ * 8a.1: the 2D blitter as fd6_blitter's buffer path and turnip's r2d use it
++ * (CP_BLIT BLIT_OP_SCALE, no shader). Offsets, fields and a618 values are
++ * from Mesa 26.2.5 (a6xx.xml, adreno_pm4.xml, freedreno_devices.py; MIT).
++ */
++#define GS_GRAS_A2D_BLT_CNTL            0x08400u
++#define GS_GRAS_A2D_SRC_XMIN            0x08401u        /* XMAX, YMIN, YMAX, DEST_TL, DEST_BR follow */
++#define GS_RB_A2D_BLT_CNTL              0x08c00u        /* RB_A2D_PIXEL_CNTL follows */
++#define GS_RB_A2D_DEST_BUFFER_INFO      0x08c17u        /* BASE (64-bit) and PITCH follow */
++#define GS_RB_RBP_CNTL                  0x08e01u
++#define GS_RB_DBG_ECO_CNTL              0x08e04u
++#define GS_RB_CCU_CNTL                  0x08e07u
++#define GS_SP_A2D_OUTPUT_INFO           0x0acc0u
++#define GS_TPL1_A2D_SRC_TEXTURE_INFO    0x0b4c0u        /* SIZE, BASE (64-bit) and PITCH follow */
++#define PM4_CP_WAIT_FOR_IDLE    0x26u
++#define PM4_CP_BLIT             0x2cu
++#define PM4_CP_SET_MARKER       0x65u
++#define EV_CCU_FLUSH_DEPTH_TS   0x1cu
++#define EV_CCU_FLUSH_COLOR_TS   0x1du
++#define RM6_BLIT2DSCALE         12u
++#define BLIT_OP_SCALE           3u
++#define FMT6_8_8_8_8_UNORM      0x30u
++#define BL_BLT_CNTL             ((0xfu << 20) | (FMT6_8_8_8_8_UNORM << 8))      /* MASK, R2D_UNORM8, ROTATE_0 */
++#define BL_OUTPUT_INFO          ((0xfu << 12) | (FMT6_8_8_8_8_UNORM << 3))      /* MASK, OUTPUT_IFMT_2D_FLOAT */
++#define BL_SRC_INFO             ((1u << 22) | (1u << 20) | FMT6_8_8_8_8_UNORM)  /* UNK22, UNK20, linear, WZYX */
++#define BL_DST_INFO             FMT6_8_8_8_8_UNORM                              /* linear, WZYX */
++/* sysmem CCU layout: depth at 0, colour after one CCU's 64 KiB depth cache, both CCU_CACHE_SIZE_FULL */
++#define BL_CCU_CNTL             ((0x10000u >> 12) << 23)
++#define BL_PITCH                3328u           /* the CA surfaces' bytes per row; 2D pitches are in 64 bytes */
++#define BL_POISON               0x5ee7b1a7u
++#define BL_TS_OFF               0x800u          /* in the IB BO: where the CCU flush events write */
++
++/* a618 magic_regs and raw_magic_regs, written by sweetblit=2 */
++static const uint32_t gs_blit_magic[][2] = {
++	{ 0x09804u, 0x0000001fu },      /* PC_MODE_CNTL */
++	{ 0x09805u, 0 },                /* PC_POWER_CNTL */
++	{ 0x0a0f8u, 0 },                /* VFD_POWER_CNTL */
++	{ 0x0b600u, 0x00108000u },      /* TPL1_DBG_ECO_CNTL */
++	{ 0x08600u, 0x00000880u },      /* GRAS_DBG_ECO_CNTL */
++	{ 0x0ae03u, 0x00000430u },      /* SP_CHICKEN_BITS */
++	{ 0x0ae00u, 0 },                /* SP_DBG_ECO_CNTL */
++	{ 0x0be04u, 0x00080000u },      /* HLSQ_DBG_ECO_CNTL */
++	{ 0x09600u, 0 },                /* VPC_DBG_ECO_CNTL */
++	{ 0x00e12u, 0x00000001u },      /* UCHE_UNKNOWN_0E12 */
++	{ GS_RB_DBG_ECO_CNTL, 0x04100000u },    /* the same value for blits on a618 */
++	{ GS_RB_RBP_CNTL, 0x00000001u },
++};
++
+ /* What info reports; chip id and GMEM from the a618 catalog entry */
+ #define GS_CHIP_ID              0x06010800u
+ #define GS_GMEM_SIZE            0x80000u
+@@ -1452,6 +1505,194 @@
+ 	return ok;
+ }
+ 
++/* 8a.1 IB pieces */
++static void
++ibw_reg(struct gs_ibw *w, uint32_t reg, uint32_t val)
++{
++	ibw_put(w, sweet_cp_pkt4(reg, 1));
++	ibw_put(w, val);
++}
++
++static void
++ibw_event(struct gs_ibw *w, uint32_t ev)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_EVENT_WRITE, 1));
++	ibw_put(w, ev);
++}
++
++/* A timestamped event: the CP writes ev to addr when it is done */
++static void
++ibw_event_ts(struct gs_ibw *w, uint32_t ev, uint64_t addr)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_EVENT_WRITE, 4));
++	ibw_put(w, ev);
++	ibw_put(w, (uint32_t)addr);
++	ibw_put(w, (uint32_t)(addr >> 32));
++	ibw_put(w, ev);
++}
++
++static void
++ibw_wfi(struct gs_ibw *w)
++{
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_WAIT_FOR_IDLE, 0));
++}
++
++/* One linear BGRA8 copy, width x height at the same pitch; ts is 8 bytes for the CCU flush events */
++static void
++ibw_blit(struct gs_ibw *w, bool magic, uint64_t ts, uint64_t dst, uint64_t src, uint32_t pitch, uint32_t width,
++    uint32_t height)
++{
++	/* fd6 emit_setup: clean and invalidate the CCU, 2D mode, the sysmem CCU layout */
++	ibw_event_ts(w, EV_CCU_FLUSH_COLOR_TS, ts);
++	ibw_event_ts(w, EV_CCU_FLUSH_DEPTH_TS, ts + 4u);
++	ibw_event(w, EV_CCU_INVALIDATE_COLOR);
++	ibw_event(w, EV_CCU_INVALIDATE_DEPTH);
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_SET_MARKER, 1));
++	ibw_put(w, RM6_BLIT2DSCALE);
++	ibw_wfi(w);
++	ibw_reg(w, GS_RB_CCU_CNTL, BL_CCU_CNTL);
++	for (unsigned i = 0; magic && i < sizeof(gs_blit_magic) / sizeof(gs_blit_magic[0]); ++i) {
++		ibw_reg(w, gs_blit_magic[i][0], gs_blit_magic[i][1]);
++	}
++	/* emit_blit_setup */
++	ibw_put(w, sweet_cp_pkt4(GS_RB_A2D_BLT_CNTL, 2));
++	ibw_put(w, BL_BLT_CNTL);
++	ibw_put(w, 0);                  /* RB_A2D_PIXEL_CNTL: PIXEL_OP_DISABLED */
++	ibw_reg(w, GS_GRAS_A2D_BLT_CNTL, BL_BLT_CNTL);
++	ibw_reg(w, GS_SP_A2D_OUTPUT_INFO, BL_OUTPUT_INFO);
++	/* source, destination, rectangles */
++	ibw_put(w, sweet_cp_pkt4(GS_TPL1_A2D_SRC_TEXTURE_INFO, 5));
++	ibw_put(w, BL_SRC_INFO);
++	ibw_put(w, width | (height << 15));
++	ibw_put(w, (uint32_t)src);
++	ibw_put(w, (uint32_t)(src >> 32));
++	ibw_put(w, (pitch >> 6) << 9);
++	ibw_put(w, sweet_cp_pkt4(GS_RB_A2D_DEST_BUFFER_INFO, 4));
++	ibw_put(w, BL_DST_INFO);
++	ibw_put(w, (uint32_t)dst);
++	ibw_put(w, (uint32_t)(dst >> 32));
++	ibw_put(w, pitch >> 6);
++	ibw_put(w, sweet_cp_pkt4(GS_GRAS_A2D_SRC_XMIN, 6));
++	ibw_put(w, 0);
++	ibw_put(w, (width - 1u) << 8);
++	ibw_put(w, 0);
++	ibw_put(w, (height - 1u) << 8);
++	ibw_put(w, 0);                  /* GRAS_A2D_DEST_TL */
++	ibw_put(w, (width - 1u) | ((height - 1u) << 16));
++	/* emit_blit_fini; a618 has blit_wfi_quirk */
++	ibw_wfi(w);
++	ibw_put(w, sweet_cp_pkt7(PM4_CP_BLIT, 1));
++	ibw_put(w, BLIT_OP_SCALE);
++	/* the copy out of the CCU before the submit's fence */
++	ibw_event_ts(w, EV_CCU_FLUSH_COLOR_TS, ts);
++	ibw_wfi(w);
++}
++
++static uint32_t
++bl_pattern(uint32_t x, uint32_t y)
++{
++	return (x * 0x9e3779b1u) ^ (y * 0x85ebca77u);
++}
++
++/* 0 pass, 1 fail, 2 skipped (no contiguous memory for the BOs) */
++static int
++gs_blit_one(bool magic, uint32_t width, uint32_t height, uint32_t pitch)
++{
++	struct st_bo s = { 0 }, d = { 0 }, c = { 0 };
++	uint32_t size = gs_round(pitch * height), words = pitch / 4u, bad = 0, pad_bad = 0;
++	int ret = 1;
++	int r = sweet_gsvc_bo_new(size, 0, &s.h, &s.gva, &s.cpu);
++	r = r ? r : sweet_gsvc_bo_new(size, 0, &d.h, &d.gva, &d.cpu);
++	r = r ? r : sweet_gsvc_bo_new(GS_PAGE, 0, &c.h, &c.gva, &c.cpu);
++	if (r) {
++		ret = r == ENOMEM ? 2 : 1;
++		printf("SWEET GSVC:   8a.1 %ux%u: bo_new of 2 x %u bytes failed (%d)%s\n", width, height, size, r,
++		    ret == 2 ? ": no contiguous memory, skipped" : "");
++		goto out;
++	}
++	for (uint32_t y = 0; y < height; ++y) {
++		for (uint32_t x = 0; x < words; ++x) {
++			s.cpu[y * words + x] = x < width ? bl_pattern(x, y) : ~BL_POISON;
++			d.cpu[y * words + x] = BL_POISON;
++		}
++	}
++	struct gs_ibw w;
++	ibw_init(&w, c.cpu, BL_TS_OFF / 4u);
++	ibw_blit(&w, magic, c.gva + BL_TS_OFF, d.gva, s.gva, pitch, width, height);
++	if (w.n > w.max) {
++		printf("SWEET GSVC:   8a.1: IB is %u dwords, more than %u\n", w.n, w.max);
++		goto out;
++	}
++	(void)sweet_gsvc_bo_sync(s.h);
++	(void)sweet_gsvc_bo_sync(d.h);
++	(void)sweet_gsvc_bo_sync(c.h);
++	struct sweet_gsvc_ib ib = { c.h, 0, w.n };
++	uint32_t seq = 0;
++	uint64_t t0 = gs_alwayson();
++	r = sweet_gsvc_submit(&ib, 1, &seq);
++	r = r ? r : sweet_gsvc_wait(seq, GS_WAIT_MS);
++	uint64_t us = gs_ticks_us(gs_alwayson() - t0);
++	if (r) {
++		printf("SWEET GSVC:   8a.1 %ux%u: submit/wait failed (%d) after %llu us\n", width, height, r, us);
++		goto out;
++	}
++	(void)sweet_gsvc_bo_sync(d.h);
++	(void)sweet_gsvc_bo_sync(c.h);
++	for (uint32_t y = 0; y < height; ++y) {
++		for (uint32_t x = 0; x < words; ++x) {
++			uint32_t got = d.cpu[y * words + x], want = x < width ? bl_pattern(x, y) : BL_POISON;
++			if (got == want) {
++				continue;
++			}
++			if (bad + pad_bad < 4u) {
++				printf("SWEET GSVC:   8a.1 %ux%u: %s (%u,%u) 0x%08x, want 0x%08x\n", width, height,
++				    x < width ? "pixel" : "row padding", x, y, got, want);
++			}
++			if (x < width) {
++				++bad;
++			} else {
++				++pad_bad;
++			}
++		}
++	}
++	printf("SWEET GSVC:   8a.1 %ux%u pitch %u: %u bad pixels, %u padding words changed, %llu us (submit to fence), "
++	    "CCU flush words 0x%x 0x%x\n", width, height, pitch, bad, pad_bad, us, c.cpu[BL_TS_OFF / 4u],
++	    c.cpu[BL_TS_OFF / 4u + 1u]);
++	ret = bad == 0 && pad_bad == 0 ? 0 : 1;
++out:
++	if (s.h) {
++		(void)sweet_gsvc_bo_free(s.h);
++	}
++	if (d.h) {
++		(void)sweet_gsvc_bo_free(d.h);
++	}
++	if (c.h) {
++		(void)sweet_gsvc_bo_free(c.h);
++	}
++	return ret;
++}
++
++/* 8a.1: a block, one canvas row, then the whole 828x1792 canvas */
++static bool
++gs_blit_step(int mode)
++{
++	static const uint32_t cases[3][3] = { { 64, 64, 256 }, { 828, 1, BL_PITCH }, { 828, 1792, BL_PITCH } };
++	printf("SWEET GSVC: 8a.1 blit self-test (sweetblit=%d): CP_BLIT BLIT_OP_SCALE copies of linear BGRA8 in window "
++	    "BOs%s\n", mode, mode >= 2 ? ", after the a618 magic registers" : "");
++	gpu_pause("8a.1 the 2D blitter");
++	unsigned pass = 0, skip = 0;
++	for (unsigned i = 0; i < 3u && !gs_dead; ++i) {
++		int r = gs_blit_one(mode >= 2, cases[i][0], cases[i][1], cases[i][2]);
++		pass += r == 0;
++		skip += r == 2;
++	}
++	uint32_t used = gs_win_count();
++	gs_dump("after 8a.1");
++	printf("SWEET GSVC: 8a.1: %u of 3 copies right, %u skipped; window pages in use afterwards: %u (want 0)\n", pass,
++	    skip, used);
++	return gs_clean("8a.1") && pass + skip == 3u && pass >= 2u && used == 0;
++}
++
+ bool
+ sweet_gsvc_run(int stop, int cb, vm_offset_t l1_va, uint64_t l1_pa)
+ {
+@@ -1495,7 +1736,14 @@
+ 	printf("SWEET GSVC: stage 6 %s at 6.%d (sweetsvc=%d); %s\n", ok ? "done" : "STOPPED by a failure", step, stop,
+ 	    gs_dead ? "the service is dead, the SQE stopped" : gs_ready ? "the service stays ready" :
+ 	    "the SQE stays running");
+-	/* only now: the 6.7 self-tests want the window empty, so no user BOs before this */
++	int blit = 0;
++	(void)PE_parse_boot_argn("sweetblit", &blit, sizeof(blit));
++	if (ok && stop >= 7 && blit > 0 && !gs_dead) {
++		bool b = gs_blit_step(blit);
++		printf("SWEET GSVC: 8a.1 %s; %s\n", b ? "PASSED" : "FAILED", gs_dead ? "the service is dead" :
++		    "the service stays ready");
++	}
++	/* only now: the 6.7 self-tests and 8a.1 want the window empty, so no user BOs before this */
+ 	if (ok && gs_ready && !gs_dead) {
+ 		sweet_gpu_uc_publish();
+ 		printf("SWEET GSVC: published SweetGPUReady: the SweetGPU user client (root only, debug) can open\n");
