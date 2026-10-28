@@ -35,6 +35,24 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/mesa" rev-parse HEAD)" = "$MESA_COMMIT"
           git -C "$RUNNER_TEMP/mesa" apply --verbose "$GITHUB_WORKSPACE"/tools/sweetgl/mesa/*.patch
 
+      - name: sweetdrm
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          cd tools/sweetgl/sweetdrm
+          INC="-I$RUNNER_TEMP/mesa/include -Iinclude"
+          # 7.1 host test against a fake SweetGPU
+          clang -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -g $INC sweetdrm.c sweetdrm_iokit.c \
+            test/test_sweetdrm.c -framework IOKit -framework CoreFoundation -o "$RUNNER_TEMP/test_sweetdrm"
+          "$RUNNER_TEMP/test_sweetdrm"
+          # the library Mesa links on iOS
+          mkdir -p "$GITHUB_WORKSPACE/out/lib"
+          for f in sweetdrm sweetdrm_iokit; do
+            xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -std=gnu11 -O2 -Wall -Wextra -Werror \
+              $INC -c $f.c -o "$RUNNER_TEMP/$f.o"
+          done
+          xcrun ar rcs "$GITHUB_WORKSPACE/out/lib/libsweetdrm.a" "$RUNNER_TEMP"/sweetdrm*.o
+
       - name: Build
         run: |
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
@@ -52,6 +70,10 @@ jobs:
           nm -g out/lib/libfreedrenowinsys.a | grep -q ' T _fd_drm_screen_create_renderonly'
           # every libdrm symbol the driver needs, which 7.1 (sweetdrm) has to provide
           for a in out/lib/*.a; do nm -u "$a"; done | grep -E '^_drm' | sort -u | tee out/lib/drm-imports.txt
+          nm -gU out/lib/libsweetdrm.a | awk '{print $3}' | grep -E '^_drm' | sort -u > out/lib/drm-exports.txt
+          if comm -23 out/lib/drm-imports.txt out/lib/drm-exports.txt | grep .; then
+            echo "libdrm calls sweetdrm lacks (above)"; exit 1
+          fi
           (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
