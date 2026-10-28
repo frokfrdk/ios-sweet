@@ -1,0 +1,36 @@
+name: sweetgpu-test
+
+# Only the stage 6U userspace tool (tools/sweetgpu); xnu.yml builds it too, with the kernel
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/sweetgpu/**"
+      - ".github/workflows/sweetgpu-test.yml"
+
+jobs:
+  build:
+    # same Xcode 15 / iPhoneOS SDK as xnu.yml
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sweetgpu-test
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          xcodebuild -version
+          # the iPhoneOS SDK has no IOKit headers; the tool declares the calls it uses
+          mkdir -p out
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Werror \
+            -framework IOKit -framework IOSurface -framework CoreFoundation \
+            -o out/sweetgpu-test tools/sweetgpu/sweetgpu-test.c
+          codesign -s - -f out/sweetgpu-test
+          codesign -dv out/sweetgpu-test
+          (cd out && shasum -a 256 sweetgpu-test > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgpu-test
+          path: out/

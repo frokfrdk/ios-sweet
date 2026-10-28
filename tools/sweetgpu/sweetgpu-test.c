@@ -11,12 +11,19 @@
  *      and no seqno retires
  *
  * Prints "sweetgpu-test: PASS, 0 bad pixels" or "... FAIL ..." and exits 0/1.
+ *
+ * Run at boot by the launchd job com.sweet.gpu-test (stdout to /dev/console, so the
+ * persistent log keeps it): it does nothing unless the boot-args contain
+ * sweetgputest=1, and then waits up to 15 min for SweetGPU, which only appears
+ * after the kernel's 6.7 hold, minutes after launchd starts it.
  * Built in CI: xcrun -sdk iphoneos clang ... -framework IOKit -framework
  * IOSurface -framework CoreFoundation, then codesign -s - (ad hoc).
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -336,14 +343,49 @@ test_bad(void)
 	return ok;
 }
 
+#define WAIT_STEP_S     5u
+#define WAIT_MAX_S      900u
+
+/* the boot-args hold " sweetgputest=1" (or start with it) */
+static int
+asked_for(void)
+{
+	char args[1024];
+	size_t len = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len] = '\0';
+	for (const char *p = args; (p = strstr(p, "sweetgputest=1")) != NULL; p++) {
+		char end = p[strlen("sweetgputest=1")];
+		if ((p == args || p[-1] == ' ') && (end == '\0' || end == ' ')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 int
 main(void)
 {
-	io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("SweetGPU"));
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (!asked_for()) {
+		printf("sweetgpu-test: no sweetgputest=1 in the boot-args, nothing to do\n");
+		return 0;
+	}
+	printf("sweetgpu-test: waiting up to %u s for SweetGPU (published after the kernel's 6.7 hold)\n", WAIT_MAX_S);
+	io_service_t svc = 0;
+	unsigned waited = 0;
+	while (!(svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("SweetGPU"))) && waited < WAIT_MAX_S) {
+		sleep(WAIT_STEP_S);
+		waited += WAIT_STEP_S;
+	}
 	if (!svc) {
-		printf("sweetgpu-test: no SweetGPU service (needs sweetgpu=8 sweetsvc=7 and 6.7 passed)\n");
+		printf("sweetgpu-test: FAIL, no SweetGPU service after %u s (needs sweetgpu=8 sweetsvc=7 and 6.7 passed)\n",
+		    waited);
 		return 1;
 	}
+	printf("sweetgpu-test: SweetGPU found after %u s\n", waited);
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);
 	if (kr) {
