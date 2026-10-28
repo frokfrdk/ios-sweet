@@ -2328,6 +2328,13 @@ the owner's OK): Stage 6.
     - Reading (guess): the hang is in the tool's first user-client calls within ~5 s of registration. The
       1 s log flush loses the last second, so the exact step is unknown.
     - Next: 0112b. The user client logs, then pauses 2 s before each step (as gpu_pause in 0094).
+  - G6f (0112b, + sweetgpuucslow=1 sweetiolog=sweetgpu-test): **froze in bo new**.
+    - Open, initWithTask and info (fence map) all succeeded. The fence map logged XNU's "physical with
+      managed page" warning.
+    - The log ends at "next: bo new 16384 bytes: IOBufferMemoryDescriptor write-combined". The hang is in
+      IOBMD inTaskWithOptions with kIOMapWriteCombineCache.
+    - Next: 0112c makes user BOs cacheable (no WC) and cleans/invalidates them to PoC around submit/wait,
+      like imports and the kernel's own BOs.
   - (Before G6e) Next: G6e (sweetgpu-test through the user client). It waits on the owner's choice of how the tool gets
     onto the phone.
 - While bit 20 is latched, GICD shows INTID 332 pending. So the GPU line reaches the GIC; only the enable
