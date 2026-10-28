@@ -1,0 +1,87 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -8,12 +8,14 @@
+  * read and write any physical memory through the GPU.
+  *
+  *   sel 10  bo new: scalar [size, flags 0] -> [handle, gpu_va, user_va]
+- *           wired pages, write-combined in the task (the GPU side is
+- *           non-cacheable); at most 16 MiB
++ *           wired pages, cacheable in the task like an import (the GPU side
++ *           is non-cacheable); at most 16 MiB. Not write-combined: G6f hung
++ *           in IOBufferMemoryDescriptor with kIOMapWriteCombineCache (0112c)
+  *   sel 11  bo free: scalar [handle]; waits (2 s cap) for the GPU first
+  *   sel 12  bo import IOSurface: scalar [surface id] -> [handle, gpu_va, size]
+- *           the surface's own pages; cleaned and invalidated to PoC before
+- *           each submit and after each successful wait of this client
++ *           the surface's own pages. Both kinds of BO are cleaned and
++ *           invalidated to PoC before each submit and after each successful
++ *           wait of this client
+  *   sel 13  submit: struct sweet_gpu_submit -> scalar [seqno]; each IB
+  *           must lie inside a BO of this client
+  *   sel 14  wait: scalar [seqno, timeout_ms]; kIOReturnTimeout, or
+@@ -190,7 +192,7 @@
+ 	IOMemoryMap *map;                       /* bo new: the task's mapping */
+ 	SweetSurface *surface;                  /* import */
+ 	IOMemoryDescriptor *mem;                /* import: prepared */
+-	uint64_t *pa;                           /* import: page addresses, for cache maintenance */
++	uint64_t *pa;                           /* page addresses, for cache maintenance */
+ };
+ 
+ class SweetGPUUserClient : public IOUserClient {
+@@ -286,7 +288,7 @@
+ 	bzero(bo, sizeof(*bo));
+ }
+ 
+-/* Lock held. Imported surfaces may be cacheable for the CPU; the GPU is not. */
++/* Lock held. New and imported BOs are cacheable for the CPU; the GPU is not. */
+ void
+ SweetGPUUserClient::syncImports(void)
+ {
+@@ -310,10 +312,10 @@
+ 	}
+ 	size = round_page(size);        /* whole XNU pages, so the task mapping covers the BO */
+ 	uint32_t npages = (uint32_t)(size / SWEET_GPU_PAGE);
+-	uc_next("bo new %llu bytes: IOBufferMemoryDescriptor write-combined", size);
++	uc_next("bo new %llu bytes: IOBufferMemoryDescriptor, cacheable", size);
+ 	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
+ 	IOBufferMemoryDescriptor *buf =IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, size, page_size);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
+ 	if (pa == NULL || buf == NULL) {
+ 		if (pa != NULL) {
+ 			IOFreeData(pa, npages * sizeof(uint64_t));
+@@ -321,7 +323,7 @@
+ 		OSSafeReleaseNULL(buf);
+ 		return kIOReturnNoMemory;
+ 	}
+-	/* The pages were zeroed through the cacheable physical aliases: push that out once */
++	/* The zeroed pages are cacheable: push that out once, then syncImports keeps them in step */
+ 	uc_next("bo new: physical segments and flush_dcache64 of %u pages", npages);
+ 	for (uint32_t p = 0; p < npages; p++) {
+ 		IOByteCount len = 0;
+@@ -329,7 +331,7 @@
+ 		flush_dcache64((addr64_t)pa[p], SWEET_GPU_PAGE, TRUE);
+ 	}
+ 	uc_next("bo new: map into the task (pa[0] 0x%llx)", pa[0]);
+-	IOMemoryMap *map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++	IOMemoryMap *map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere);
+ 	IOReturn ret = map != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
+ 	uint32_t handle = 0;
+ 	uint64_t gpu_va = 0;
+@@ -347,14 +349,15 @@
+ 		bo->npages = npages;
+ 		bo->buf = buf;
+ 		bo->map = map;
++		bo->pa = pa;                    /* for syncImports; release() frees it */
+ 		args->scalarOutput[0] = handle;
+ 		args->scalarOutput[1] = gpu_va;
+ 		args->scalarOutput[2] = map->getAddress();
+ 		args->scalarOutputCount = 3;
+ 	}
+ 	IOLockUnlock(fLock);
+-	IOFreeData(pa, npages * sizeof(uint64_t));
+ 	if (ret != kIOReturnSuccess) {
++		IOFreeData(pa, npages * sizeof(uint64_t));
+ 		OSSafeReleaseNULL(map);
+ 		buf->release();
+ 	}
