@@ -1,0 +1,37 @@
+diff -ru a/src/freedreno/meson.build b/src/freedreno/meson.build
+--- a/src/freedreno/meson.build	2026-10-28 23:12:44.627846187 +1030
++++ b/src/freedreno/meson.build	2026-10-28 23:12:44.646435696 +1030
+@@ -22,7 +22,8 @@
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++# ios-sweet: on iOS the msm calls go to sweetdrm (our libdrm subset)
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+diff -ru a/src/util/os_mman.h b/src/util/os_mman.h
+--- a/src/util/os_mman.h	2026-10-28 23:12:44.626946121 +1030
++++ b/src/util/os_mman.h	2026-10-28 23:12:44.646522509 +1030
+@@ -51,7 +51,19 @@
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#if defined(SWEETDRM)
++/* ios-sweet: BO maps go through sweetdrm, which passes other fds to mmap */
++void *sweetdrm_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++int sweetdrm_munmap(void *addr, size_t length);
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             sweetdrm_mmap(addr, length, prot, flags, fd, offset)
++
++static inline int os_munmap(void *addr, size_t length)
++{
++   return sweetdrm_munmap(addr, length);
++}
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)

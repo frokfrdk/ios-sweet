@@ -1,0 +1,66 @@
+name: sweetgl
+
+# Stage 7.0: Mesa freedreno (gallium, msm kmd) cross-built for iOS arm64 against
+# sweetdrm. Only static libraries for now; nothing links or runs them yet.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/sweetgl/**"
+      - ".github/workflows/sweetgl.yml"
+
+env:
+  MESA_TAG: mesa-26.2.5
+  MESA_COMMIT: ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+
+jobs:
+  build:
+    # same Xcode 15 / iPhoneOS SDK as xnu.yml
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install bison ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install meson==1.5.2 mako==1.3.5 pyyaml==6.0.2 packaging==24.1
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Mesa source
+        run: |
+          git clone --depth 1 --branch "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git "$RUNNER_TEMP/mesa"
+          test "$(git -C "$RUNNER_TEMP/mesa" rev-parse HEAD)" = "$MESA_COMMIT"
+          git -C "$RUNNER_TEMP/mesa" apply --verbose "$GITHUB_WORKSPACE"/tools/sweetgl/mesa/*.patch
+
+      - name: Build
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          xcodebuild -version
+          meson --version; bison --version | head -1
+          bash tools/sweetgl/mesa/build.sh "$RUNNER_TEMP/mesa" out
+
+      - name: Check
+        run: |
+          mkdir -p out/lib
+          find out/build -name '*.a' -exec cp {} out/lib/ \;
+          ls -l out/lib
+          nm -g out/lib/libfreedreno.a | grep -q ' T _fd_screen_create'
+          nm -g out/lib/libfreedrenowinsys.a | grep -q ' T _fd_drm_screen_create_renderonly'
+          # every libdrm symbol the driver needs, which 7.1 (sweetdrm) has to provide
+          for a in out/lib/*.a; do nm -u "$a"; done | grep -E '^_drm' | sort -u | tee out/lib/drm-imports.txt
+          (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl-mesa
+          path: out/lib/
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: meson-logs
+          path: out/build/meson-logs/
