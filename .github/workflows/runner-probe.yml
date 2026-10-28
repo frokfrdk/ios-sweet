@@ -1,0 +1,30 @@
+name: runner-probe
+
+# macos-14 (the only image with Xcode 15, whose iig xnu-8796 needs) is being
+# retired and rarely gets a runner. List what the other macOS images offer.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/runner-probe.yml"
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel, macos-26, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Image
+        run: |
+          sw_vers; uname -m
+          ls -d /Applications/Xcode*.app
+          for XC in /Applications/Xcode_*.app; do
+            [ -L "$XC" ] && continue
+            v=$(DEVELOPER_DIR="$XC/Contents/Developer" xcodebuild -version 2>/dev/null | tr '\n' ' ')
+            sdk=$(DEVELOPER_DIR="$XC/Contents/Developer" xcrun -sdk iphoneos --show-sdk-version 2>/dev/null)
+            iig=$(DEVELOPER_DIR="$XC/Contents/Developer" xcrun --find iig 2>/dev/null)
+            echo "XC $XC | $v| iphoneos $sdk | iig ${iig:-none}"
+          done
