@@ -1,0 +1,203 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -451,6 +451,69 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+  */
+ #define EXECUTABLE_KEY "executable_path="
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: boot-arg sweetenv=name:VAR=VAL[;name:VAR=VAL...] adds VAR=VAL to
++ * the environment of every exec whose file name (the last path component)
++ * is name. It goes after the caller's own variables, so one the caller set
++ * wins (getenv and dyld take the first). For the GL shim (GPU plan 7.6):
++ *   sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
++ * dyld honours DYLD_* only because sweet_amfi.c answers its policy query.
++ * Boot-args end at a space, so a value cannot hold one. An entry that does
++ * not fit the argument space is skipped (logged), never fails the exec.
++ */
++#define SWEET_ENV_MAX   256
++static char sweet_env[SWEET_ENV_MAX];
++static _Atomic int sweet_env_state;     /* 0 unread, 1 reading, 2 none, 3 set */
++
++static void
++sweet_exec_add_env(struct image_params *imgp, int ptr_size)
++{
++	int state = os_atomic_load(&sweet_env_state, acquire);
++	if (state == 0 && os_atomic_cmpxchg(&sweet_env_state, 0, 1, relaxed)) {
++		bool set = PE_parse_boot_argn("sweetenv", sweet_env, sizeof(sweet_env)) && sweet_env[0] != '\0';
++		state = set ? 3 : 2;
++		os_atomic_store(&sweet_env_state, state, release);
++		if (set) {
++			printf("SWEET env: sweetenv=%s\n", sweet_env);
++		}
++	}
++	if (state != 3) {
++		return;         /* none, or the first exec is still reading it */
++	}
++	const char *name = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++	for (const char *c = name; *c != '\0'; c++) {
++		if (*c == '/') {
++			name = c + 1;
++		}
++	}
++	size_t nlen = strlen(name);
++	for (const char *e = sweet_env; *e != '\0';) {
++		const char *end = e;
++		while (*end != '\0' && *end != ';') {
++			end++;
++		}
++		size_t len = (size_t)(end - e);
++		if (nlen > 0 && len > nlen + 1 && strncmp(e, name, nlen) == 0 && e[nlen] == ':') {
++			char kv[SWEET_ENV_MAX];
++			len -= nlen + 1;
++			memcpy(kv, e + nlen + 1, len);
++			kv[len] = '\0';
++			/* the string, its envv[] slot, and the slot of the NULL after it */
++			if (imgp->ip_argspace < (int)(len + 1) + 2 * ptr_size ||
++			    exec_add_user_string(imgp, CAST_USER_ADDR_T(kv), UIO_SYSSPACE, TRUE) != 0) {
++				printf("SWEET env: %s: no room for %s, skipped\n", name, kv);
++			} else {
++				imgp->ip_argspace -= ptr_size;
++				imgp->ip_envc++;
++				printf("SWEET env: %s += %s\n", name, kv);
++			}
++		}
++		e = *end != '\0' ? end + 1 : end;
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * exec_save_path
+  *
+@@ -5741,6 +5804,10 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_exec_add_env(imgp, new_ptr_size);
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -381,6 +381,19 @@ static mac_policy_handle_t sweet_amfi_mac_handle;
+  */
+ #define SWEET_AMFI_SYSCALL_QUERY_BOOTARG_STATE  0x60
+ #define SWEET_AMFI_BOOTARG_STATE                0x4ULL
++/*
++ * dyld's amfi_check_dyld_policy_self(in, &out) is __mac_syscall("AMFI", 0x5a,
++ * &args), args = { u64 in flags; u64 *out } (that layout is a guess, the
++ * first call logs both words). On failure dyld allows no DYLD_* variables,
++ * so the DYLD_INSERT_LIBRARIES that sweetenv= adds (GPU plan 7.6) would
++ * be ignored.
++ * Answer @-paths, path variables, fallback paths, print variables, failed
++ * insertion, interposing and embedded variables (0xfb); not a custom
++ * shared cache (0x4).
++ */
++#define SWEET_AMFI_SYSCALL_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_POLICY                  0xfbULL
++static bool sweet_amfi_dyld_logged;
+ static uint64_t sweet_amfi_call_seen[2];
+ 
+ static int
+@@ -396,6 +409,22 @@ sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+ 		uint64_t state = SWEET_AMFI_BOOTARG_STATE;
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
++	if (call == SWEET_AMFI_SYSCALL_CHECK_DYLD_POLICY) {
++		uint64_t args[2] = { 0, 0 }, policy = SWEET_AMFI_DYLD_POLICY;
++		int error = copyin(arg, args, sizeof(args));
++		if (error == 0 && args[1] == 0) {
++			error = EINVAL;
++		}
++		if (error == 0) {
++			error = copyout(&policy, (user_addr_t)args[1], sizeof(policy));
++		}
++		if (!sweet_amfi_dyld_logged) {
++			sweet_amfi_dyld_logged = true;
++			printf("SWEET AMFI: dyld policy in 0x%llx out 0x%llx -> 0x%llx (%d)\n",
++			    args[0], args[1], policy, error);
++		}
++		return error;
++	}
+ 	return ENOPOLICY;
+ }
+ 
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -0,0 +1,47 @@
++/*
++ * IOAcceleratorES stand-in for the GL shim (docs/GPU_A618_PLAN.md 7.6,
++ * docs/EAGL_NOTES.md). QuartzCore's CAMetalContextCreate looks for an
++ * IOAcceleratorES service up to 300 times, 100 ms apart, before it gives up
++ * on Metal, so with none backboardd loses 30 s before it tries GLES. This
++ * service has the class name and nothing else: no MetalPluginName, so Metal
++ * still finds no device, and no IOGLESBundleName, so OpenGLES's own plugin
++ * lookup still finds nothing (sweetgl replaces that path). It matches with
++ * SweetGPU, once the GPU service is ready, so CA waits for the GPU for up to
++ * those 30 s. Off unless the boot-arg sweetaccel=1.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++IOService *
++IOAcceleratorES::probe(IOService *provider, SInt32 *score)
++{
++	uint32_t on = 0;
++	(void)PE_parse_boot_argn("sweetaccel", &on, sizeof(on));
++	return on ? IOService::probe(provider, score) : NULL;
++}
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	registerService();
++	IOLog("SWEET ACCEL: IOAcceleratorES stand-in registered (no Metal or GLES plugin)\n");
++	return true;
++}
++#endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -88,6 +88,12 @@ const char * gIOKernelConfigTables =
+     "     'IOResourceMatch' = SweetGPUReady;"
+     "     'IOMatchCategory' = SweetGPU;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = SweetGPUReady;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetAccel.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
