@@ -116,6 +116,17 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Build sweetgpu-test (stage 6U)
+        if: always()
+        run: |
+          # the iPhoneOS SDK has no IOKit headers; the tool declares the calls it uses
+          mkdir -p out
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Werror \
+            -framework IOKit -framework IOSurface -framework CoreFoundation \
+            -o out/sweetgpu-test tools/sweetgpu/sweetgpu-test.c
+          codesign -s - -f out/sweetgpu-test
+          (cd out && shasum -a 256 sweetgpu-test >> SHA256SUMS)
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

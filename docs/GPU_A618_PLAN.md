@@ -1686,7 +1686,8 @@ work.
   - An IOKit `SweetGPU` service and `SweetGPUUserClient`, about 300 lines of C++ next to 0046, which
     only marshal arguments into the C API.
   - A small static test tool, `sweetgpu-test`, built in CI and ad-hoc signed like `tools/mkinit.py`.
-  - 0112 is planned here but written only after 6.7 passes.
+  - 0112 was planned to be written only after 6.7 passes; it was written early at the owner's request
+    (2026-10-28, see 6U).
 
 **Memory** (GPU-GMU-MEM is 1 MiB; offsets continue after Stage 5's metadata copy; PAs as on G5c, where
 GMU-MEM started at 0x1024f8000 and the metadata copy was 0x10258f000):
@@ -1944,6 +1945,23 @@ Stage 6, with `max_freq` 430 MHz.
 no BO pages leak, nothing latches, and the phone stays stable.
 
 #### 6U User client and userspace test (patch 0112, after 6.7 passes)
+
+**Patch 0112 written early** (2026-10-28, at the owner's request while CI was blocked; not built in CI, not
+booted). Where it differs from the text below:
+- `SweetGPU` matches IOResources `SweetGPUReady`. `sweet_gsvc_run` publishes that only **after** 6.7's hold
+  passed, not when the service becomes ready, because the 6.7 self-tests require an empty window.
+- BO memory is an `IOBufferMemoryDescriptor` (write-combined) cleaned and invalidated to PoC page by page
+  once, because the pages were zeroed through cacheable aliases. Then it is imported with
+  `sweet_gsvc_bo_import_pages`. BO sizes round up to whole 16 KiB XNU pages.
+- Imported IOSurfaces may be CPU-cacheable, so the client cleans and invalidates them before each of its
+  submits and after each of its successful waits. Between submit and wait the CPU must not touch them.
+- The info struct adds `abi` (1), `window_base` and `window_size` (56 bytes). Wait timeouts are capped at
+  10 s. A BO whose free times out (the GPU may still use it) is leaked, never reused.
+- `sweetgpu-test` (`tools/sweetgpu/sweetgpu-test.c`) is a normal dynamically linked iOS binary built with
+  Xcode in `xnu.yml` and signed with `codesign -s -`. It is not a static mkinit-style binary. The iPhoneOS
+  SDK has no IOKit headers, so it declares the IOKit and IOSurface calls it uses. Locally it was checked
+  only against stub headers.
+- Delivery to the phone is still the owner's choice (options below).
 
 A `SweetGPU` IOService, matched by name and published only when the service is ready, with user client
 `SweetGPUUserClient`. Selectors as in their design. Our argument layout:

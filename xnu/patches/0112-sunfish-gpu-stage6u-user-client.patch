@@ -1,0 +1,574 @@
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -143,6 +143,8 @@
+ int sweet_gsvc_submit(const struct sweet_gsvc_ib *ibs, unsigned n, uint32_t *seq);
+ int sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms);
+ void sweet_gsvc_info(struct sweet_gsvc_info *info);
++/* iokit/Kernel/arm/SweetGPU.cpp (0112): publish the user client once the service is ready */
++void sweet_gpu_uc_publish(void);
+ 
+ /* sweet_rpmh.c: cmd-db address of an ARC (slave 3) or BCM (slave 5) resource, and an ARC's levels */
+ int sweet_rpmh_cmddb_query(const char *res, unsigned slave, uint32_t *addr, unsigned *vlvl,
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -1495,6 +1495,11 @@
+ 	printf("SWEET GSVC: stage 6 %s at 6.%d (sweetsvc=%d); %s\n", ok ? "done" : "STOPPED by a failure", step, stop,
+ 	    gs_dead ? "the service is dead, the SQE stopped" : gs_ready ? "the service stays ready" :
+ 	    "the SQE stays running");
++	/* only now: the 6.7 self-tests want the window empty, so no user BOs before this */
++	if (ok && gs_ready && !gs_dead) {
++		sweet_gpu_uc_publish();
++		printf("SWEET GSVC: published SweetGPUReady: the SweetGPU user client (root only, debug) can open\n");
++	}
+ 	return ok;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,12 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = SweetGPUReady;"
++    "     'IOMatchCategory' = SweetGPU;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -0,0 +1,521 @@
++/*
++ * SweetGPU: the user client for the Adreno 618 kernel GPU service
++ * (bsd/dev/sweet_gsvc.c, docs/GPU_A618_PLAN.md stage 6U). Debug only.
++ *
++ * The service is published (IOResources "SweetGPUReady") once stage 6.7
++ * passed; IOServiceMatching("SweetGPU") then finds it. Only root may open
++ * it: user IBs run in SMMU bank 0, which maps all DRAM 1:1, so a client can
++ * read and write any physical memory through the GPU.
++ *
++ *   sel 10  bo new: scalar [size, flags 0] -> [handle, gpu_va, user_va]
++ *           wired pages, write-combined in the task (the GPU side is
++ *           non-cacheable); at most 16 MiB
++ *   sel 11  bo free: scalar [handle]; waits (2 s cap) for the GPU first
++ *   sel 12  bo import IOSurface: scalar [surface id] -> [handle, gpu_va, size]
++ *           the surface's own pages; cleaned and invalidated to PoC before
++ *           each submit and after each successful wait of this client
++ *   sel 13  submit: struct sweet_gpu_submit -> scalar [seqno]; each IB
++ *           must lie inside a BO of this client
++ *   sel 14  wait: scalar [seqno, timeout_ms]; kIOReturnTimeout, or
++ *           kIOReturnNotResponding once the service is dead
++ *   sel 15  info: struct sweet_gpu_info out; the fence page is mapped
++ *           read-only into the task (word 0 = last retired seqno)
++ *
++ * Other selectors return kIOReturnUnsupported (logged once each). Closing
++ * waits for this client's last seqno (2 s cap), then frees its BOs. A BO
++ * the GPU may still use (free timed out) is leaked, never reused.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include "SweetSurface.h"
++
++/* The C API in bsd/dev/sweet_gsvc.c, as declared in bsd/dev/sweet_gpu_internal.h */
++extern "C" {
++struct sweet_gsvc_ib {
++	uint32_t handle, offset, size_dw;
++};
++struct sweet_gsvc_info {
++	uint32_t chip_id, gmem_size, gmem_base;
++	uint32_t cur_khz, max_khz, last_retired, flags;
++	uint64_t fence_pa, window_base, window_size;
++};
++int sweet_gsvc_bo_import_pages(const uint64_t *pa, uint32_t npages, uint32_t *handle, uint64_t *gpu_va);
++int sweet_gsvc_bo_free(uint32_t handle);
++int sweet_gsvc_submit(const struct sweet_gsvc_ib *ibs, unsigned n, uint32_t *seq);
++int sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms);
++void sweet_gsvc_info(struct sweet_gsvc_info *info);
++void sweet_gpu_uc_publish(void);
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
++
++/* The user ABI; tools/sweetgpu/sweetgpu-test.c has the same layouts */
++#define SWEET_GPU_ABI           1u
++#define SWEET_GPU_MAX_IBS       16u
++struct sweet_gpu_submit {
++	uint32_t count, reserved;
++	struct sweet_gsvc_ib ib[SWEET_GPU_MAX_IBS];
++};
++struct sweet_gpu_info {
++	uint32_t chip_id, gmem_size, gmem_base, cur_khz;
++	uint32_t max_khz, last_retired, flags, abi;
++	uint64_t fence_user_va, window_base, window_size;
++};
++static_assert(sizeof(struct sweet_gpu_submit) == 200, "submit ABI");
++static_assert(sizeof(struct sweet_gpu_info) == 56, "info ABI");
++
++enum {
++	kSweetGPUBoNew          = 10,
++	kSweetGPUBoFree         = 11,
++	kSweetGPUBoImport       = 12,
++	kSweetGPUSubmit         = 13,
++	kSweetGPUWait           = 14,
++	kSweetGPUInfo           = 15,
++};
++
++#define SWEET_GPU_PAGE          4096u           /* GPU pages; XNU's are 16 KiB */
++#define SWEET_GPU_BO_MAX        (16u << 20)
++#define SWEET_GPU_CLIENT_BOS    64u
++#define SWEET_GPU_WAIT_MAX_MS   10000u
++#define SWEET_GPU_CLOSE_WAIT_MS 2000u
++
++static IOReturn
++sweet_gpu_ret(int err)
++{
++	switch (err) {
++	case 0:         return kIOReturnSuccess;
++	case EINVAL:    return kIOReturnBadArgument;
++	case ENOMEM:    return kIOReturnNoMemory;
++	case ENXIO:     return kIOReturnNotResponding;
++	case ETIMEDOUT: return kIOReturnTimeout;
++	case EBUSY:     return kIOReturnBusy;
++	default:        return kIOReturnIOError;
++	}
++}
++
++class SweetGPU : public IOService {
++	OSDeclareDefaultStructors(SweetGPU);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPU, IOService);
++
++bool
++SweetGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	registerService();
++	IOLog("SWEET GPUUC: SweetGPU registered (root-only debug interface)\n");
++	return true;
++}
++
++/* Called by sweet_gsvc.c once 6.7 passed: SweetGPU matches IOResources "SweetGPUReady" */
++extern "C" void
++sweet_gpu_uc_publish(void)
++{
++	IOService::publishResource("SweetGPUReady", kOSBooleanTrue);
++}
++
++struct sweet_gpu_bo {
++	uint32_t handle;                        /* the service's handle; 0 = free slot */
++	uint32_t npages;                        /* GPU pages */
++	IOBufferMemoryDescriptor *buf;          /* bo new */
++	IOMemoryMap *map;                       /* bo new: the task's mapping */
++	SweetSurface *surface;                  /* import */
++	IOMemoryDescriptor *mem;                /* import: prepared */
++	uint64_t *pa;                           /* import: page addresses, for cache maintenance */
++};
++
++class SweetGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetGPUUserClient);
++
++	task_t fTask;
++	IOLock *fLock;
++	struct sweet_gpu_bo fBOs[SWEET_GPU_CLIENT_BOS];
++	uint32_t fLastSeq;
++	bool fSubmitted;
++	IOMemoryMap *fFenceMap;
++	uint64_t fLogged;                       /* unsupported selectors already logged */
++
++	struct sweet_gpu_bo *slot(uint32_t handle);
++	void release(struct sweet_gpu_bo *bo);
++	void syncImports(void);
++	IOReturn boNew(IOExternalMethodArguments *args);
++	IOReturn boFree(uint32_t handle);
++	IOReturn boImport(IOExternalMethodArguments *args);
++	IOReturn submit(IOExternalMethodArguments *args);
++	IOReturn wait(IOExternalMethodArguments *args);
++	IOReturn info(IOExternalMethodArguments *args);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
++
++bool
++SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	bool root = IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
++	IOLog("SWEET GPUUC: open by %s (pid %d, type %u): %s\n", name, proc_selfpid(), (unsigned)type,
++	    !root ? "refused, not root" : type != 0 ? "refused, type is not 0" : "accepted");
++	if (!root || type != 0 || !IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	bzero(fBOs, sizeof(fBOs));
++	return fLock != NULL;
++}
++
++void
++SweetGPUUserClient::free()
++{
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++/* Lock held */
++struct sweet_gpu_bo *
++SweetGPUUserClient::slot(uint32_t handle)
++{
++	for (uint32_t i = 0; i < SWEET_GPU_CLIENT_BOS; i++) {
++		if (fBOs[i].handle == handle) {
++			return &fBOs[i];
++		}
++	}
++	return NULL;
++}
++
++/* Lock held; the GPU no longer uses the pages */
++void
++SweetGPUUserClient::release(struct sweet_gpu_bo *bo)
++{
++	OSSafeReleaseNULL(bo->map);
++	OSSafeReleaseNULL(bo->buf);
++	if (bo->mem != NULL) {
++		bo->mem->complete();
++		bo->mem->release();
++	}
++	OSSafeReleaseNULL(bo->surface);
++	if (bo->pa != NULL) {
++		IOFreeData(bo->pa, bo->npages * sizeof(uint64_t));
++	}
++	bzero(bo, sizeof(*bo));
++}
++
++/* Lock held. Imported surfaces may be cacheable for the CPU; the GPU is not. */
++void
++SweetGPUUserClient::syncImports(void)
++{
++	for (uint32_t i = 0; i < SWEET_GPU_CLIENT_BOS; i++) {
++		struct sweet_gpu_bo *bo = &fBOs[i];
++		for (uint32_t p = 0; bo->handle != 0 && bo->pa != NULL && p < bo->npages; p++) {
++			flush_dcache64((addr64_t)bo->pa[p], SWEET_GPU_PAGE, TRUE);
++		}
++	}
++}
++
++IOReturn
++SweetGPUUserClient::boNew(IOExternalMethodArguments *args)
++{
++	if (args->scalarInputCount != 2 || args->scalarOutputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t size = args->scalarInput[0];
++	if (args->scalarInput[1] != 0 || size == 0 || size > SWEET_GPU_BO_MAX) {
++		return kIOReturnBadArgument;
++	}
++	size = round_page(size);        /* whole XNU pages, so the task mapping covers the BO */
++	uint32_t npages = (uint32_t)(size / SWEET_GPU_PAGE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, size, page_size);
++	if (pa == NULL || buf == NULL) {
++		if (pa != NULL) {
++			IOFreeData(pa, npages * sizeof(uint64_t));
++		}
++		OSSafeReleaseNULL(buf);
++		return kIOReturnNoMemory;
++	}
++	/* The pages were zeroed through the cacheable physical aliases: push that out once */
++	for (uint32_t p = 0; p < npages; p++) {
++		IOByteCount len = 0;
++		pa[p] = buf->getPhysicalSegment((IOByteCount)p * SWEET_GPU_PAGE, &len, kIOMemoryMapperNone);
++		flush_dcache64((addr64_t)pa[p], SWEET_GPU_PAGE, TRUE);
++	}
++	IOMemoryMap *map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++	IOReturn ret = map != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
++	uint32_t handle = 0;
++	uint64_t gpu_va = 0;
++	IOLockLock(fLock);
++	struct sweet_gpu_bo *bo = slot(0);
++	if (ret == kIOReturnSuccess && bo == NULL) {
++		ret = kIOReturnNoResources;
++	}
++	if (ret == kIOReturnSuccess) {
++		ret = sweet_gpu_ret(sweet_gsvc_bo_import_pages(pa, npages, &handle, &gpu_va));
++	}
++	if (ret == kIOReturnSuccess) {
++		bo->handle = handle;
++		bo->npages = npages;
++		bo->buf = buf;
++		bo->map = map;
++		args->scalarOutput[0] = handle;
++		args->scalarOutput[1] = gpu_va;
++		args->scalarOutput[2] = map->getAddress();
++		args->scalarOutputCount = 3;
++	}
++	IOLockUnlock(fLock);
++	IOFreeData(pa, npages * sizeof(uint64_t));
++	if (ret != kIOReturnSuccess) {
++		OSSafeReleaseNULL(map);
++		buf->release();
++	}
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::boFree(uint32_t handle)
++{
++	IOLockLock(fLock);
++	struct sweet_gpu_bo *bo = handle != 0 ? slot(handle) : NULL;
++	IOReturn ret = bo != NULL ? sweet_gpu_ret(sweet_gsvc_bo_free(handle)) : kIOReturnBadArgument;
++	if (ret == kIOReturnBusy) {
++		/* The GPU may still write these pages: keep them, and the slot, forever */
++		IOLog("SWEET GPUUC: bo %u: the GPU did not finish in 2 s; its pages are leaked\n", handle);
++		bo->handle = UINT32_MAX;
++	} else if (bo != NULL && ret != kIOReturnBadArgument) {
++		release(bo);
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::boImport(IOExternalMethodArguments *args)
++{
++	if (args->scalarInputCount != 1 || args->scalarOutputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_copy((uint32_t)args->scalarInput[0]);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	IOMemoryDescriptor *mem = s->memory;
++	uint64_t len = mem->getLength();
++	if (len == 0 || len > SWEET_GPU_BO_MAX) {
++		s->release();
++		return kIOReturnBadArgument;
++	}
++	uint32_t npages = (uint32_t)((len + SWEET_GPU_PAGE - 1) / SWEET_GPU_PAGE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	if (pa == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	mem->retain();
++	IOReturn ret = mem->prepare(kIODirectionInOut);
++	if (ret != kIOReturnSuccess) {
++		mem->release();
++		s->release();
++		IOFreeData(pa, npages * sizeof(uint64_t));
++		return ret;
++	}
++	for (uint32_t p = 0; p < npages; p++) {
++		IOByteCount seg = 0;
++		pa[p] = mem->getPhysicalSegment((IOByteCount)p * SWEET_GPU_PAGE, &seg, kIOMemoryMapperNone);
++		flush_dcache64((addr64_t)pa[p], SWEET_GPU_PAGE, TRUE);
++	}
++	uint32_t handle = 0;
++	uint64_t gpu_va = 0;
++	IOLockLock(fLock);
++	struct sweet_gpu_bo *bo = slot(0);
++	ret = bo == NULL ? kIOReturnNoResources : sweet_gpu_ret(sweet_gsvc_bo_import_pages(pa, npages, &handle, &gpu_va));
++	if (ret == kIOReturnSuccess) {
++		bo->handle = handle;
++		bo->npages = npages;
++		bo->surface = s;
++		bo->mem = mem;
++		bo->pa = pa;
++		args->scalarOutput[0] = handle;
++		args->scalarOutput[1] = gpu_va;
++		args->scalarOutput[2] = (uint64_t)npages * SWEET_GPU_PAGE;
++		args->scalarOutputCount = 3;
++	}
++	IOLockUnlock(fLock);
++	if (ret != kIOReturnSuccess) {
++		mem->complete();
++		mem->release();
++		s->release();
++		IOFreeData(pa, npages * sizeof(uint64_t));
++	}
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::submit(IOExternalMethodArguments *args)
++{
++	struct sweet_gpu_submit in;
++	uint32_t len = args->structureInputSize;
++	if (args->structureInputDescriptor != NULL || args->structureInput == NULL || args->scalarOutputCount < 1 ||
++	    len < 8 || len > sizeof(in)) {
++		return kIOReturnBadArgument;
++	}
++	bzero(&in, sizeof(in));
++	memcpy(&in, args->structureInput, len);
++	if (in.count == 0 || in.count > SWEET_GPU_MAX_IBS || len < 8 + in.count * sizeof(struct sweet_gsvc_ib)) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	for (uint32_t i = 0; i < in.count; i++) {
++		/* the service checks the IB against its BO; this checks the BO is ours */
++		if (in.ib[i].handle == 0 || in.ib[i].handle == UINT32_MAX || slot(in.ib[i].handle) == NULL) {
++			IOLockUnlock(fLock);
++			return kIOReturnBadArgument;
++		}
++	}
++	syncImports();
++	uint32_t seq = 0;
++	IOReturn ret = sweet_gpu_ret(sweet_gsvc_submit(in.ib, in.count, &seq));
++	if (ret == kIOReturnSuccess) {
++		fLastSeq = seq;
++		fSubmitted = true;
++		args->scalarOutput[0] = seq;
++		args->scalarOutputCount = 1;
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::wait(IOExternalMethodArguments *args)
++{
++	if (args->scalarInputCount != 2) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t ms = args->scalarInput[1];
++	IOReturn ret = sweet_gpu_ret(sweet_gsvc_wait((uint32_t)args->scalarInput[0],
++	    ms > SWEET_GPU_WAIT_MAX_MS ? SWEET_GPU_WAIT_MAX_MS : (uint32_t)ms));
++	if (ret == kIOReturnSuccess) {
++		IOLockLock(fLock);
++		syncImports();
++		IOLockUnlock(fLock);
++	}
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::info(IOExternalMethodArguments *args)
++{
++	if (args->structureOutput == NULL || args->structureOutputSize < sizeof(struct sweet_gpu_info)) {
++		return kIOReturnNoSpace;
++	}
++	struct sweet_gsvc_info in;
++	sweet_gsvc_info(&in);
++	IOLockLock(fLock);
++	if (fFenceMap == NULL && in.fence_pa != 0) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(in.fence_pa, SWEET_GPU_PAGE, kIODirectionIn);
++		if (md != NULL) {
++			fFenceMap = md->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapWriteCombineCache);
++			md->release();
++		}
++	}
++	struct sweet_gpu_info out;
++	out.chip_id = in.chip_id;
++	out.gmem_size = in.gmem_size;
++	out.gmem_base = in.gmem_base;
++	out.cur_khz = in.cur_khz;
++	out.max_khz = in.max_khz;
++	out.last_retired = in.last_retired;
++	out.flags = in.flags;
++	out.abi = SWEET_GPU_ABI;
++	out.fence_user_va = fFenceMap != NULL ? fFenceMap->getAddress() : 0;
++	out.window_base = in.window_base;
++	out.window_size = in.window_size;
++	IOLockUnlock(fLock);
++	memcpy(args->structureOutput, &out, sizeof(out));
++	args->structureOutputSize = sizeof(out);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGPUUserClient::clientClose(void)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOReturn w = fSubmitted ? sweet_gpu_ret(sweet_gsvc_wait(fLastSeq, SWEET_GPU_CLOSE_WAIT_MS)) : kIOReturnSuccess;
++	unsigned freed = 0, leaked = 0;
++	for (uint32_t i = 0; i < SWEET_GPU_CLIENT_BOS; i++) {
++		uint32_t h = fBOs[i].handle;
++		if (h == 0) {
++			continue;
++		}
++		if (h == UINT32_MAX || boFree(h) == kIOReturnBusy) {
++			leaked++;
++		} else {
++			freed++;
++		}
++	}
++	IOLockLock(fLock);
++	OSSafeReleaseNULL(fFenceMap);
++	IOLockUnlock(fLock);
++	IOLog("SWEET GPUUC: close by %s: last seqno %u %s, %u BOs freed, %u leaked\n", name, fLastSeq,
++	    !fSubmitted ? "(none sent)" : w == kIOReturnSuccess ? "retired" : "NOT retired", freed, leaked);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	switch (selector) {
++	case kSweetGPUBoNew:
++		return boNew(args);
++	case kSweetGPUBoFree:
++		return args->scalarInputCount == 1 ? boFree((uint32_t)args->scalarInput[0]) : kIOReturnBadArgument;
++	case kSweetGPUBoImport:
++		return boImport(args);
++	case kSweetGPUSubmit:
++		return submit(args);
++	case kSweetGPUWait:
++		return wait(args);
++	case kSweetGPUInfo:
++		return info(args);
++	default: {
++		uint32_t bit = selector < 63 ? selector : 63;
++		if (!(fLogged & (1ULL << bit))) {
++			fLogged |= 1ULL << bit;
++			IOLog("SWEET GPUUC: unsupported selector %u\n", selector);
++		}
++		return kIOReturnUnsupported;
++	}
++	}
++}
++#endif /* SWEET */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
