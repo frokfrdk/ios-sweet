@@ -2107,6 +2107,82 @@ Stage 6 leaves these for later:
     them early in boot.
 - Start with (a) and look into (b) afterwards.
 
+#### 8(a) planned in detail (2026-10-28, while CI 40672085967 queued; nothing built)
+
+**The present path today (0093 + `sweetfb_mdpscale=1`, read from `SweetFramebuffer.cpp`).**
+- CA swaps alternate between two surfaces (2 and 3 in the G6g log): 828x1792 BGRA, 3328 bytes per row (64-byte
+  aligned).
+- They are `IOBufferMemoryDescriptor`s, cacheable and **not physically contiguous**.
+- `AppleCLCD::vsyncFired` runs `present()` at most once per dirty vsync. `present()` memcpys 1792 rows of 3312 bytes
+  (5.93 MB) into the canvas at PA 0x9ca00000, mapped write-combined, then runs `dsb sy`. VIG0 fetches the canvas and
+  QSEED upscales it to 1080x2340.
+
+**What the gain can be (estimate, not measured).**
+- E2c measured a 10 MB panel copy at 2.1 ms (about 5 GB/s), so this copy is likely about 1.2–1.5 ms per presented
+  frame. That is under 10% of one core even at 60 presents/s.
+- The surfaces are cacheable CPU memory, so before the GPU (not coherent here) can read one, the CPU must clean it to
+  PoC (`dc cvac` over 5.9 MB, as `sweet_gsvc_bo_sync` does). That clean may cost a large part of the copy it
+  replaces.
+- So **8(a) saves little while CA renders on the CPU**. The UI's slowness is CA's CPU renderer (FBSTAT showed 1–6
+  swaps/s in the E2c/G1c sessions; a guess that this still holds), which only Stage 7 fixes.
+- 8(a) pays off once Stage 7 renders into the surfaces with the GPU: then nothing is in the CPU caches, no clean is
+  needed, and the CPU does no per-frame work at all.
+- (b) zero-copy would need physically contiguous swap surfaces; today's surfaces are page lists, so (b) stays later.
+
+**Recommendation.** Do 8a.0 now (free: one boot-arg on the next test image). Build 8a.1 now if wanted: it is also
+Stage 7 groundwork, because it proves the 2D engine. Do 8a.2–8a.3 together with Stage 7's first GPU-rendered frames.
+
+**Copy engine.** CP_MEM_TO_MEM (6.4's copy) moves one word per 6-dword packet: about 35 MB of IB per frame, so it is
+unusable. Use the a6xx **2D blitter** (`CP_BLIT`, `BLIT_OP_SCALE`), which needs no shader.
+- The sequence, as Mesa turnip's `r2d_*` and freedreno's `fd6_blitter` (MIT) use it:
+  - `CP_SET_MARKER` 2D-blit mode.
+  - `RB_2D_BLIT_CNTL` / `GRAS_2D_BLIT_CNTL` (colour format and ifmt), `SP_2D_DST_FORMAT`.
+  - Source: `SP_PS_2D_SRC_INFO`, `_SIZE`, base and `_PITCH`.
+  - Destination: `RB_2D_DST_INFO`, base and `_PITCH`.
+  - Source and destination rectangles: `GRAS_2D_SRC_TL/BR_X/Y`, `GRAS_2D_DST_TL/BR`.
+  - `CP_BLIT`, then the CCU colour flush event and our `CACHE_FLUSH_TS` fence.
+- Offsets, field layouts and the exact flush events must be taken from `a6xx.xml` at the pinned Mesa release and
+  checked one by one. This list is from memory.
+- The 2D pitches are in units of 64 bytes (to check), so the **canvas stride must become 3328** (`VIG0 SRC_YSTRIDE`;
+  3328 × 1792 = 5.96 MB, still under the carve-out's end). The CPU path can use the same stride.
+- Format: BGRA8 to BGRA8, same size, nearest filter, no swap. Our 4.1 init list may not set the CCU (`RB_CCU_CNTL`)
+  the way the 2D path expects; 8a.1 checks that.
+
+**Steps.**
+- **8a.0 Baseline (no new code).** Add `sweetfbstat=1` to the next test boot (G6h), then read FBSTAT's `copy avg` for
+  the MDP path. PORT_LOG has no FBSTAT result for the MDP path; H4c was built for it, but no reading was recorded. It decides whether 8(a) is worth more
+  than a groundwork test.
+- **8a.1 Blit self-test (`sweetblit=1`, after 6.7 like 6.4; `sweetgpu=8 sweetsvc=7`).**
+  - Two window BOs of 3328 × 1792 bytes; the CPU fills the source with the 6.4 pattern; one `CP_BLIT` copies it;
+    every pixel is checked.
+  - Repeat at 64x64 and 828x1 to catch row and edge errors. Log the GPU time (submit to fence).
+  - Pass: 0 bad pixels in all three; no SMMU fault, no `CP_HW_FAULT` / `CP_PROTECT_STATUS`, no hang latch; the
+    service is still ready.
+  - Expect ≤ 2 ms for 6 MB (guess: DDR-bound at 180–430 MHz).
+- **8a.2 Shadow copy (`sweetfb_gpucopy=1`).** The CPU still presents. Each presented surface is imported once (by
+  surface ID, freed when the surface is freed), and a canvas-sized window BO is the destination. Per present: clean
+  the surface to PoC (timed), blit, wait (20 ms limit), then compare 16 sampled rows with the canvas the CPU wrote.
+  - Log once per 5 s: clean, blit and wait times, and mismatches.
+  - Pass: 0 mismatches over 2 minutes of UI use; times logged. Nothing on screen changes.
+- **8a.3 GPU present (`sweetfb_gpucopy=2`).** Import the canvas carve-out once as a BO (`bo_import_pages` of
+  0x9ca00000…). The blit writes it; the CPU memcpy is skipped.
+  - Any error, wait timeout or `SWEET_GSVC_DEAD` falls back to the CPU copy for the rest of the boot, and logs why.
+  - Before the GPU path starts, VIG0 is never pointed at a buffer the GPU writes. The switch stays as it is (the first
+    frame is a CPU copy).
+  - Pass: the UI looks as on H4; FBSTAT copy avg falls (CPU time = clean + submit); no fallback in 10 minutes.
+
+**Test boots.** G6h carries 8a.0 (proposal: G6g's args plus `sweetfbstat=1`). After that: B1 = G6h args +
+`sweetblit=1`. Later, with Stage 7: B2 (`sweetfb_gpucopy=1`) and B3 (`=2`). All are `fastboot boot` only, and no root
+change is needed.
+
+**Risks, most uncertain first.**
+1. The 2D engine's setup on a618 (CCU, ifmt, UBWC off): if 8a.1 shows garbage, compare with turnip's register dump
+   for a linear BGRA copy.
+2. The clean-to-PoC cost may eat the gain while CA renders on the CPU (8a.2 measures it).
+3. Tearing: the canvas is updated while VIG0 scans it. That is the same as today's CPU copy, so it is not new.
+4. Importing 1456 pages per surface: the window (64 MiB, BO limit 16 MiB) fits 2 surfaces plus the canvas (about
+   18 MB). Re-imports when CA reallocates surfaces must free the old ones (6U's leak count shows it).
+
 ### Stage 9: tuning
 
 - Clock levels up to 650/825 MHz, if thermals allow.
