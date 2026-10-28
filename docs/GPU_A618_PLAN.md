@@ -2173,7 +2173,7 @@ unusable. Use the a6xx **2D blitter** (`CP_BLIT`, `BLIT_OP_SCALE`), which needs 
 
 **8a.1 written (patch 0113, 2026-10-28; not built on CI, not booted).**
 - `sweet_gsvc.c` runs `gs_blit_step` after 6.7 and before the user client is published, when `sweetblit` > 0.
-- Three copies, each with a 3-page IB BO: 64x64 (pitch 256), 828x1 and 828x1792 (pitch 3328).
+- Three copies, each with its own source, destination and 1-page IB BO: 64x64 (pitch 256), 828x1 and 828x1792 (pitch 3328).
   - The source is a hash pattern (every byte varies, so channel swaps show). The 16 bytes of row padding hold a
     poison that must survive.
   - Each line logs bad pixels, changed padding words, the submit-to-fence time, and the two CCU flush timestamp words.
