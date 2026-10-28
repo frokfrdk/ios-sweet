@@ -15,7 +15,7 @@ Observed = read in the disassembly. Guess = not checked.
   `kEAGLContextPropertyClientRetainRelease` (the only OpenGLES symbols QuartzCore imports, plus the
   `EAGLContext` class).
 - `[[EAGLContext alloc] initWithAPI:3 properties:]`, falling back to API 2. Then
-  `setParameter:0x260 to:&0` (meaning unknown).
+  `setParameter:0x260 to:&0`, whose return value CA ignores (see "Closed questions" below).
 - **It then requires `[ctx API] == 3`**, otherwise no GL renderer. So the shim must give ES 3.0+.
   Mesa freedreno on a618 offers ES 3.2.
 - `new CA::OGL::GLESContext(ctx)` (0x870 bytes), then `CA::OGL::Renderer`.
@@ -66,7 +66,7 @@ The slot numbers were matched to names through OpenGLES's exported trampolines (
 ```
 
 - Apple-only entries: `FinishObjectAPPLE(GL_TEXTURE, name)` (wait for one texture),
-  `FramebufferParameteriAPPLE` (arguments not traced; guess: GL_APPLE_tile_order_rot), and the EXT
+  `FramebufferParameteriAPPLE` (only used with GL_APPLE_tile_order_rot; see below), and the EXT
   markers (no-ops are fine).
 - Extensions CA probes in `glGetString(GL_EXTENSIONS)`: GL_EXT_shader_framebuffer_fetch (blend
   filters, `gl_LastFragData`), GL_APPLE_fence, GL_APPLE_texture_filter_cubic, GL_APPLE_texture_xr,
@@ -113,7 +113,41 @@ OpenGLES matches the `IOAcceleratorES` (or `IOAcceleratorESLegacy`) service. lib
   its slot number once (through sel 16, as sweetgpu-test does) and returns 0, so a missed call shows
   up in the log rather than as a crash.
 - API 3 must be reported. `getMacroContextPrivate` must return `priv+0x20`.
-- Open: the meaning of setParameter 0x260 and the FramebufferParameteriAPPLE arguments; whether
-  anything reads the second table or other `priv` fields.
+- The `priv` block is 0x40e8 bytes: the 0x28-byte header, the table, and a zeroed back table (below).
+  Fill +0x20 too, because `GLIContextFromEAGLContext` returns it.
 - Slot 591 serves both glDeleteShader and glDeleteProgram (both exports jump there). Mesa keeps
   shaders and programs in one name space, so the entry can check glIsProgram and call the right one.
+
+## Closed questions (observed, 2026-10-28)
+
+**setParameter:to: / getParameter:to:.** OpenGLES does not interpret the parameter itself. If the
+sharegroup's renderer state is valid, it calls the GL plugin's set-integer / get-integer entry with
+(GLI context, pname, pointer) and returns its result. Otherwise it returns 10000 (0x2710). These are
+CGL-style context parameters: `setMultiThreaded:` is 0x139 (313, CGL's `kCGLCEMPEngine`), and
+`setBlockFence:onQueue:` uses 0x263 and 0x264. Public headers do not name 0x260 (608). CA sets it to 0
+straight after init and **does not check the return value**. So the shim can accept any pname and
+return 0. It should keep 0x139 working, because `isMultiThreaded` reads it back.
+
+**FramebufferParameteriAPPLE (slot 1024).**
+- The one call site is `CA::OGL::GLESContext::set_surface`. It makes the call as
+  `fn(ctx, GL_FRAMEBUFFER, 0x8a79, &value)`, so the third argument is a pointer.
+- `value` is 0x8a7a or 0x8a7d, depending on a bit in the surface's flags.
+- CA keeps the last value in the surface (+0x64) and skips the call when the value is unchanged.
+- The call only happens when GLESContext flag bit 6 is set. The constructor sets that bit only if
+  `check_extension("GL_APPLE_tile_order_rot")` succeeds. **If the shim does not advertise
+  GL_APPLE_tile_order_rot, slot 1024 is never called.** The stub entry is enough.
+- Guess: 0x8a79 is a tile order or rotation pname, and the two values are two orientations.
+
+**The second table and other priv fields.**
+- priv+0x2088 (right after the first table's 1036 × 8 bytes) is the **back dispatch**. It is only touched
+  by OpenGLES's exported `GLCSelectDispatchBounded`, `GLCSelectDispatchFunction`,
+  `GLCRestoreDispatch` and `GLCRestoreDispatchFunction`, with `GLCBackDispatch` returning a pointer
+  to it.
+- Those functions let a tool interpose GL calls: they save an original entry there before
+  overwriting the front entry, and put it back on restore. A zero entry means "not saved".
+- QuartzCore imports none of them. CA reads nothing past the first table (its highest slot is 1024;
+  its own +0x2100 stores are into the GLESContext object, not priv).
+- So the shim allocates the back table zeroed and need not do anything else. Because the layout
+  matches Apple's, those GLC* exports then work on our contexts too.
+- Other priv reads by OpenGLES code the shim does not override: `GLIContextFromEAGLContext` (+0x20),
+  `-API` (+0x10), `-sharegroup` (+0x08) and `+currentContext` (+0x00).
