@@ -314,10 +314,17 @@ main(void)
 	/* IOSurface import: a handle with an iova and no map */
 	uint32_t s = 0;
 	uint64_t ssize = 0;
-	CHECK(sweetdrm_import_iosurface(fd, 77, &s, &ssize) == 0 && s != 0 && ssize == 0x10000);
+	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &s, &ssize) == 0 && s != 0 && ssize == 0x10000);
 	CHECK(gem_info(fd, s, MSM_INFO_GET_IOVA, &iova) == 0 && iova != 0);
 	CHECK(gem_info(fd, s, MSM_INFO_GET_OFFSET, &off) == -EINVAL);
-	CHECK(sweetdrm_import_iosurface(fd, 78, &s, &ssize) == -ENOENT);
+	CHECK(sweetdrm_import_iosurface(fd, 78, NULL, &s, &ssize) == -ENOENT);
+	/* with the surface's own mapping, which Mesa's mmap then gets back */
+	static uint32_t surface_pages[0x10000 / 4];
+	uint32_t s2 = 0;
+	CHECK(sweetdrm_import_iosurface(fd, 77, surface_pages, &s2, &ssize) == 0 && s2 != 0 && s2 != s);
+	CHECK(gem_info(fd, s2, MSM_INFO_GET_OFFSET, &off) == 0 &&
+	    sweetdrm_mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off) == (void *)surface_pages);
+	CHECK(sweetdrm_munmap(surface_pages, 0x10000) == 0);
 
 	/* drmIoctl: errno convention, msm ioctls through it, GEM_CLOSE */
 	struct drm_msm_param pp = { .pipe = MSM_PIPE_3D0, .param = MSM_PARAM_GPU_ID };

@@ -44,10 +44,12 @@ void sweetdrm_set_backend(const struct sweetdrm_backend *backend);
 
 /*
  * Import an IOSurface as a GEM handle on the sweetdrm fd, for fd_bo_from_handle().
- * It has no CPU mapping here (the surface's own mapping is the CPU view).
+ * cpu is the surface's base address in this task (IOSurfaceGetBaseAddress), which
+ * Mesa then maps the BO to, or NULL for a BO Mesa must never map. The kernel keeps
+ * the CPU caches in step around submits and waits, as for its own BOs.
  * Returns 0 or -errno.
  */
-int sweetdrm_import_iosurface(int fd, uint32_t surface_id, uint32_t *handle, uint64_t *size);
+int sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *handle, uint64_t *size);
 
 /* One log line to stderr and the backend's report (the kernel log on iOS, selector 16) */
 void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

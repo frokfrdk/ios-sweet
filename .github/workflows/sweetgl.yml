@@ -3,7 +3,8 @@ name: sweetgl
 # Stage 7.0: Mesa freedreno (gallium, msm kmd) cross-built for iOS arm64 against
 # sweetdrm, as static libraries. 7.2: sweetgl-tri links them into an offscreen
 # clear-and-triangle test for the device. 7.3: libsweetgl.a, the surfaceless
-# GLES frontend, and sweetgl-gltri, the same test through GL calls.
+# GLES frontend, and sweetgl-gltri, the same test through GL calls. 7.5: the
+# EAGL shim (libsweeteagl) and sweetgl-eagltri, which drives it as CA does.
 on:
   workflow_dispatch:
   push:
@@ -100,8 +101,25 @@ jobs:
             fi
           done
           bash tools/sweetgl/test/build-gltri.sh "$RUNNER_TEMP/mesa" out/build out/lib out/bin/sweetgl-gltri
+
+      - name: EAGL shim and sweetgl-eagltri
+        run: |
+          XC=/Applications/Xcode_16.4.app
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          bash tools/sweetgl/eagl/build.sh "$RUNNER_TEMP/mesa" out/lib out/bin
+          # the dylib exports the installer only, and gets every gl* from Mesa inside it
+          nm -gU out/bin/libsweeteagl.dylib | tee "$RUNNER_TEMP/eagl-exports.txt"
+          test "$(awk '{print $3}' "$RUNNER_TEMP/eagl-exports.txt")" = _sweeteagl_install
+          if nm -u out/bin/libsweeteagl.dylib | grep -E '^_gl[A-Z]'; then
+            echo "gl* left undefined in the dylib (above)"; exit 1
+          fi
+          nm out/lib/libsweeteagl.a | grep -q ' t _sweeteagl_unknown_stubs\| T _sweeteagl_unknown_stubs'
+          bash tools/sweetgl/test/build-eagltri.sh "$RUNNER_TEMP/mesa" out/lib out/bin/sweetgl-eagltri
+          if nm -u out/bin/sweetgl-eagltri | grep -E '^_gl[A-Z]'; then
+            echo "gl* left undefined in sweetgl-eagltri (above)"; exit 1
+          fi
           (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
-          (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri > SHA256SUMS)
+          (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri sweetgl-eagltri libsweeteagl.dylib > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:

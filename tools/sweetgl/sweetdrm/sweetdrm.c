@@ -47,7 +47,7 @@ struct bo {
 	uint32_t handle;                /* 0 = free slot */
 	uint32_t last_seq;              /* 0 = never submitted */
 	uint64_t gpu_va, size;
-	void *cpu;                      /* NULL for imports */
+	void *cpu;                      /* an import's is the surface's own mapping, or NULL */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -558,7 +558,7 @@ sweetdrm_munmap(void *addr, size_t length)
 }
 
 int
-sweetdrm_import_iosurface(int fd, uint32_t surface_id, uint32_t *handle, uint64_t *size)
+sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *handle, uint64_t *size)
 {
 	if (!is_ours(fd)) {
 		return fail(EBADF);
@@ -568,7 +568,7 @@ sweetdrm_import_iosurface(int fd, uint32_t surface_id, uint32_t *handle, uint64_
 	int e = be->bo_import ? be->bo_import(surface_id, &h, &va, &sz) : ENOSYS;
 	if (e == 0) {
 		pthread_mutex_lock(&lock);
-		e = add(h, va, sz, NULL);
+		e = add(h, va, sz, cpu);
 		pthread_mutex_unlock(&lock);
 		if (e) {
 			be->bo_free(h);

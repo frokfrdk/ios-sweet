@@ -6,12 +6,13 @@
  * stubs) go to whichever context is current on the calling thread.
  *
  * This is the layer the EAGL shim sits on: an EAGLContext holds one
- * sweetgl_context, and its renderbuffer storage is an FBO's.
+ * sweetgl_context, and IOSurfaces become its textures through sweetgl images.
  */
 #ifndef SWEETGL_H
 #define SWEETGL_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,31 @@ SWEETGL_EXPORT void sweetgl_context_destroy(struct sweetgl_context *c);
 
 /* The entry point of a GL function by name, or NULL. */
 SWEETGL_EXPORT void (*sweetgl_get_proc_address(const char *name))(void);
+
+/*
+ * Stage 7.5: IOSurface memory as GL storage, with no copy. An image is the
+ * surface's pages imported into GPU VA (SweetGPU's import selector) and wrapped
+ * as a linear 2D resource. Pass the image pointer as the GLeglImageOES of
+ * glEGLImageTargetTexture2DOES or glEGLImageTargetRenderbufferStorageOES; the
+ * texture or renderbuffer then keeps its own reference, so the image may be
+ * destroyed straight after.
+ */
+struct sweetgl_image;
+
+/* IOSurface pixel formats (kIOSurfacePixelFormat) an image can have */
+#define SWEETGL_FOURCC_BGRA     0x42475241u     /* 'BGRA': B8G8R8A8 in memory order */
+#define SWEETGL_FOURCC_RGBA     0x52474241u     /* 'RGBA' */
+
+/*
+ * Import surface_id (IOSurfaceGetID) as a width x height image with stride bytes
+ * per row (a multiple of 256) of pixel format fourcc. cpu is the surface's base
+ * address in this task, for the driver's CPU access. NULL on failure, with the
+ * reason logged through sweetdrm_say.
+ */
+SWEETGL_EXPORT struct sweetgl_image *sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id,
+    void *cpu, unsigned width, unsigned height, unsigned stride, uint32_t fourcc);
+
+SWEETGL_EXPORT void sweetgl_image_destroy(struct sweetgl_image *img);
 
 #ifdef __cplusplus
 }

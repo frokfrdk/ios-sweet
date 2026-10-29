@@ -5,9 +5,11 @@
  * current through the st API, but never a pipe_frontend_drawable, so every
  * context is surfaceless and draws into FBOs only. See sweetgl.h.
  */
+#include <pthread.h>
 #include <stdlib.h>
 
 #include "sweetgl.h"
+#include "sweetdrm.h"
 
 #include "frontend/api.h"
 #include "glapi/glapi/glapi.h"
@@ -15,6 +17,7 @@
 #include "pipe/p_screen.h"
 #include "state_tracker/st_context.h"
 #include "util/driconf.h"
+#include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/xmlconfig.h"
 #include "freedreno/drm/freedreno_drm_public.h"
@@ -28,6 +31,10 @@ struct sweetgl_display {
 	/* first, so the st's fscreen pointer is the display */
 	struct pipe_frontend_screen fscreen;
 	driOptionCache options_info, options;
+	int fd;
+	/* the live images, so a stale GLeglImageOES is refused rather than followed */
+	pthread_mutex_t images_lock;
+	struct sweetgl_image *images;
 };
 
 struct sweetgl_context {
@@ -35,7 +42,56 @@ struct sweetgl_context {
 	struct st_context *st;
 };
 
+struct sweetgl_image {
+	struct sweetgl_display *display;
+	struct sweetgl_image *next;
+	struct pipe_resource *res;
+};
+
 static _Thread_local struct sweetgl_context *current;
+
+/* sweetgl_import.c */
+struct pipe_resource *sweetgl_fd_import_iosurface(struct pipe_screen *pscreen, int fd, uint32_t surface_id,
+    void *cpu, const struct pipe_resource *tmpl, unsigned stride);
+
+/* images_lock held */
+static struct sweetgl_image *
+find_image(struct sweetgl_display *d, void *egl_image)
+{
+	for (struct sweetgl_image *i = d->images; i; i = i->next) {
+		if (i == egl_image) {
+			return i;
+		}
+	}
+	return NULL;
+}
+
+static bool
+sweetgl_validate_egl_image(struct pipe_frontend_screen *fscreen, void *egl_image)
+{
+	struct sweetgl_display *d = (struct sweetgl_display *)fscreen;
+	pthread_mutex_lock(&d->images_lock);
+	bool ok = find_image(d, egl_image) != NULL;
+	pthread_mutex_unlock(&d->images_lock);
+	return ok;
+}
+
+static bool
+sweetgl_get_egl_image(struct pipe_frontend_screen *fscreen, void *egl_image, struct st_egl_image *out)
+{
+	struct sweetgl_display *d = (struct sweetgl_display *)fscreen;
+	pthread_mutex_lock(&d->images_lock);
+	struct sweetgl_image *i = find_image(d, egl_image);
+	if (i) {
+		/* the caller owns this reference; internalformat 0 means "from the format" */
+		pipe_resource_reference(&out->texture, i->res);
+		out->format = i->res->format;
+		out->level = 0;
+		out->layer = 0;
+	}
+	pthread_mutex_unlock(&d->images_lock);
+	return i != NULL;
+}
 
 static int
 sweetgl_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param param)
@@ -68,6 +124,10 @@ sweetgl_display_open(int fd)
 		return NULL;
 	}
 	d->fscreen.get_param = sweetgl_get_param;
+	d->fscreen.get_egl_image = sweetgl_get_egl_image;
+	d->fscreen.validate_egl_image = sweetgl_validate_egl_image;
+	d->fd = fd;
+	pthread_mutex_init(&d->images_lock, NULL);
 	return d;
 }
 
@@ -83,6 +143,10 @@ sweetgl_display_close(struct sweetgl_display *d)
 	if (d == NULL) {
 		return;
 	}
+	while (d->images) {
+		sweetgl_image_destroy(d->images);
+	}
+	pthread_mutex_destroy(&d->images_lock);
 	/* the st's per-screen state, made by the first context */
 	st_screen_destroy(&d->fscreen);
 	d->fscreen.screen->destroy(d->fscreen.screen);
@@ -159,4 +223,62 @@ sweetgl_context_destroy(struct sweetgl_context *c)
 void (*sweetgl_get_proc_address(const char *name))(void)
 {
 	return _mesa_glapi_get_proc_address(name);
+}
+
+struct sweetgl_image *
+sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, void *cpu, unsigned width,
+    unsigned height, unsigned stride, uint32_t fourcc)
+{
+	enum pipe_format format;
+	switch (fourcc) {
+	case SWEETGL_FOURCC_BGRA:       format = PIPE_FORMAT_B8G8R8A8_UNORM; break;
+	case SWEETGL_FOURCC_RGBA:       format = PIPE_FORMAT_R8G8B8A8_UNORM; break;
+	default:
+		sweetdrm_say("7.5 image: surface %u has pixel format 0x%08x, not BGRA or RGBA", surface_id, fourcc);
+		return NULL;
+	}
+	struct sweetgl_image *i = CALLOC_STRUCT(sweetgl_image);
+	if (i == NULL) {
+		return NULL;
+	}
+	struct pipe_resource tmpl = {
+		.target = PIPE_TEXTURE_2D,
+		.format = format,
+		.width0 = width,
+		.height0 = height,
+		.depth0 = 1,
+		.array_size = 1,
+		.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED,
+	};
+	i->res = sweetgl_fd_import_iosurface(d->fscreen.screen, d->fd, surface_id, cpu, &tmpl, stride);
+	if (i->res == NULL) {
+		FREE(i);
+		return NULL;
+	}
+	i->display = d;
+	pthread_mutex_lock(&d->images_lock);
+	i->next = d->images;
+	d->images = i;
+	pthread_mutex_unlock(&d->images_lock);
+	return i;
+}
+
+void
+sweetgl_image_destroy(struct sweetgl_image *img)
+{
+	if (img == NULL) {
+		return;
+	}
+	struct sweetgl_display *d = img->display;
+	pthread_mutex_lock(&d->images_lock);
+	for (struct sweetgl_image **p = &d->images; *p; p = &(*p)->next) {
+		if (*p == img) {
+			*p = img->next;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&d->images_lock);
+	/* textures bound to it keep the resource, and so the import, alive */
+	pipe_resource_reference(&img->res, NULL);
+	FREE(img);
 }

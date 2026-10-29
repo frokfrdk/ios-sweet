@@ -24,7 +24,10 @@ cat "$W/cc.sh"
 bash "$W/cc.sh" "$HERE/sweetgl.c" "$W/sweetgl.o"
 bash "$W/cc.sh" "$HERE/renderonly_stub.c" "$W/renderonly_stub.o"
 bash "$W/cc.sh" "$SRC/src/mesa/glapi/es2api/libgles2_public.c" "$W/gles2_public.o" "-I$W"
+# The IOSurface import (7.5) needs freedreno's own headers: freedreno_resource.c's command
+bash "$HERE/../mesa/mesa-cc.sh" "$SRC" "$B" drivers/freedreno/freedreno_resource.c > "$W/cc-fd.sh"
+bash "$W/cc-fd.sh" "$HERE/sweetgl_import.c" "$W/sweetgl_import.o"
 
 AR=$(xcrun --sdk iphoneos -f ar)
 rm -f "$OUT"
-"$AR" rcs "$OUT" "$W/sweetgl.o" "$W/renderonly_stub.o" "$W/gles2_public.o"
+"$AR" rcs "$OUT" "$W/sweetgl.o" "$W/sweetgl_import.o" "$W/renderonly_stub.o" "$W/gles2_public.o"
