@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -1771,6 +1771,8 @@
+ 	    "BOs%s%s\n", mode, (mode & 2) ? ", after the a618 magic registers" : "",
+ 	    (mode & 4) ? ", CACHE_INVALIDATE first" : "");
+ 	gpu_pause("8a.1 the 2D blitter");
++	/* as in 6.7 (0116b): 8a.2's imports may stay mapped, so the copies must only give back what they took */
++	uint32_t before = gs_win_count();
+ 	unsigned pass = 0, skip = 0;
+ 	for (unsigned i = 0; i < ncases && !gs_dead; ++i) {
+ 		int r = gs_blit_one((mode & 2) != 0, (mode & 4) != 0, cases[i][0], cases[i][1], cases[i][2]);
+@@ -1779,9 +1781,9 @@
+ 	}
+ 	uint32_t used = gs_win_count();
+ 	gs_dump("after 8a.1");
+-	printf("SWEET GSVC: 8a.1: %u of %u copies right, %u skipped; window pages in use afterwards: %u (want 0)\n", pass,
+-	    ncases, skip, used);
+-	return gs_clean("8a.1") && pass + skip == ncases && pass >= 2u && used == 0;
++	printf("SWEET GSVC: 8a.1: %u of %u copies right, %u skipped; window pages in use afterwards: %u, %u before "
++	    "(want at most %u)\n", pass, ncases, skip, used, before, before);
++	return gs_clean("8a.1") && pass + skip == ncases && pass >= 2u && used <= before;
+ }
+ 
+ /*

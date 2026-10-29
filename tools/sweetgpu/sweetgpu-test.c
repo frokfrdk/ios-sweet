@@ -359,13 +359,18 @@ test_bad(void)
 	struct sweet_gpu_info i0, i1;
 	info(&i0);
 	struct sweet_gpu_ib past = { b.h, size - 4u, 2 }, other = { b.h + 1000u, 0, 1 };
-	uint32_t seq = 0;
-	kern_return_t k1 = submit(&past, 1, &seq), k2 = submit(&other, 1, &seq);
+	uint32_t s1 = 0, s2 = 0;
+	kern_return_t k1 = submit(&past, 1, &s1), k2 = submit(&other, 1, &s2);
 	info(&i1);
 	bo_free(&b);
-	int ok = k1 == kIOReturnBadArgument && k2 == kIOReturnBadArgument && i0.last_retired == i1.last_retired;
-	say("sweetgpu-test: bad submits: IB past its BO 0x%x, foreign handle 0x%x (want 0x%x both); last retired %u -> %u: %s\n",
-	    k1, k2, kIOReturnBadArgument, i0.last_retired, i1.last_retired, ok ? "refused" : "NOT refused");
+	/*
+	 * A refused submit gets no seqno. Other clients (the kernel's 8a.2 copies)
+	 * keep retiring work meanwhile, so last retired is only logged.
+	 */
+	int ok = k1 == kIOReturnBadArgument && k2 == kIOReturnBadArgument && s1 == 0 && s2 == 0;
+	say("sweetgpu-test: bad submits: IB past its BO 0x%x seq %u, foreign handle 0x%x seq %u (want 0x%x and 0 both); "
+	    "last retired %u -> %u: %s\n", k1, s1, k2, s2, kIOReturnBadArgument, i0.last_retired, i1.last_retired,
+	    ok ? "refused" : "NOT refused");
 	return ok;
 }
 
