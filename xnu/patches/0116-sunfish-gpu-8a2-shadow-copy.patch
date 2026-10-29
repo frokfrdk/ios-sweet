@@ -1,0 +1,419 @@
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -143,6 +143,8 @@
+ int sweet_gsvc_submit(const struct sweet_gsvc_ib *ibs, unsigned n, uint32_t *seq);
+ int sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms);
+ void sweet_gsvc_info(struct sweet_gsvc_info *info);
++/* 0116: a linear BGRA8 2D-blitter copy between window addresses, for the framebuffer (8a.2) */
++int sweet_gsvc_blit(uint64_t dst, uint64_t src, uint32_t pitch, uint32_t width, uint32_t height, uint32_t *seq);
+ /* iokit/Kernel/arm/SweetGPU.cpp (0112): publish the user client once the service is ready */
+ void sweet_gpu_uc_publish(void);
+ 
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -34,6 +34,8 @@
+  * a618 "magic" registers that Mesa's context restore sets; 4 (patch 0113b)
+  * starts each copy with CACHE_INVALIDATE, as that restore does (G6i showed
+  * stale source data from the previous case without it). 1 runs neither.
++ * sweet_gsvc_blit (patch 0116, plan 8a.2) is that copy for the framebuffer,
++ * always with CACHE_INVALIDATE (G6j: all 8a.1 cases right with it).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -1775,6 +1777,52 @@
+ 	return gs_clean("8a.1") && pass + skip == ncases && pass >= 2u && used == 0;
+ }
+ 
++/*
++ * 0116: one linear BGRA8 copy, width x height at the same pitch, between window
++ * addresses (64-byte aligned, pitch a multiple of 64). The IB lives in a
++ * one-page BO made on first use; each call waits for the previous copy before
++ * it rewrites that IB, so callers are serialised. *seq is for sweet_gsvc_wait.
++ */
++static LCK_MTX_DECLARE(gs_kblit_lock, &gs_grp);
++static uint32_t gs_kblit_ib, gs_kblit_seq;
++static uint64_t gs_kblit_gva;
++static volatile uint32_t *gs_kblit_cpu;
++
++int
++sweet_gsvc_blit(uint64_t dst, uint64_t src, uint32_t pitch, uint32_t width, uint32_t height, uint32_t *seq)
++{
++	if (!gs_usable() || !gs_ready) {
++		return ENXIO;
++	}
++	if (width == 0 || height == 0 || width > 0x4000u || height > 0x4000u || (pitch & 63u) || pitch < width * 4u ||
++	    ((dst | src) & 63u)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&gs_kblit_lock);
++	int r = 0;
++	if (gs_kblit_ib == 0) {
++		r = sweet_gsvc_bo_new(GS_PAGE, 0, &gs_kblit_ib, &gs_kblit_gva, &gs_kblit_cpu);
++	}
++	if (r == 0 && gs_kblit_seq != 0) {
++		r = sweet_gsvc_wait(gs_kblit_seq, GS_WAIT_MS);
++	}
++	if (r == 0) {
++		struct gs_ibw w;
++		ibw_init(&w, gs_kblit_cpu, BL_TS_OFF / 4u);
++		ibw_blit(&w, false, true, gs_kblit_gva + BL_TS_OFF, dst, src, pitch, width, height);
++		(void)sweet_gsvc_bo_sync(gs_kblit_ib);
++		struct sweet_gsvc_ib ib = { gs_kblit_ib, 0, w.n };
++		uint32_t s = 0;
++		r = w.n > w.max ? EINVAL : sweet_gsvc_submit(&ib, 1, &s);
++		if (r == 0) {
++			gs_kblit_seq = s;
++			*seq = s;
++		}
++	}
++	lck_mtx_unlock(&gs_kblit_lock);
++	return r;
++}
++
+ bool
+ sweet_gsvc_run(int stop, int cb, vm_offset_t l1_va, uint64_t l1_pa)
+ {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,24 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/errno.h>
++
++/* The C API in bsd/dev/sweet_gsvc.c, as declared in bsd/dev/sweet_gpu_internal.h (0116) */
++extern "C" {
++struct sweet_gsvc_info {
++	uint32_t chip_id, gmem_size, gmem_base;
++	uint32_t cur_khz, max_khz, last_retired, flags;
++	uint64_t fence_pa, window_base, window_size;
++};
++#define SWEET_GSVC_READY        1u
++#define SWEET_GSVC_DEAD         2u
++int sweet_gsvc_bo_import_pages(const uint64_t *pa, uint32_t npages, uint32_t *handle, uint64_t *gpu_va);
++int sweet_gsvc_bo_free(uint32_t handle);
++int sweet_gsvc_wait(uint32_t seq, uint32_t timeout_ms);
++void sweet_gsvc_info(struct sweet_gsvc_info *info);
++int sweet_gsvc_blit(uint64_t dst, uint64_t src, uint32_t pitch, uint32_t width, uint32_t height, uint32_t *seq);
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -93,6 +111,14 @@
+  * flush latches it at the next frame. The CPU copies 5.9 MB per frame and
+  * scales nothing; the kernel console keeps drawing into the panel buffer,
+  * which is no longer shown.
++ *
++ * Boot-arg sweetfb_gpucopy=1 (patch 0116, plan 8a.2; MDP path only): after
++ * the CPU copy, the GPU's 2D blitter (sweet_gsvc_blit) copies the same
++ * surface into a canvas-sized shadow buffer, and 16 rows of it are compared
++ * with the canvas. Nothing on screen changes. Each surface is imported into
++ * the GPU window once (the 3 most recent stay); the surface is cleaned to
++ * PoC before each copy. Any error turns it off for the rest of the boot.
++ * Timings and mismatches are logged with FBSTAT (forced on) every 5 s.
+  */
+ #define SWEET_MDP_PA                    0x0ae00000ULL
+ #define SWEET_MDP_SIZE                  0x8000
+@@ -195,6 +221,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	uint64_t gpuShadow(SweetSurface *s);
+ 	bool mdpSetup(void);
+ 	void mdpSwitch(void);
+ };
+@@ -236,6 +263,124 @@
+ static uint64_t sweet_fb_stat_presents, sweet_fb_stat_copy_abs, sweet_fb_stat_copy_max, sweet_fb_stat_bytes;
+ static int sweet_fb_stat_cpu = -1;
+ 
++/* 8a.2 (sweetfb_gpucopy=1): see the comment at the top; one AppleCLCD, its vsync work loop only */
++#define SWEET_FB_GPU_PAGE       4096u           /* GPU pages; XNU's are 16 KiB */
++#define SWEET_FB_GPU_IMPORTS    3u
++#define SWEET_FB_GPU_WAIT_MS    20u
++#define SWEET_FB_GPU_ROWS       16u
++struct sweet_fb_gpu_buf {
++	SweetSurface       *s;                  /* retained while imported; NULL for the shadow */
++	IOMemoryDescriptor *mem;                /* prepared */
++	uint32_t            handle;
++	uint64_t            gva, used;          /* used: when last copied from */
++};
++static int sweet_fb_gpucopy;
++static bool sweet_fb_gpu_off, sweet_fb_gpu_first;
++static struct sweet_fb_gpu_buf sweet_fb_gpu_imp[SWEET_FB_GPU_IMPORTS], sweet_fb_gpu_shadow;
++static IOBufferMemoryDescriptor *sweet_fb_gpu_shadow_buf;
++static uint64_t sweet_fb_gpu_uses, sweet_fb_gpu_n, sweet_fb_gpu_clean_abs, sweet_fb_gpu_clean_max;
++static uint64_t sweet_fb_gpu_blit_abs, sweet_fb_gpu_blit_max, sweet_fb_gpu_rows, sweet_fb_gpu_bad_rows;
++static uint64_t sweet_fb_gpu_imports, sweet_fb_gpu_waiting;
++static uint32_t sweet_fb_gpu_bad_logged;
++
++static void
++sweet_fb_gpu_stat_report(void)
++{
++	uint64_t n = sweet_fb_gpu_n, clean = 0, cmax = 0, blit = 0, bmax = 0;
++	if (n != 0) {
++		absolutetime_to_nanoseconds(sweet_fb_gpu_clean_abs / n, &clean);
++		absolutetime_to_nanoseconds(sweet_fb_gpu_blit_abs / n, &blit);
++	}
++	absolutetime_to_nanoseconds(sweet_fb_gpu_clean_max, &cmax);
++	absolutetime_to_nanoseconds(sweet_fb_gpu_blit_max, &bmax);
++	IOLog("SWEET GPUCOPY: %llu copies/5s, clean avg %llu us max %llu, blit+wait avg %llu us max %llu, "
++	    "%llu of %llu sampled rows differ, %llu imports so far, %llu skipped (service not ready)%s\n", n,
++	    clean / 1000, cmax / 1000, blit / 1000, bmax / 1000, sweet_fb_gpu_bad_rows, sweet_fb_gpu_rows,
++	    sweet_fb_gpu_imports, sweet_fb_gpu_waiting, sweet_fb_gpu_off ? "; OFF" : "");
++	sweet_fb_gpu_n = sweet_fb_gpu_clean_abs = sweet_fb_gpu_clean_max = sweet_fb_gpu_blit_abs = 0;
++	sweet_fb_gpu_blit_max = sweet_fb_gpu_rows = sweet_fb_gpu_bad_rows = sweet_fb_gpu_waiting = 0;
++}
++
++static void
++sweet_fb_gpu_stop(const char *why, int err)
++{
++	sweet_fb_gpu_off = true;
++	IOLog("SWEET GPUCOPY: off for the rest of this boot: %s (%d)\n", why, err);
++}
++
++static void
++sweet_fb_gpu_drop(struct sweet_fb_gpu_buf *b)
++{
++	if (b->handle != 0) {
++		(void)sweet_gsvc_bo_free(b->handle);
++	}
++	if (b->mem != NULL) {
++		b->mem->complete();
++		b->mem->release();
++	}
++	OSSafeReleaseNULL(b->s);
++	*b = (struct sweet_fb_gpu_buf){};
++}
++
++/* Map mem's pages into the GPU window (as SweetGPU.cpp's bo import does); false on failure */
++static bool
++sweet_fb_gpu_map(IOMemoryDescriptor *mem, struct sweet_fb_gpu_buf *b)
++{
++	uint64_t len = mem->getLength();
++	uint32_t npages = (uint32_t)((len + SWEET_FB_GPU_PAGE - 1) / SWEET_FB_GPU_PAGE);
++	uint64_t *pa = npages != 0 ? (uint64_t *)IOMallocData(npages * sizeof(uint64_t)) : NULL;
++	if (pa == NULL) {
++		sweet_fb_gpu_stop("no page list", ENOMEM);
++		return false;
++	}
++	IOReturn ret = mem->prepare(kIODirectionInOut);
++	int r = ret == kIOReturnSuccess ? 0 : EIO;
++	for (uint32_t p = 0; r == 0 && p < npages; p++) {
++		IOByteCount seg = 0;
++		pa[p] = mem->getPhysicalSegment((IOByteCount)p * SWEET_FB_GPU_PAGE, &seg, kIOMemoryMapperNone);
++		r = pa[p] != 0 ? 0 : EFAULT;
++	}
++	uint32_t handle = 0;
++	uint64_t gva = 0;
++	r = r ? r : sweet_gsvc_bo_import_pages(pa, npages, &handle, &gva);
++	IOFreeData(pa, npages * sizeof(uint64_t));
++	if (r != 0) {
++		if (ret == kIOReturnSuccess) {
++			mem->complete();
++		}
++		sweet_fb_gpu_stop("mapping into the GPU window failed", r);
++		return false;
++	}
++	mem->retain();
++	b->mem = mem;
++	b->handle = handle;
++	b->gva = gva;
++	return true;
++}
++
++/* The surface's window mapping, made on first use; the least recently used one is dropped */
++static struct sweet_fb_gpu_buf *
++sweet_fb_gpu_import(SweetSurface *s)
++{
++	struct sweet_fb_gpu_buf *old = &sweet_fb_gpu_imp[0];
++	for (uint32_t i = 0; i < SWEET_FB_GPU_IMPORTS; i++) {
++		if (sweet_fb_gpu_imp[i].s == s) {
++			return &sweet_fb_gpu_imp[i];
++		}
++		if (sweet_fb_gpu_imp[i].used < old->used) {
++			old = &sweet_fb_gpu_imp[i];
++		}
++	}
++	sweet_fb_gpu_drop(old);
++	if (!sweet_fb_gpu_map(s->memory, old)) {
++		return NULL;
++	}
++	s->retain();
++	old->s = s;
++	sweet_fb_gpu_imports++;
++	return old;
++}
++
+ static void
+ sweet_fb_stat_report(void)
+ {
+@@ -249,6 +394,9 @@
+ 	IOLog("SWEET FBSTAT: swaps %llu/s presents %llu/s copy avg %llu us max %llu us (%llu MB/5s) cpu %d\n",
+ 	    swaps / 5, n / 5, avg_ns / 1000, max_ns / 1000, sweet_fb_stat_bytes >> 20, sweet_fb_stat_cpu);
+ 	sweet_fb_stat_presents = sweet_fb_stat_copy_abs = sweet_fb_stat_copy_max = sweet_fb_stat_bytes = 0;
++	if (sweet_fb_gpucopy == 1) {
++		sweet_fb_gpu_stat_report();
++	}
+ }
+ 
+ bool
+@@ -362,6 +510,13 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	PE_parse_boot_argn("sweetfbstat", &sweet_fb_stat, sizeof(sweet_fb_stat));
++	PE_parse_boot_argn("sweetfb_gpucopy", &sweet_fb_gpucopy, sizeof(sweet_fb_gpucopy));
++	if (sweet_fb_gpucopy == 1) {
++		sweet_fb_stat = 1;
++		IOLog("SWEET GPUCOPY: sweetfb_gpucopy=1: GPU shadow copies of presented surfaces%s\n",
++		    fMdp ? "" : " need sweetfb_mdpscale=1 with a scaled canvas; not used");
++		sweet_fb_gpu_off = !fMdp;
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -601,6 +756,7 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	uint64_t t0 = mach_absolute_time();
++	uint64_t gpu = 0;       /* 8a.2 time, kept out of the copy statistics */
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -654,6 +810,9 @@
+ 						    base + (uint64_t)y * s->bytesPerRow, (size_t)fLogicalW * 4);
+ 					}
+ 					__asm__ volatile ("dsb sy" ::: "memory");
++					if (sweet_fb_gpucopy == 1) {
++						gpu += gpuShadow(s);
++					}
+ 					if (!fMdpOn) {
+ 						mdpSwitch();
+ 					} else if (!fMdpLogged) {
+@@ -766,7 +925,7 @@
+ 		}
+ 		s->release();
+ 	}
+-	uint64_t dt = mach_absolute_time() - t0;
++	uint64_t dt = mach_absolute_time() - t0 - gpu;
+ 	sweet_fb_stat_presents++;
+ 	sweet_fb_stat_copy_abs += dt;
+ 	if (dt > sweet_fb_stat_copy_max) {
+@@ -775,6 +934,117 @@
+ 	sweet_fb_stat_cpu = cpu_number();
+ }
+ 
++/*
++ * 8a.2: the GPU copies surface s (just copied into the canvas by the CPU) into
++ * the shadow buffer; 16 rows of the shadow are compared with the canvas.
++ * Returns the time spent (absolute units).
++ */
++uint64_t
++AppleCLCD::gpuShadow(SweetSurface *s)
++{
++	if (sweet_fb_gpu_off) {
++		return 0;
++	}
++	uint64_t t0 = mach_absolute_time();
++	struct sweet_gsvc_info info;
++	sweet_gsvc_info(&info);
++	if (info.flags & SWEET_GSVC_DEAD) {
++		sweet_fb_gpu_stop("the GPU service is dead", ENXIO);
++		return 0;
++	}
++	if (!(info.flags & SWEET_GSVC_READY)) {
++		sweet_fb_gpu_waiting++;
++		return 0;
++	}
++	uint32_t pitch = s->bytesPerRow;
++	uintptr_t src = s->kernelAddress();
++	uint64_t span = (uint64_t)(fLogicalH - 1) * pitch + (uint64_t)fLogicalW * 4;
++	if (src == 0 || (pitch & 63u) || (s->offset & 63u) || pitch < fLogicalW * 4 ||
++	    s->memory->getLength() > (16u << 20)) {
++		IOLog("SWEET GPUCOPY: surface %u: pitch %u offset %u length %llu not usable\n", s->id, pitch, s->offset,
++		    (uint64_t)s->memory->getLength());
++		sweet_fb_gpu_stop("surface layout", EINVAL);
++		return 0;
++	}
++	uint64_t need = (uint64_t)pitch * fLogicalH;
++	if (sweet_fb_gpu_shadow_buf != NULL && sweet_fb_gpu_shadow_buf->getLength() < need) {
++		sweet_fb_gpu_drop(&sweet_fb_gpu_shadow);
++		OSSafeReleaseNULL(sweet_fb_gpu_shadow_buf);
++	}
++	if (sweet_fb_gpu_shadow_buf == NULL) {
++		sweet_fb_gpu_shadow_buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut, round_page(need), SWEET_FB_GPU_PAGE);
++		if (sweet_fb_gpu_shadow_buf == NULL) {
++			sweet_fb_gpu_stop("no shadow buffer", ENOMEM);
++			return 0;
++		}
++		if (!sweet_fb_gpu_map(sweet_fb_gpu_shadow_buf, &sweet_fb_gpu_shadow)) {
++			return 0;
++		}
++	}
++	struct sweet_fb_gpu_buf *imp = sweet_fb_gpu_import(s);
++	if (imp == NULL) {
++		return 0;
++	}
++	imp->used = ++sweet_fb_gpu_uses;
++	uint8_t *shadow = (uint8_t *)sweet_fb_gpu_shadow_buf->getBytesNoCopy();
++
++	/* the surface to PoC for the GPU's reads; the shadow cleaned so no dirty line lands on the GPU's writes */
++	flush_dcache64((addr64_t)(src + s->offset), (unsigned)span, FALSE);
++	flush_dcache64((addr64_t)(uintptr_t)shadow, (unsigned)need, FALSE);
++	uint64_t t1 = mach_absolute_time();
++	uint32_t seq = 0;
++	int r = sweet_gsvc_blit(sweet_fb_gpu_shadow.gva, imp->gva + s->offset, pitch, fLogicalW, fLogicalH, &seq);
++	r = r ? r : sweet_gsvc_wait(seq, SWEET_FB_GPU_WAIT_MS);
++	uint64_t t2 = mach_absolute_time();
++	if (r != 0) {
++		sweet_fb_gpu_stop(r == ETIMEDOUT ? "the copy took more than 20 ms" : "blit or wait failed", r);
++		return t2 - t0;
++	}
++	if (!sweet_fb_gpu_first) {
++		sweet_fb_gpu_first = true;
++		IOLog("SWEET GPUCOPY: first copy: surface %u %ux%u pitch %u at gpu 0x%llx -> shadow gpu 0x%llx, seq %u\n",
++		    s->id, fLogicalW, fLogicalH, pitch, imp->gva + s->offset, sweet_fb_gpu_shadow.gva, seq);
++	}
++
++	/* drop stale lines, then compare 16 rows spread over the canvas */
++	flush_dcache64((addr64_t)(uintptr_t)shadow, (unsigned)need, FALSE);
++	for (uint32_t i = 0; i < SWEET_FB_GPU_ROWS; i++) {
++		uint32_t y = (uint32_t)(((uint64_t)i * (fLogicalH - 1)) / (SWEET_FB_GPU_ROWS - 1));
++		const uint32_t *g = (const uint32_t *)(shadow + (uint64_t)y * pitch);
++		const uint32_t *c = (const uint32_t *)(fCanvas + (uint64_t)y * fLogicalW * 4);
++		sweet_fb_gpu_rows++;
++		if (memcmp(g, c, (size_t)fLogicalW * 4) == 0) {
++			continue;
++		}
++		sweet_fb_gpu_bad_rows++;
++		if (sweet_fb_gpu_bad_logged < 8) {
++			uint32_t x = 0;
++			while (x < fLogicalW && g[x] == c[x]) {
++				x++;
++			}
++			uint32_t n = 0;
++			for (uint32_t k = x; k < fLogicalW; k++) {
++				n += g[k] != c[k];
++			}
++			sweet_fb_gpu_bad_logged++;
++			IOLog("SWEET GPUCOPY: surface %u row %u: %u pixels differ from x %u: gpu 0x%08x canvas 0x%08x\n",
++			    s->id, y, n, x, x < fLogicalW ? g[x] : 0, x < fLogicalW ? c[x] : 0);
++		}
++	}
++	uint64_t t3 = mach_absolute_time();
++	sweet_fb_gpu_n++;
++	sweet_fb_gpu_clean_abs += t1 - t0;
++	sweet_fb_gpu_blit_abs += t2 - t1;
++	if (t1 - t0 > sweet_fb_gpu_clean_max) {
++		sweet_fb_gpu_clean_max = t1 - t0;
++	}
++	if (t2 - t1 > sweet_fb_gpu_blit_max) {
++		sweet_fb_gpu_blit_max = t2 - t1;
++	}
++	return t3 - t0;
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
