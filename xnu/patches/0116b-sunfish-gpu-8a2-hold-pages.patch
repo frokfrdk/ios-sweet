@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -1501,11 +1501,18 @@
+ 		gpu_sleep_ms(10000);
+ 		char when[24];
+ 		snprintf(when, sizeof(when), "6.7 hold %u s", s);
++		/*
++		 * Other clients (8a.2's imports) may keep pages mapped through the hold, so
++		 * the rule is that the self-test gives back what it took: no more pages in
++		 * use afterwards than before.
++		 */
++		uint32_t before = gs_win_count();
+ 		uint32_t bad = gs_selftest(when);
+ 		uint32_t used = gs_win_count();
+ 		gs_dump(when);
+-		printf("SWEET GSVC:   %s: %u bad pixels, %u window pages in use (want 0, 0)\n", when, bad, used);
+-		ok = gs_clean(when) && bad == 0 && used == 0 && ok;
++		printf("SWEET GSVC:   %s: %u bad pixels, %u window pages in use, %u before the self-test (want 0, at most %u)\n",
++		    when, bad, used, before, before);
++		ok = gs_clean(when) && bad == 0 && used <= before && ok;
+ 	}
+ 	return ok;
+ }
