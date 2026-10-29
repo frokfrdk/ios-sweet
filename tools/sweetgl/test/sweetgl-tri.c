@@ -22,7 +22,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/driconf.h"
-#include "util/u_box.h"
+#include "util/box.h"
 #include "util/u_inlines.h"
 #include "util/u_simple_shaders.h"
 #include "util/xmlconfig.h"

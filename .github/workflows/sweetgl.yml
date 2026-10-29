@@ -82,7 +82,7 @@ jobs:
           XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           mkdir -p out/bin
-          bash tools/sweetgl/test/build-tri.sh out/build out/lib out/bin/sweetgl-tri
+          bash tools/sweetgl/test/build-tri.sh "$RUNNER_TEMP/mesa" out/build out/lib out/bin/sweetgl-tri
           (cd out/bin && shasum -a 256 sweetgl-tri > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
