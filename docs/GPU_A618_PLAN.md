@@ -2173,7 +2173,43 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   OpenGLES from our root to list exactly what `CA::OGL::GLESContext` calls on `EAGLContext`, how it
   gets the GL dispatch, binds IOSurfaces and presents. Output: our own interface notes, which define
   7.5.
-- **7.5 EAGL shim**, written from the 7.4 notes.
+- **7.5 EAGL shim**, written from the 7.4 notes. ✅ when sweetgl-eagltri passes on the device.
+
+  *Written; sweetgl run 40887402788 (04dd3e4) building, not yet run on the device (2026-10-30).*
+
+  How it is built: `tools/sweetgl/eagl/`. `sweeteagl.m` (no ARC) does not link OpenGLES: once the
+  `EAGLContext` class is in the process, `sweeteagl_install()` (also run from the dylib's constructor)
+  sets our implementations on `initWithAPI:` / `initWithAPI:properties:` / `initWithAPI:sharegroup:`,
+  `dealloc`, `+setCurrentContext:`, `+currentContext`, `API`, `getMacroContextPrivate`,
+  `setParameter:to:` / `getParameter:to:`, `attachImage:toCoreSurface:invertedRender:`, both
+  `texImageIOSurface:...plane:[invert:]`, and (logged, NO) `renderbufferStorage:fromDrawable:` and
+  `presentRenderbuffer:`.
+  - Each context is a sweetgl context (ES 3.2 for API 2 or 3; API 1 refused) and a calloc'd `_private`
+    block with the EAGL_NOTES layout (`sweeteagl.h` asserts the offsets 0x20, 0x28, 0x2088, 0x40e8),
+    stored through the `_private` ivar's runtime offset. The current context is TSD slot 30
+    (`tpidrro_el0`), so OpenGLES's own gl* exports reach the same table.
+  - `sweeteagl_slots.c` fills the table: the 62 slots CA uses call Mesa's public gl* (591 checks
+    `glIsProgram`, 470 FinishObjectAPPLE is `glFinish`, the EXT markers do nothing). Every other slot,
+    1024 included, is one of 1036 generated assembly stubs (`mov w0, #i; b`) that logs its slot once and
+    returns 0.
+  - IOSurfaces: `sweetgl_image_from_iosurface` (frontend) imports the surface with SweetGPU's import
+    selector (`sweetdrm_import_iosurface`, which now takes the surface's CPU mapping so Mesa can map the
+    BO) and wraps it with `resource_from_handle` as a linear resource at the surface's pitch. Mesa
+    imports KMS handles with size 0, which fails the layout check, so `sweetgl_import.c` first enters
+    the BO in freedreno's handle table with its real size. The frontend's `get_egl_image` /
+    `validate_egl_image` hooks hand the image to `glEGLImageTargetTexture2DOES`, so the bound texture
+    takes the pages with no copy. `invertedRender:` / `invert:` YES is logged and drawn upright.
+  - Present: nothing to hook. CA swaps through IOMFB itself, after its own Flush/Finish/FenceSync calls.
+  - `build.sh` makes `libsweeteagl.a` (for tests) and `libsweeteagl.dylib` (Mesa inside, exports only
+    `_sweeteagl_install`, for 7.7); CI checks the export list and that no `gl*` is left undefined.
+  - `test/sweetgl-eagltri.m` (boot-arg `sweetgleagltri=1`, job `com.sweet.gl-eagltri`) dlopens
+    OpenGLES, installs the shim, `initWithAPI:3 properties:`, and from there calls GL only through the
+    macro table, as CA does. It builds the display-buffer FBO from a 64x64 BGRA IOSurface
+    (`attachImage:`), clears it blue, draws a red triangle (GLSL ES 1.00, client arrays, `Uniform4f`,
+    FenceSync/ClientWaitSync), then samples a CPU-filled green IOSurface (`texImageIOSurface:`). Each
+    result is checked in the target surface's own memory, and it confirms an unimplemented slot returns 0.
+  - Open for 7.7: the shim opens SweetGPU on the first context and fails it if the device is not up
+    yet; backboardd starts long before the kernel's 6.7 hold ends (260 s in G6m).
 - **7.6 Kernel plumbing**: `sweetenv=` (exec-time env vars), AMFI op 0x5a in the 0092 handler, an
   `IOAcceleratorES` stub without `MetalPluginName`.
 - **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.

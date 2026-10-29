@@ -7,6 +7,7 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
 #include "pipe/p_defines.h"
+#include "util/u_inlines.h"        /* before freedreno's headers, which use it without including it */
 #include "freedreno_screen.h"
 
 struct pipe_resource *sweetgl_fd_import_iosurface(struct pipe_screen *pscreen, int fd, uint32_t surface_id,
