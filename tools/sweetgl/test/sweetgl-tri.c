@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 
 #include "xf86drm.h"
 #include "sweetdrm.h"
@@ -151,6 +152,58 @@ draw_triangle(void)
 	pipe_resource_reference(&vbuf, NULL);
 }
 
+/*
+ * Jetsam: with the launchd job's JetsamProperties (1024 MB) we were still killed
+ * for the per-process limit (reason 7) in a BO allocation, G6l twice. Log the
+ * limit launchd left us and our footprint, then raise the limit ourselves (root
+ * may; bsd/sys/kern_memorystatus.h, private, so declared here).
+ */
+#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES        7
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES        8
+#define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL                0x1
+#define MEMLIMIT_MB                                     2048
+typedef struct {
+	int32_t memlimit_active;        /* MB */
+	uint32_t memlimit_active_attr;
+	int32_t memlimit_inactive;      /* MB */
+	uint32_t memlimit_inactive_attr;
+} memlimit_props;
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
+
+static unsigned
+footprint_mb(void)
+{
+	task_vm_info_data_t vm;
+	mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) != KERN_SUCCESS) {
+		return 0;
+	}
+	return (unsigned)(vm.phys_footprint >> 20);
+}
+
+static void
+say_memlimit(const char *when)
+{
+	memlimit_props p = { 0 };
+	int r = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, getpid(), 0, &p, sizeof(p));
+	sweetdrm_say("7.2 memory %s: footprint %u MB, jetsam limit active %d MB attr 0x%x inactive %d MB attr 0x%x "
+	    "(get %d)", when, footprint_mb(), p.memlimit_active, p.memlimit_active_attr, p.memlimit_inactive,
+	    p.memlimit_inactive_attr, r);
+}
+
+static void
+raise_memlimit(void)
+{
+	say_memlimit("at start");
+	memlimit_props p = {
+		.memlimit_active = MEMLIMIT_MB, .memlimit_active_attr = MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+		.memlimit_inactive = MEMLIMIT_MB, .memlimit_inactive_attr = MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+	};
+	int r = memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &p, sizeof(p));
+	sweetdrm_say("7.2 memory: set jetsam limit %d MB -> %d", MEMLIMIT_MB, r);
+	say_memlimit("after set");
+}
+
 #define WAIT_STEP_S     5u
 #define WAIT_MAX_S      900u
 
@@ -193,6 +246,7 @@ main(void)
 		return 1;
 	}
 	sweetdrm_say("7.2 sweetgl-tri: SweetGPU open after %u s", waited);
+	raise_memlimit();
 	/*
 	 * Mesa's GL context creation sets up the GLSL type cache (main/context.c);
 	 * without that frontend we do it, or the driver's built-in shaders crash in
@@ -211,11 +265,13 @@ main(void)
 		return 1;
 	}
 	sweetdrm_say("7.2: screen \"%s\" by %s", screen->get_name(screen), screen->get_vendor(screen));
+	say_memlimit("after screen");
 	ctx = screen->context_create(screen, NULL, 0);
 	if (ctx == NULL) {
 		sweetdrm_say("7.2: no context");
 		return 1;
 	}
+	say_memlimit("after context");
 
 	struct pipe_resource tmpl = {
 		.target = PIPE_TEXTURE_2D,
