@@ -2251,6 +2251,27 @@ unusable. Use the a6xx **2D blitter** (`CP_BLIT`, `BLIT_OP_SCALE`), which needs 
 - Pass: 0 bad pixels and 0 changed padding in at least 2 of 3 copies with none failed; window pages 0 afterwards;
   `gs_clean`. A failure is logged and doesn't kill the service, unless the poller finds a fatal error.
 
+**8a.1 result (2026-10-29).** G6i (`sweetblit=1`) failed with stale source data from the previous case at the
+reused window VA. G6j (`sweetblit=5`, CACHE_INVALIDATE first) passed all 6 cases, the 828x1792 copy in 1011 us
+submit-to-fence. So every kernel blit starts with CACHE_INVALIDATE.
+
+**8a.2 written (patch 0116, 2026-10-29; built on CI, not booted).**
+- `sweet_gsvc_blit(dst, src, pitch, w, h, &seq)`: the 8a.1 IB (always with CACHE_INVALIDATE, no magic registers)
+  in a one-page IB BO made on first use. Calls are serialised: each one waits for the previous copy first.
+- `sweetfb_gpucopy=1`, MDP path only. After `present()`'s CPU canvas copy, `gpuShadow()`:
+  - waits until the service is READY (until then it counts the present as "skipped");
+  - imports the surface's pages into the window once (the 3 most recently used stay imported and retained);
+  - uses as the shadow a page-list `IOBufferMemoryDescriptor` (not a contiguous `bo_new`), imported the same way;
+  - cleans the surface and the shadow to PoC by VA (`flush_dcache64`, timed), blits, and waits (20 ms limit);
+  - invalidates the shadow, then compares 16 rows spread over the canvas with the canvas itself.
+- Its time is kept out of FBSTAT's copy statistics. `sweetfbstat` is forced on, and every 5 s a line follows FBSTAT:
+  `SWEET GPUCOPY: n copies/5s, clean avg/max, blit+wait avg/max, x of y sampled rows differ, imports, skipped`.
+  The first copy logs both GPU addresses. The first 8 differing rows are logged with the first differing pixel.
+- Any error (import, blit, a 20 ms timeout, a dead service, a surface whose pitch or offset is not 64-byte aligned)
+  logs `SWEET GPUCOPY: off for the rest of this boot: <why> (<errno>)` and stops 8a.2. The screen is unaffected.
+- Test boot G6k = G6j's args + `sweetfb_gpucopy=1`. Pass: GPUCOPY lines with 0 differing rows over 2 minutes of UI
+  use, never "off"; the times are recorded for the 8a.3 decision.
+
 **Test boots.** G6h carries 8a.0 (proposal: G6g's args plus `sweetfbstat=1`). After that: B1 = G6h args +
 `sweetblit=1`. Later, with Stage 7: B2 (`sweetfb_gpucopy=1`) and B3 (`=2`). All are `fastboot boot` only, and no root
 change is needed.
