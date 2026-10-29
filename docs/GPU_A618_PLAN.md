@@ -2150,7 +2150,14 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
 - **7.3 GL frontend** modelled on hgl: a surfaceless GLES context, rendering only into FBOs, the GL
   entry points exported for the EAGL shim. ✅ the 7.2 test redone through GL calls.
 
-  *Built (sweetgl run 40870346392, 47320f2), not yet run on the device (2026-10-29).* `tools/sweetgl/frontend/`: `sweetgl.h`/`sweetgl.c`
+  **7.3 PASSED on the device (G6m, booted 2026-10-29 23:59, root v6m; sweetgl run 40870346392, 47320f2).**
+  The test's report lines in the kernel log: `GL_VERSION "OpenGL ES 3.2 Mesa 26.2.5"`, `GL_RENDERER "FD618"`,
+  GLSL ES 3.20; FBO complete; clear 0 of 4096 pixels wrong; GLSL ES triangle 0 of 4096 wrong, 2016 red
+  (as 7.2); "7.3 sweetgl-gltri: pass"; close: last seqno 131 retired, 0 leaked. Footprint 1 MB after the
+  screen, 15 MB with a current context, 22 MB at the end. Kernel stages 0-6, sweetgpu-test and the 8a.2
+  GPU copies (0 rows differ) all passed in the same boot, no panic.
+
+  How it is built: `tools/sweetgl/frontend/`: `sweetgl.h`/`sweetgl.c`
   wrap the freedreno screen in a `pipe_frontend_screen` and create `API_OPENGLES2` st contexts with a
   `PIPE_FORMAT_NONE` visual (no `gl_config`), made current with `st_api_make_current(st, NULL, NULL)`,
   i.e. Mesa's incomplete framebuffer, so they draw only into FBOs. `build.sh` makes `libsweetgl.a`:
