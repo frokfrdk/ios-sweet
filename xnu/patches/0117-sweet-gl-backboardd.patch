@@ -141,6 +141,15 @@
  
  /* sweetgpuucslow=1: log what comes next, then give the persistent log time to reach the disk */
  static int sweet_gpu_uc_slow = -1;
+@@ -207,7 +208,7 @@ class SweetGPUUserClient : public IOUserClient {
+ 
+ 	task_t fTask;
+ 	IOLock *fLock;
+-	struct sweet_gpu_bo fBOs[SWEET_GPU_CLIENT_BOS];
++	struct sweet_gpu_bo *fBOs;              /* SWEET_GPU_CLIENT_BOS; 20 KiB, so not inline (classes <= 16 KiB) */
+ 	uint32_t fLastSeq;
+ 	bool fSubmitted;
+ 	IOMemoryMap *fFenceMap;
 @@ -243,9 +244,17 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
  	char name[32];
  	proc_selfname(name, sizeof(name));
@@ -161,3 +170,23 @@
  		return false;
  	}
  	uc_next("IOUserClient::initWithTask");
+@@ -254,13 +263,17 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 	}
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+-	bzero(fBOs, sizeof(fBOs));
+-	return fLock != NULL;
++	fBOs = IONewZero(struct sweet_gpu_bo, SWEET_GPU_CLIENT_BOS);
++	return fLock != NULL && fBOs != NULL;
+ }
+ 
+ void
+ SweetGPUUserClient::free()
+ {
++	if (fBOs != NULL) {
++		IODelete(fBOs, struct sweet_gpu_bo, SWEET_GPU_CLIENT_BOS);
++		fBOs = NULL;
++	}
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
