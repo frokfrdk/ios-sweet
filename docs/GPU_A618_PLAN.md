@@ -2134,6 +2134,19 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
 - **7.2 Offscreen test binary.** Gallium directly (no GL frontend yet): create the screen through
   sweetdrm, clear and draw a triangle into a linear resource, read back, report through sel 16 as
   sweetgpu-test does. `FD_MESA_DEBUG=nogmem,noubwc` first. Deploying it is a root edit (owner OK).
+  - **Result: PASSED on the phone (G6l, 2026-10-29 21:36 boot, root v6l, sweetgl run 40860677622).**
+    Screen "FD618" by freedreno; clear: 0 of 4096 pixels wrong; triangle: 0 of 4096 wrong, 2016 red
+    (want 2048 ± 64); "7.2 sweetgl-tri: pass"; close: last seqno 130 retired, 6 BOs freed, 0 leaked.
+    Kernel checks and sweetgpu-test passed alongside.
+  - Two fixes were needed. (1) Without a GL frontend nothing sets up Mesa's GLSL type cache, and the
+    driver's built-in shaders crashed in `glsl_array_type` during `context_create`; the tool calls
+    `glsl_type_singleton_init_or_ref()` itself. (2) launchd gave the job a 6 MB jetsam limit (active
+    non-fatal, inactive fatal) and ignored `JetsamProperties` in launchd.plist; the footprint is 13 MB
+    after `context_create`, so jetsam killed it (reason 7, per-process limit). The tool now raises its
+    own limit to 2048 MB with `memorystatus_control` (root may) and logs footprint and limit.
+  - Leftovers: the `JetsamProperties` key sweetgpu-root.py adds has no effect (harmless); the kernel
+    warns that the SDK's `TASK_VM_INFO_COUNT` (90) is newer than the kernel's (89), which is harmless.
+    7.3 needs the same two fixes in whatever process hosts the GL frontend.
 - **7.3 GL frontend** modelled on hgl: a surfaceless GLES context, rendering only into FBOs, the GL
   entry points exported for the EAGL shim. ✅ the 7.2 test redone through GL calls.
 - **7.4 EAGL research** (local only; nothing from Apple goes into git): disassemble QuartzCore and
