@@ -23,6 +23,7 @@
 #include "xf86drm.h"
 #include "sweetdrm.h"
 
+#include "compiler/glsl_types.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
@@ -192,6 +193,12 @@ main(void)
 		return 1;
 	}
 	sweetdrm_say("7.2 sweetgl-tri: SweetGPU open after %u s", waited);
+	/*
+	 * Mesa's GL context creation sets up the GLSL type cache (main/context.c);
+	 * without that frontend we do it, or the driver's built-in shaders crash in
+	 * glsl_array_type during context_create (G6l).
+	 */
+	glsl_type_singleton_init_or_ref();
 	sweetdrm_say("7.2 sweetgl-tri: FD_MESA_DEBUG=%s", getenv("FD_MESA_DEBUG"));
 
 	driOptionCache options_info = { 0 }, options = { 0 };
@@ -249,5 +256,6 @@ main(void)
 	ctx->destroy(ctx);
 	pipe_resource_reference(&rt, NULL);
 	screen->destroy(screen);
+	glsl_type_singleton_decref();
 	return fails ? 1 : 0;
 }
