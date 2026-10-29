@@ -1,7 +1,8 @@
 name: sweetgl
 
 # Stage 7.0: Mesa freedreno (gallium, msm kmd) cross-built for iOS arm64 against
-# sweetdrm. Only static libraries for now; nothing links or runs them yet.
+# sweetdrm, as static libraries. 7.2: sweetgl-tri links them into an offscreen
+# clear-and-triangle test for the device.
 on:
   workflow_dispatch:
   push:
@@ -76,10 +77,23 @@ jobs:
           fi
           (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
 
+      - name: sweetgl-tri
+        run: |
+          XC=/Applications/Xcode_16.4.app
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          mkdir -p out/bin
+          bash tools/sweetgl/test/build-tri.sh out/build out/lib out/bin/sweetgl-tri
+          (cd out/bin && shasum -a 256 sweetgl-tri > SHA256SUMS)
+
       - uses: actions/upload-artifact@v4
         with:
           name: sweetgl-mesa
           path: out/lib/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl-tri
+          path: out/bin/
 
       - uses: actions/upload-artifact@v4
         if: failure()

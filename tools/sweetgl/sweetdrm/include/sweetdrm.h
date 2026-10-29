@@ -49,6 +49,9 @@ void sweetdrm_set_backend(const struct sweetdrm_backend *backend);
  */
 int sweetdrm_import_iosurface(int fd, uint32_t surface_id, uint32_t *handle, uint64_t *size);
 
+/* One log line to stderr and the backend's report (the kernel log on iOS, selector 16) */
+void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 #ifdef __cplusplus
 }
 #endif

@@ -55,7 +55,7 @@ meson setup "$OUT/build" "$SRC" --cross-file "$OUT/ios-arm64.ini" --buildtype=re
   -Dxmlconfig=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
   -Dperfetto=false -Dbuild-tests=false
 
-# Nothing links the driver yet (that is 7.2/7.3), so build its static libraries by name
+# No target links the driver (test/build-tri.sh does, 7.2), so build its static libraries by name
 meson compile -C "$OUT/build" \
   freedreno freedreno_drm freedrenowinsys freedreno_common freedreno_ir3 freedreno_layout \
-  freedreno_perfcntrs ir3encode ir3decode gallium mesa compiler glsl
+  freedreno_perfcntrs ir3encode ir3decode gallium mesa compiler glsl nir mesa_util mesa_util_simd xmlconfig

@@ -66,17 +66,32 @@ sweetdrm_set_backend(const struct sweetdrm_backend *backend)
 }
 
 static void
-say(const char *fmt, ...)
+vsay(const char *who, const char *fmt, va_list ap)
 {
 	char line[192];
-	va_list ap;
-	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
-	va_end(ap);
-	fprintf(stderr, "sweetdrm: %s\n", line);
+	fprintf(stderr, "%s: %s\n", who, line);
 	if (be && be->report) {
 		be->report(line);
 	}
+}
+
+static void
+say(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vsay("sweetdrm", fmt, ap);
+	va_end(ap);
+}
+
+void
+sweetdrm_say(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vsay("sweetgl", fmt, ap);
+	va_end(ap);
 }
 
 static int
