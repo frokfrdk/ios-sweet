@@ -25,10 +25,14 @@
  *
  * The GPU device is opened on the first context. FD_MESA_DEBUG defaults to
  * nogmem,noubwc and GALLIUM_THREAD to 0, the configuration 7.3 passed with.
+ * In backboardd (7.7) that first context can come before the kernel has
+ * published SweetGPU, so the open waits for it, up to SWEETEAGL_WAIT_S.
  */
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 #import <Foundation/Foundation.h>
 #include <objc/message.h>
@@ -52,6 +56,19 @@ uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef buffer);
 
 #define TSD_EAGL_SLOT           30      /* OpenGLES's thread-specific slot for the current priv */
 #define PNAME_MULTITHREADED     0x139
+#define SWEETEAGL_WAIT_S        300u    /* for SweetGPU; G6o published it ~260 s after launchd */
+#define BIND_LOG_MAX            16u     /* IOSurface binds reported */
+#define CONTEXT_LOG_MAX         4u      /* contexts reported */
+
+/* bsd/sys/kern_memorystatus.h (private): only to log the jetsam limit the process runs under */
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES        8
+typedef struct {
+	int32_t memlimit_active;        /* MB */
+	uint32_t memlimit_active_attr;
+	int32_t memlimit_inactive;      /* MB */
+	uint32_t memlimit_inactive_attr;
+} memlimit_props;
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 
 #define SWEETEAGL_EXPORT        __attribute__((visibility("default")))
 
@@ -86,16 +103,37 @@ priv_of(id ctx)
 
 static pthread_once_t display_once = PTHREAD_ONCE_INIT;
 
+static unsigned
+footprint_mb(void)
+{
+	task_vm_info_data_t vm;
+	mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) != KERN_SUCCESS) {
+		return 0;
+	}
+	return (unsigned)(vm.phys_footprint >> 20);
+}
+
 static void
 open_display(void)
 {
 	setenv("FD_MESA_DEBUG", "nogmem,noubwc", 0);
 	setenv("GALLIUM_THREAD", "0", 0);
-	int fd = drmOpenWithType("msm", NULL, 0);
+	/* ENODEV: no SweetGPU service yet; anything else (EPERM: not allowed to open it) is final */
+	unsigned waited = 0;
+	int fd;
+	while ((fd = drmOpenWithType("msm", NULL, 0)) < 0 && errno == ENODEV && waited < SWEETEAGL_WAIT_S) {
+		sleep(1);
+		++waited;
+	}
 	if (fd < 0) {
-		sweetdrm_say("7.5 eagl: no SweetGPU device (%d); no GL contexts", fd);
+		sweetdrm_say("7.5 eagl: no SweetGPU device (%d) after %u s; no GL contexts", fd, waited);
 		return;
 	}
+	memlimit_props m = { 0 };
+	int r = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, getpid(), 0, &m, sizeof(m));
+	sweetdrm_say("7.7 eagl: %s pid %d uid %d: SweetGPU open after %u s; footprint %u MB, jetsam limit %d MB "
+	    "(get %d)", getprogname(), getpid(), getuid(), waited, footprint_mb(), m.memlimit_active, r);
 	display = sweetgl_display_open(fd);
 	if (display == NULL) {
 		sweetdrm_say("7.5 eagl: no Mesa screen on SweetGPU");
@@ -152,6 +190,10 @@ init_common(id self, NSUInteger api_arg, id sharegroup)
 	p->gli_ctx = p;
 	sweeteagl_fill_table(p->fn);
 	*(struct sweeteagl_priv **)((char *)self + private_offset) = p;
+	static unsigned logged;
+	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < CONTEXT_LOG_MAX) {
+		sweetdrm_say("7.7 eagl: context %p API %u, footprint %u MB", (void *)self, api, footprint_mb());
+	}
 	return self;
 }
 
@@ -306,6 +348,12 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 	}
 	if (old != p) {
 		sweetgl_make_current(old ? old->gl : NULL);
+	}
+	/* 7.7: which surfaces CA hands us, without a line per frame */
+	static unsigned logged;
+	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < BIND_LOG_MAX) {
+		sweetdrm_say("7.7 eagl: %s surface %u %ux%u stride %u fmt 0x%08x -> %s, footprint %u MB", how, sid, width,
+		    height, stride, fourcc, ok ? "ok" : "FAILED", footprint_mb());
 	}
 	return ok;
 }

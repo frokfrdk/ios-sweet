@@ -2261,6 +2261,35 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   at start.
 - **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.
 
+  *Started 2026-10-30. What stood in the way (observed in the G6o log and the root image):*
+  - *backboardd runs as `mobile` (its launchd job's UserName), and SweetGPU only let root open it.*
+  - *SweetGPU was published ~260 s after launchd: the GPU thread starts 40 s after boot
+    (`sweetgpudelay`), then 58 step pauses of 2 s and the 60 s 6.7 hold. CA looks for
+    `IOAcceleratorES` for 30 s, then tries GLES once; the shim gave up at once without SweetGPU.*
+  - *The window (64 MiB) and the BO tables (64 in the service, 64 per client) looked too small for
+    CA's three 5.9 MB display surfaces plus layers and Mesa's own BOs (a guess, not measured).*
+
+  What was changed:
+  - xnu **0117**: `sweetgpupause=<ms>` (step pause, at most the old 2000), `sweetsvchold=<s>` (6.7
+    hold in whole 10 s rounds, 0 = none), `sweetgpuuser=<name>` (that process may open SweetGPU too),
+    window 128 MiB (64 L3 tables; they fit the 0x55000 bytes left in GPU-GMU-MEM), 512 BOs in the
+    service and per client, 256 report lines per client.
+  - Shim: the first context waits for SweetGPU (up to 300 s, only while the open fails with
+    ENODEV), then reports `7.7 eagl: <process> pid uid: SweetGPU open after N s; footprint, jetsam
+    limit`, the first 4 contexts and the first 16 IOSurface binds (size, stride, format, result).
+  - Boot G6p: G6o's args without the test and debug ones (`sweetgputest`, `sweetgpuucslow`,
+    `sweetiolog`, `sweetblit`, `sweetfb_gpucopy`, `sweetgleagldy`), plus `sweetgpupause=100
+    sweetsvchold=0 sweetgpuuser=backboardd sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/libsweeteagl.dylib`.
+    Root v6p replaces only `/usr/lib/libsweeteagl.dylib`.
+
+  What the G6p log should show: "accepted (sweetgpuuser)" for backboardd, the `7.7 eagl` lines from
+  backboardd, IOSurface binds of 828x1792, and the screen still updating (FBSTAT swaps).
+  Risks (guesses): CA may still find no `IOAcceleratorES` within its 30 s and go to GLES first; the
+  shim then blocks CA's first context until SweetGPU is up. backboardd's jetsam limit is unknown and
+  it cannot raise it as `mobile`. Ad-hoc-signed code in an Apple platform binary has never been tried.
+  Any Mesa crash takes backboardd down; launchd restarts it, so the screen may cycle. The boot is
+  temporary; a normal reboot leaves it.
+
 Risks to check early (guesses):
 
 - **The GPU VA window is 64 MiB** (0x200000000 + 0x4000000). Three 6 MB CA surfaces plus textures and
