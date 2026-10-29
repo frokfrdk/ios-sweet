@@ -1,0 +1,187 @@
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -30,8 +30,10 @@
+  * until reboot; nothing else is undone.
+  * sweetblit=1 (patch 0113, plan 8a.1) adds a 2D blitter self-test after
+  * 6.7: CP_BLIT copies of linear BGRA8 up to the 828x1792 canvas, before the
+- * user client is published. sweetblit=2 first writes the a618 "magic"
+- * registers that Mesa's context restore sets.
++ * user client is published. sweetblit is a bit mask: 2 first writes the
++ * a618 "magic" registers that Mesa's context restore sets; 4 (patch 0113b)
++ * starts each copy with CACHE_INVALIDATE, as that restore does (G6i showed
++ * stale source data from the previous case without it). 1 runs neither.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -163,6 +165,7 @@ static const uint32_t gs_protect[32] = {
+ #define PM4_CP_SET_MARKER       0x65u
+ #define EV_CCU_FLUSH_DEPTH_TS   0x1cu
+ #define EV_CCU_FLUSH_COLOR_TS   0x1du
++#define EV_CACHE_INVALIDATE     0x31u           /* a6xx: invalidates UCHE (and the texture caches behind it) */
+ #define RM6_BLIT2DSCALE         12u
+ #define BLIT_OP_SCALE           3u
+ #define FMT6_8_8_8_8_UNORM      0x30u
+@@ -1539,14 +1542,17 @@ ibw_wfi(struct gs_ibw *w)
+ 
+ /* One linear BGRA8 copy, width x height at the same pitch; ts is 8 bytes for the CCU flush events */
+ static void
+-ibw_blit(struct gs_ibw *w, bool magic, uint64_t ts, uint64_t dst, uint64_t src, uint32_t pitch, uint32_t width,
+-    uint32_t height)
++ibw_blit(struct gs_ibw *w, bool magic, bool inval, uint64_t ts, uint64_t dst, uint64_t src, uint32_t pitch,
++    uint32_t width, uint32_t height)
+ {
+ 	/* fd6 emit_setup: clean and invalidate the CCU, 2D mode, the sysmem CCU layout */
+ 	ibw_event_ts(w, EV_CCU_FLUSH_COLOR_TS, ts);
+ 	ibw_event_ts(w, EV_CCU_FLUSH_DEPTH_TS, ts + 4u);
+ 	ibw_event(w, EV_CCU_INVALIDATE_COLOR);
+ 	ibw_event(w, EV_CCU_INVALIDATE_DEPTH);
++	if (inval) {
++		ibw_event(w, EV_CACHE_INVALIDATE);
++	}
+ 	ibw_put(w, sweet_cp_pkt7(PM4_CP_SET_MARKER, 1));
+ 	ibw_put(w, RM6_BLIT2DSCALE);
+ 	ibw_wfi(w);
+@@ -1594,9 +1600,56 @@ bl_pattern(uint32_t x, uint32_t y)
+ 	return (x * 0x9e3779b1u) ^ (y * 0x85ebca77u);
+ }
+ 
++/*
++ * 0113b: the source pixel whose pattern is v, by inverting bl_pattern for
++ * each row (0x9e3779b1 is odd, so it has an inverse mod 2^32). False if v is
++ * no pixel of the width x height source. Searched over the largest case, so
++ * a pattern left over from an earlier case is found too.
++ */
++#define BL_FIND_W               828u
++#define BL_FIND_H               1792u
++static bool
++bl_find(uint32_t v, uint32_t width, uint32_t height, uint32_t *sx, uint32_t *sy)
++{
++	uint32_t inv = 0x9e3779b1u;
++	for (int i = 0; i < 5; ++i) {
++		inv *= 2u - 0x9e3779b1u * inv;
++	}
++	for (uint32_t y = 0; y < height; ++y) {
++		uint32_t x = (v ^ (y * 0x85ebca77u)) * inv;
++		if (x < width) {
++			*sx = x;
++			*sy = y;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* 0113b: one line for a wrong row: its count, x range, and where its first bad pixel came from */
++static void
++bl_row(uint32_t width, uint32_t height, uint32_t pitch, uint32_t y, uint32_t n, uint32_t x0, uint32_t x1, uint32_t got)
++{
++	uint32_t sx, sy;
++	if (got == BL_POISON) {
++		printf("SWEET GSVC:     8a.1 %ux%u row %u: %u bad, x %u..%u; (%u,%u) not written\n", width, height, y, n,
++		    x0, x1, x0, y);
++	} else if (bl_find(got, BL_FIND_W, BL_FIND_H, &sx, &sy)) {
++		/* outside this copy's source: an earlier case's pattern, e.g. stale in a GPU cache */
++		bool outside = sx >= width || sy >= height;
++		long long delta = ((long long)sy * pitch + sx * 4) - ((long long)y * pitch + x0 * 4);
++		printf("SWEET GSVC:     8a.1 %ux%u row %u: %u bad, x %u..%u; (%u,%u) holds pattern (%u,%u)%s, "
++		    "byte offset %+lld at this pitch\n", width, height, y, n, x0, x1, x0, y, sx, sy,
++		    outside ? ", outside this source" : "", delta);
++	} else {
++		printf("SWEET GSVC:     8a.1 %ux%u row %u: %u bad, x %u..%u; (%u,%u) holds 0x%08x, no source pixel\n",
++		    width, height, y, n, x0, x1, x0, y, got);
++	}
++}
++
+ /* 0 pass, 1 fail, 2 skipped (no contiguous memory for the BOs) */
+ static int
+-gs_blit_one(bool magic, uint32_t width, uint32_t height, uint32_t pitch)
++gs_blit_one(bool magic, bool inval, uint32_t width, uint32_t height, uint32_t pitch)
+ {
+ 	struct st_bo s = { 0 }, d = { 0 }, c = { 0 };
+ 	uint32_t size = gs_round(pitch * height), words = pitch / 4u, bad = 0, pad_bad = 0;
+@@ -1618,7 +1671,7 @@ gs_blit_one(bool magic, uint32_t width, uint32_t height, uint32_t pitch)
+ 	}
+ 	struct gs_ibw w;
+ 	ibw_init(&w, c.cpu, BL_TS_OFF / 4u);
+-	ibw_blit(&w, magic, c.gva + BL_TS_OFF, d.gva, s.gva, pitch, width, height);
++	ibw_blit(&w, magic, inval, c.gva + BL_TS_OFF, d.gva, s.gva, pitch, width, height);
+ 	if (w.n > w.max) {
+ 		printf("SWEET GSVC:   8a.1: IB is %u dwords, more than %u\n", w.n, w.max);
+ 		goto out;
+@@ -1638,7 +1691,10 @@ gs_blit_one(bool magic, uint32_t width, uint32_t height, uint32_t pitch)
+ 	}
+ 	(void)sweet_gsvc_bo_sync(d.h);
+ 	(void)sweet_gsvc_bo_sync(c.h);
++	/* 0113b: per wrong row (the first 16), then rows and 64-pixel columns overall */
++	uint32_t rows_bad = 0, y0 = 0, y1 = 0, unwritten = 0, col[14] = { 0 };
+ 	for (uint32_t y = 0; y < height; ++y) {
++		uint32_t n = 0, x0 = 0, x1 = 0, got0 = 0;
+ 		for (uint32_t x = 0; x < words; ++x) {
+ 			uint32_t got = d.cpu[y * words + x], want = x < width ? bl_pattern(x, y) : BL_POISON;
+ 			if (got == want) {
+@@ -1650,10 +1706,32 @@ gs_blit_one(bool magic, uint32_t width, uint32_t height, uint32_t pitch)
+ 			}
+ 			if (x < width) {
+ 				++bad;
++				unwritten += got == BL_POISON;
++				++col[x / 64u < 13u ? x / 64u : 13u];
++				if (n++ == 0) {
++					x0 = x;
++					got0 = got;
++				}
++				x1 = x;
+ 			} else {
+ 				++pad_bad;
+ 			}
+ 		}
++		if (n) {
++			if (rows_bad++ == 0) {
++				y0 = y;
++			}
++			y1 = y;
++			if (rows_bad <= 16u) {
++				bl_row(width, height, pitch, y, n, x0, x1, got0);
++			}
++		}
++	}
++	if (bad) {
++		printf("SWEET GSVC:     8a.1 %ux%u: %u rows wrong (y %u..%u), %u pixels not written; bad per 64 columns: "
++		    "%u %u %u %u %u %u %u %u %u %u %u %u %u %u\n", width, height, rows_bad, y0, y1, unwritten, col[0],
++		    col[1], col[2], col[3], col[4], col[5], col[6], col[7], col[8], col[9], col[10], col[11], col[12],
++		    col[13]);
+ 	}
+ 	printf("SWEET GSVC:   8a.1 %ux%u pitch %u: %u bad pixels, %u padding words changed, %llu us (submit to fence), "
+ 	    "CCU flush words 0x%x 0x%x\n", width, height, pitch, bad, pad_bad, us, c.cpu[BL_TS_OFF / 4u],
+@@ -1676,21 +1754,25 @@ out:
+ static bool
+ gs_blit_step(int mode)
+ {
+-	static const uint32_t cases[3][3] = { { 64, 64, 256 }, { 828, 1, BL_PITCH }, { 828, 1792, BL_PITCH } };
++	/* 0113b adds 128x1 at a small pitch, 64x2 at the canvas pitch and a 64-row canvas strip */
++	static const uint32_t cases[][3] = { { 64, 64, 256 }, { 128, 1, 512 }, { 64, 2, BL_PITCH }, { 828, 1, BL_PITCH },
++		                             { 828, 64, BL_PITCH }, { 828, 1792, BL_PITCH } };
++	const unsigned ncases = sizeof(cases) / sizeof(cases[0]);
+ 	printf("SWEET GSVC: 8a.1 blit self-test (sweetblit=%d): CP_BLIT BLIT_OP_SCALE copies of linear BGRA8 in window "
+-	    "BOs%s\n", mode, mode >= 2 ? ", after the a618 magic registers" : "");
++	    "BOs%s%s\n", mode, (mode & 2) ? ", after the a618 magic registers" : "",
++	    (mode & 4) ? ", CACHE_INVALIDATE first" : "");
+ 	gpu_pause("8a.1 the 2D blitter");
+ 	unsigned pass = 0, skip = 0;
+-	for (unsigned i = 0; i < 3u && !gs_dead; ++i) {
+-		int r = gs_blit_one(mode >= 2, cases[i][0], cases[i][1], cases[i][2]);
++	for (unsigned i = 0; i < ncases && !gs_dead; ++i) {
++		int r = gs_blit_one((mode & 2) != 0, (mode & 4) != 0, cases[i][0], cases[i][1], cases[i][2]);
+ 		pass += r == 0;
+ 		skip += r == 2;
+ 	}
+ 	uint32_t used = gs_win_count();
+ 	gs_dump("after 8a.1");
+-	printf("SWEET GSVC: 8a.1: %u of 3 copies right, %u skipped; window pages in use afterwards: %u (want 0)\n", pass,
+-	    skip, used);
+-	return gs_clean("8a.1") && pass + skip == 3u && pass >= 2u && used == 0;
++	printf("SWEET GSVC: 8a.1: %u of %u copies right, %u skipped; window pages in use afterwards: %u (want 0)\n", pass,
++	    ncases, skip, used);
++	return gs_clean("8a.1") && pass + skip == ncases && pass >= 2u && used == 0;
+ }
+ 
+ bool
