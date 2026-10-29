@@ -56,8 +56,10 @@ meson setup "$OUT/build" "$SRC" --cross-file "$OUT/ios-arm64.ini" --buildtype=re
   -Dperfetto=false -Dbuild-tests=false
 
 # No target links the driver (test/build-tri.sh does, 7.2; frontend/build.sh, 7.3), so build its
-# static libraries by name. glapi is the GL dispatch (current context and table) libmesa calls.
+# static libraries by name. For GL (7.3): glapi is the dispatch (current context and table) libmesa
+# calls, glcpp the GLSL preprocessor libglsl calls, and vtn the SPIR-V to NIR translator behind
+# glSpecializeShader / ARB_gl_spirv in libmesa.
 meson compile -C "$OUT/build" \
   freedreno freedreno_drm freedrenowinsys freedreno_common freedreno_ir3 freedreno_layout \
   freedreno_perfcntrs ir3encode ir3decode gallium mesa compiler glsl nir mesa_util mesa_util_simd xmlconfig \
-  mesa_util_c11 blake3 isaspec freedreno_ir2 glapi
+  mesa_util_c11 blake3 isaspec freedreno_ir2 glapi glcpp vtn
