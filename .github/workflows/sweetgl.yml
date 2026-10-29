@@ -91,9 +91,13 @@ jobs:
           XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           bash tools/sweetgl/frontend/build.sh "$RUNNER_TEMP/mesa" out/build out/lib/libsweetgl.a
-          nm -g out/lib/libglapi.a | grep -q ' T _mesa_glapi_set_dispatch'
-          nm -g out/lib/libsweetgl.a | grep -q ' T _sweetgl_context_create'
-          nm -g out/lib/libsweetgl.a | grep -q ' T _glClear$'
+          # exported (not private extern) definitions, as the EAGL shim's dylib will need them
+          for c in libglapi.a:_mesa_glapi_set_dispatch libsweetgl.a:_sweetgl_context_create libsweetgl.a:_glClear; do
+            lib=out/lib/${c%%:*} sym=${c#*:}
+            if ! nm -gU "$lib" | grep -q " T $sym\$"; then
+              echo "$sym is not an exported definition in $lib:"; nm -m "$lib" | grep -w "$sym" || true; exit 1
+            fi
+          done
           bash tools/sweetgl/test/build-gltri.sh "$RUNNER_TEMP/mesa" out/build out/lib out/bin/sweetgl-gltri
           (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
           (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri > SHA256SUMS)
