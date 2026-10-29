@@ -11,11 +11,11 @@ OUT=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 # Compile with freedreno_screen.c's command from meson (defines, generated
-# include dirs, target flags), swapping in our source and object, plus the
-# winsys and driver dirs for freedreno_drm_public.h and driinfo_freedreno.h.
-python3 - "$B" "$HERE/sweetgl-tri.c" "$B/sweetgl-tri.o" "$SRC" > "$B/sweetgl-tri-cc.sh" <<'EOF'
+# include dirs, target flags) minus its source and outputs, plus the winsys
+# and driver dirs for freedreno_drm_public.h and driinfo_freedreno.h.
+python3 - "$B" "$SRC" > "$B/sweetgl-cc.sh" <<'EOF'
 import json, shlex, sys
-b, src, obj, mesa = sys.argv[1:]
+b, mesa = sys.argv[1:]
 for e in json.load(open(b + "/compile_commands.json")):
     if e["file"].endswith("drivers/freedreno/freedreno_screen.c"):
         args = e["arguments"] if "arguments" in e else shlex.split(e["command"])
@@ -31,15 +31,20 @@ for a in args:
     elif a not in ("-c", "-MD") and not a.endswith("freedreno_screen.c"):
         out.append(a)
 extra = ["-I" + mesa + "/src/gallium/winsys", "-I" + mesa + "/src/gallium/drivers", "-Wno-error"]
-print("cd " + shlex.quote(e["directory"]) + " && " + shlex.join(out + extra + ["-c", src, "-o", obj]))
+print("cd " + shlex.quote(e["directory"]) + " && " + shlex.join(out + extra) + ' -c "$1" -o "$2"')
 EOF
-cat "$B/sweetgl-tri-cc.sh"
-bash "$B/sweetgl-tri-cc.sh"
+cat "$B/sweetgl-cc.sh"
+OBJS=()
+for f in sweetgl-tri renderonly_stub; do
+  bash "$B/sweetgl-cc.sh" "$HERE/$f.c" "$B/$f.o"
+  OBJS+=("$B/$f.o")
+done
 
-# ld64 searches every archive for what is still undefined, so their order does not matter
+# ld64 searches every archive for what is still undefined, so their order does not matter.
+# Mesa's -Dzlib=disabled still leaves freedreno_rd_output's gz* calls: the SDK's libz has them.
 CXX=$(xcrun --sdk iphoneos -f clang++)
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-"$CXX" -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 "$B/sweetgl-tri.o" "$L"/*.a \
-  -framework IOKit -framework CoreFoundation -o "$OUT"
+"$CXX" -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 "${OBJS[@]}" "$L"/*.a \
+  -framework IOKit -framework CoreFoundation -lz -o "$OUT"
 codesign -s - -f "$OUT"
 codesign -dv "$OUT"
