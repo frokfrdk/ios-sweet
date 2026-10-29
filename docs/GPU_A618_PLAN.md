@@ -2214,7 +2214,7 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   - Open for 7.7: the shim opens SweetGPU on the first context and fails it if the device is not up
     yet; backboardd starts long before the kernel's 6.7 hold ends (260 s in G6m).
 - **7.6 Kernel plumbing**: `sweetenv=` (exec-time env vars), AMFI op 0x5a in the 0092 handler, an
-  `IOAcceleratorES` stub without `MetalPluginName`. ✅ when sweetgl-eagldy passes on the device.
+  `IOAcceleratorES` stub without `MetalPluginName`. ✅ passed on the device (G6o run 2, below).
 
   *All three are xnu patch 0114 (ef2fb60), in every kernel since run 40790303318 (out-0114, out-0116c).
   Observed: the AMFI 0x5a answer is already used, e.g. G6n: "SWEET AMFI: dyld policy in 0x0 out
@@ -2249,6 +2249,16 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   only after the 6.7 hold (~260 s), long after backboardd started, so the risk above was not
   exercised (no backboardd crash; FB swaps and GPU copies as in G6n). Next: boot G6o again (same root)
   and wait at least 12 min.*
+
+  ✅ **Passed on the device, G6o run 2 (2026-10-30 09:26, same image and root):** the four 7.6 lines
+  as above, then clear, triangle (ClientWaitSync signalled) and texture (texImageIOSurface YES) each
+  "0 of 4096 pixels wrong", "7.6 sweetgl-eagldy: pass, footprint 13 MB", "close by sweetgl-eagldy:
+  last seqno 130 retired, 6 BOs freed, 0 leaked". No panic, no SMMU fault, 8a.1 PASSED. So a program
+  that links only Apple's OpenGLES gets Mesa through the kernel's `DYLD_INSERT_LIBRARIES` and the
+  dylib's constructor alone. The crashes in the log (driverkitd sig 9, SpringBoard sig 6 once, the
+  Siri TTS helpers) and the "slot 1 … returns 0" stub report were all in G6n as well. Still open for
+  7.7: `IOAcceleratorES` only appears after the 6.7 hold (~260 s), so backboardd has never yet seen it
+  at start.
 - **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.
 
 Risks to check early (guesses):
