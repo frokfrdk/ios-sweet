@@ -2150,7 +2150,7 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
 - **7.3 GL frontend** modelled on hgl: a surfaceless GLES context, rendering only into FBOs, the GL
   entry points exported for the EAGL shim. ✅ the 7.2 test redone through GL calls.
 
-  *Written, not yet built or run (2026-10-29).* `tools/sweetgl/frontend/`: `sweetgl.h`/`sweetgl.c`
+  *Built (sweetgl run 40870346392, 47320f2), not yet run on the device (2026-10-29).* `tools/sweetgl/frontend/`: `sweetgl.h`/`sweetgl.c`
   wrap the freedreno screen in a `pipe_frontend_screen` and create `API_OPENGLES2` st contexts with a
   `PIPE_FORMAT_NONE` visual (no `gl_config`), made current with `st_api_make_current(st, NULL, NULL)`,
   i.e. Mesa's incomplete framebuffer, so they draw only into FBOs. `build.sh` makes `libsweetgl.a`:
@@ -2161,6 +2161,7 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   3.0: RGBA8 renderbuffer FBO, `glClear` + `glReadPixels`, then a GLSL ES 3.00 triangle; boot-arg
   `sweetglgltri=1`, job `com.sweet.gl-gltri`, `GALLIUM_THREAD=0` by default, and it raises its own
   jetsam limit as 7.2 had to. The GLSL type cache is now set up by Mesa's own `_mesa_initialize`.
+  The link also needs Mesa's `glapi`, `glcpp` (static library) and `vtn` libraries, now in `mesa/build.sh`.
 - **7.4 EAGL research** (local only; nothing from Apple goes into git): disassemble QuartzCore and
   OpenGLES from our root to list exactly what `CA::OGL::GLESContext` calls on `EAGLContext`, how it
   gets the GL dispatch, binds IOSurfaces and presents. Output: our own interface notes, which define
