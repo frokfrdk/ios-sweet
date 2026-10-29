@@ -2214,7 +2214,30 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   - Open for 7.7: the shim opens SweetGPU on the first context and fails it if the device is not up
     yet; backboardd starts long before the kernel's 6.7 hold ends (260 s in G6m).
 - **7.6 Kernel plumbing**: `sweetenv=` (exec-time env vars), AMFI op 0x5a in the 0092 handler, an
-  `IOAcceleratorES` stub without `MetalPluginName`.
+  `IOAcceleratorES` stub without `MetalPluginName`. ✅ when sweetgl-eagldy passes on the device.
+
+  *All three are xnu patch 0114 (ef2fb60), in every kernel since run 40790303318 (out-0114, out-0116c).
+  Observed: the AMFI 0x5a answer is already used, e.g. G6n: "SWEET AMFI: dyld policy in 0x0 out
+  0x16d3dfa28 -> 0xfb (0)" for launchd (so the guessed {in, out pointer} layout is right).
+  `sweetenv=` and `sweetaccel=1` were in no boot image before G6o.*
+
+  The test, `sweetgl-eagldy` (d1b80b8): `sweetgl-eagltri.m` built with `-DSWEETEAGL_INSERTED`
+  (`test/build-eagldy.sh`). It links OpenGLES.framework, as backboardd does, and neither Mesa nor the
+  shim; CI checks that with otool and nm. Boot-args `sweetgleagldy=1 sweetaccel=1
+  sweetenv=sweetgl-eagldy:DYLD_INSERT_LIBRARIES=/usr/lib/libsweeteagl.dylib`; `sweetgpu-root.py`
+  installs the dylib to /usr/lib. It reports (through its own SweetGPU connection):
+  - `7.6 env`: the variable is there, as the kernel added it;
+  - `7.6 dyld`: dyld loaded the dylib and `sweeteagl_install` is visible;
+  - `7.6 shim`: EAGLContext's `initWithAPI:` is already the dylib's when main runs, so the constructor
+    installed the shim (the 7.7 path: nothing in backboardd calls the installer);
+  - `7.6 accel`: an `IOAcceleratorES` service exists;
+  - then the 7.5 GL checks, without the three direct Mesa calls (`glGetShaderiv`, `glGetProgramiv`,
+    `glCheckFramebufferStatus`): the test has no Mesa of its own, and the pixel checks catch the same.
+  - The boot-args come to 596 of the 607 bytes the loader passes (`BOOT_LINE_LENGTH` 608, cut silently).
+
+  Risk for that boot (a guess): with `IOAcceleratorES` present, backboardd's CA stops waiting 30 s and
+  tries Metal and then GLES at once. Without the shim, Apple's EAGLContext should fail and CA fall
+  back to the CPU renderer as now, but that is not observed yet.
 - **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.
 
 Risks to check early (guesses):
