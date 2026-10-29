@@ -118,8 +118,15 @@ jobs:
           if nm -u out/bin/sweetgl-eagltri | grep -E '^_gl[A-Z]'; then
             echo "gl* left undefined in sweetgl-eagltri (above)"; exit 1
           fi
+          # 7.6: the same test with the shim only from the dylib; it must link OpenGLES and no Mesa or shim code
+          bash tools/sweetgl/test/build-eagldy.sh "$RUNNER_TEMP/mesa" out/bin/sweetgl-eagldy
+          otool -L out/bin/sweetgl-eagldy | tee "$RUNNER_TEMP/eagldy-libs.txt"
+          grep -q 'OpenGLES.framework/OpenGLES' "$RUNNER_TEMP/eagldy-libs.txt"
+          if nm out/bin/sweetgl-eagldy | grep -E ' [TtU] _(gl[A-Z]|sweeteagl_|sweetgl_|drm[A-Z])'; then
+            echo "Mesa, shim or sweetdrm symbols in sweetgl-eagldy (above)"; exit 1
+          fi
           (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
-          (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri sweetgl-eagltri libsweeteagl.dylib > SHA256SUMS)
+          (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri sweetgl-eagltri sweetgl-eagldy libsweeteagl.dylib > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:

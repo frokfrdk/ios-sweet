@@ -5,15 +5,17 @@
     sudo python3 -I tools/sunfish/sweetgpu-root.py /mnt/iosroot --remove [TOOL]
 
 BIN is out/sweetgpu-test from the sweetgpu-test (or xnu) workflow, or
-out/bin/sweetgl-tri, sweetgl-gltri or sweetgl-eagltri from the sweetgl
-workflow; its file name picks the tool.
+out/bin/sweetgl-tri, sweetgl-gltri, sweetgl-eagltri, sweetgl-eagldy or
+libsweeteagl.dylib from the sweetgl workflow; its file name picks the tool.
 TOOL defaults to sweetgpu-test. The tool goes to /usr/libexec/<tool>
 (root:wheel 0755). launchd on this root reads its jobs from
 /System/Library/xpc/launchd.plist (boot-arg launchd_unsecure_cache=1), so the
 job goes there: run once at load, as root, stdout and stderr to /dev/console.
 Each tool does nothing unless the boot-args ask for it: sweetgputest=1
-(docs/GPU_A618_PLAN.md 6U), sweetgltri=1 (Stage 7.2), sweetglgltri=1 (7.3) or
-sweetgleagltri=1 (7.5).
+(docs/GPU_A618_PLAN.md 6U), sweetgltri=1 (Stage 7.2), sweetglgltri=1 (7.3),
+sweetgleagltri=1 (7.5) or sweetgleagldy=1 (7.6).
+libsweeteagl.dylib (the EAGL shim) goes to /usr/lib (root:wheel 0644) and has
+no job: the kernel's sweetenv= inserts it with DYLD_INSERT_LIBRARIES.
 A job without JetsamProperties gets the small default daemon limit; Mesa went
 over it (G6l, killed with jetsam reason 7, per-process limit), so sweetgl-tri
 gets its own JetsamMemoryLimit (MB), as Apple's jobs in launchd.plist do.
@@ -27,7 +29,9 @@ TOOLS = {
     'sweetgl-tri': 'com.sweet.gl-tri',
     'sweetgl-gltri': 'com.sweet.gl-gltri',
     'sweetgl-eagltri': 'com.sweet.gl-eagltri',
+    'sweetgl-eagldy': 'com.sweet.gl-eagldy',
 }
+LIBS = {'libsweeteagl.dylib'}
 MEMORY_LIMIT_MB = {
     'sweetgl-tri': 1024,
 }
@@ -70,25 +74,30 @@ def main():
     if len(sys.argv) not in (3, 4) or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root, arg = sys.argv[1], sys.argv[2]
+    names = ", ".join(list(TOOLS) + sorted(LIBS))
     if arg == '--remove':
         tool = sys.argv[3] if len(sys.argv) == 4 else 'sweetgpu-test'
-        if tool not in TOOLS:
-            sys.exit(f'unknown tool {tool}; one of {", ".join(TOOLS)}')
-        dest = os.path.join(root, 'usr/libexec', tool)
+        if tool not in TOOLS and tool not in LIBS:
+            sys.exit(f'unknown tool {tool}; one of {names}')
+        rel = ('usr/lib/' if tool in LIBS else 'usr/libexec/') + tool
+        dest = os.path.join(root, rel)
         if os.path.exists(dest):
             os.unlink(dest)
-            print('removed', '/usr/libexec/' + tool)
-        launchd(root, tool, False)
+            print('removed', '/' + rel)
+        if tool in TOOLS:
+            launchd(root, tool, False)
         return
     tool = os.path.basename(arg)
-    if len(sys.argv) != 3 or tool not in TOOLS:
-        sys.exit(f'BIN must be named one of {", ".join(TOOLS)}')
-    dest = os.path.join(root, 'usr/libexec', tool)
+    if len(sys.argv) != 3 or (tool not in TOOLS and tool not in LIBS):
+        sys.exit(f'BIN must be named one of {names}')
+    rel = ('usr/lib/' if tool in LIBS else 'usr/libexec/') + tool
+    dest = os.path.join(root, rel)
     shutil.copyfile(arg, dest)
     os.chown(dest, 0, 0)
-    os.chmod(dest, 0o755)
-    print('installed', '/usr/libexec/' + tool, os.path.getsize(dest), 'bytes')
-    launchd(root, tool, True)
+    os.chmod(dest, 0o644 if tool in LIBS else 0o755)
+    print('installed', '/' + rel, os.path.getsize(dest), 'bytes')
+    if tool in TOOLS:
+        launchd(root, tool, True)
 
 
 if __name__ == '__main__':

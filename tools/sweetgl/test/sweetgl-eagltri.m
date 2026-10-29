@@ -19,8 +19,19 @@
  * only if every check passes. Run at boot by a launchd job like the other
  * sweetgl tests: nothing unless the boot-args contain sweetgleagltri=1, then it
  * waits up to 15 min for SweetGPU.
+ *
+ * Built with -DSWEETEAGL_INSERTED it is sweetgl-eagldy (Stage 7.6), the way
+ * backboardd will get the shim in 7.7: linked with OpenGLES.framework and
+ * neither Mesa nor the shim, which arrive only as /usr/lib/libsweeteagl.dylib
+ * through the kernel's sweetenv= (DYLD_INSERT_LIBRARIES). Before the same
+ * checks it confirms the variable, that dyld loaded the dylib, that its
+ * constructor already put the shim on EAGLContext, and that sweetaccel=1
+ * published an IOAcceleratorES service. Its lines go to the kernel log
+ * through its own SweetGPU connection (the dylib has its own). Boot-arg
+ * sweetgleagldy=1.
  */
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,8 +48,54 @@
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 
+#if defined(SWEETEAGL_INSERTED)
+#include <stdarg.h>
+
+/* IOKit.framework, declared as sweetdrm_iokit.c does (no IOKit headers in the iOS SDK) */
+typedef mach_port_t io_object_t;
+typedef io_object_t io_service_t;
+typedef io_object_t io_connect_t;
+CFMutableDictionaryRef IOServiceMatching(const char *name);
+io_service_t IOServiceGetMatchingService(mach_port_t mainPort, CFDictionaryRef matching);
+kern_return_t IOServiceOpen(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect);
+kern_return_t IOObjectRelease(io_object_t object);
+kern_return_t IOConnectCallMethod(mach_port_t connection, uint32_t selector, const uint64_t *input, uint32_t inputCnt,
+    const void *inputStruct, size_t inputStructCnt, uint64_t *output, uint32_t *outputCnt, void *outputStruct,
+    size_t *outputStructCnt);
+#define SEL_REPORT      16u             /* SweetGPU's report selector, as sweetdrm_iokit.c */
+#define REPORT_MAX      192u
+#define SHIM_PATH       "/usr/lib/libsweeteagl.dylib"
+
+static io_connect_t report_conn;
+
+/* sweetdrm_say without sweetdrm: stderr, and the kernel log once SweetGPU is open */
+static void
+sweetdrm_say(const char *fmt, ...)
+{
+	char line[REPORT_MAX];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	fprintf(stderr, "sweetgl: %s\n", line);
+	if (report_conn) {
+		IOConnectCallMethod(report_conn, SEL_REPORT, NULL, 0, line, strlen(line), NULL, NULL, NULL, NULL);
+	}
+}
+
+static bool
+have_service(const char *name)
+{
+	io_service_t s = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching(name));
+	if (s) {
+		IOObjectRelease(s);
+	}
+	return s != 0;
+}
+#else
 #include "xf86drm.h"
 #include "sweetdrm.h"
+#endif
 
 /* The public IOSurface.framework calls (the iPhoneOS SDK has no headers for them) */
 typedef struct __IOSurface *IOSurfaceRef;
@@ -51,9 +108,11 @@ void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
 size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
 #define LOCK_READ_ONLY  1u
 
+#if !defined(SWEETEAGL_INSERTED)
 int sweeteagl_install(void);
+#endif
 
-#define W               64
+#define W              64
 #define H               64
 #define STRIDE          256u            /* bytes per row: a618 wants linear pitches in 256s */
 #define BLUE            0xff0000ffu     /* BGRA bytes read as a little-endian word: 0xAARRGGBB */
@@ -151,7 +210,12 @@ shader(GLenum type, const char *src)
 	GLuint s = CALL(594, GLuint, (void *, GLenum), type);
 	CALL(595, void, (void *, GLuint, GLsizei, const GLchar *const *, const GLint *), s, 1, &src, NULL);
 	CALL(596, void, (void *, GLuint), s);
-	/* no GetShaderiv slot in CA's list: ask Mesa directly, as a check only */
+#if !defined(SWEETEAGL_INSERTED)
+	/*
+	 * No GetShaderiv slot in CA's list: ask Mesa directly, as a check only. The
+	 * inserted build has no Mesa of its own (its gl* are OpenGLES's), and the
+	 * pixel checks tell a bad shader anyway.
+	 */
 	GLint ok = 0;
 	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
 	if (!ok) {
@@ -159,6 +223,7 @@ shader(GLenum type, const char *src)
 		glGetShaderInfoLog(s, sizeof(log), NULL, log);
 		sweetdrm_say("7.5 %s shader: %s", type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
 	}
+#endif
 	return s;
 }
 
@@ -174,6 +239,7 @@ program(const char *vs_src, const char *fs_src)
 	/* slot 591 deletes shaders and programs alike; these stay attached until the program goes */
 	CALL(591, void, (void *, GLuint), vs);
 	CALL(591, void, (void *, GLuint), fs);
+#if !defined(SWEETEAGL_INSERTED)
 	GLint ok = 0;
 	glGetProgramiv(p, GL_LINK_STATUS, &ok);
 	if (!ok) {
@@ -183,6 +249,7 @@ program(const char *vs_src, const char *fs_src)
 		CALL(591, void, (void *, GLuint), p);
 		return 0;
 	}
+#endif
 	CALL(600, void, (void *, GLuint), p);
 	return p;
 }
@@ -263,7 +330,13 @@ raise_memlimit(void)
 
 #define WAIT_STEP_S     5u
 #define WAIT_MAX_S      900u
+#if defined(SWEETEAGL_INSERTED)
+#define ASK             "sweetgleagldy=1"
+#define NAME            "7.6 sweetgl-eagldy"
+#else
 #define ASK             "sweetgleagltri=1"
+#define NAME            "7.5 sweetgl-eagltri"
+#endif
 
 static int
 asked_for(void)
@@ -285,23 +358,75 @@ asked_for(void)
 
 #define MSG(ret, ...)   ((ret (*)(id, SEL, ##__VA_ARGS__))objc_msgSend)
 
+#if defined(SWEETEAGL_INSERTED)
+/*
+ * 7.6's own checks: the kernel added the variable, dyld honoured it, the
+ * dylib's constructor installed the shim before main, and IOAcceleratorES is
+ * there. A failure is counted; the GL checks still run if the shim is on.
+ */
+static unsigned
+inserted_checks(void)
+{
+	unsigned fails = 0;
+	const char *env = getenv("DYLD_INSERT_LIBRARIES");
+	sweetdrm_say("7.6 env: DYLD_INSERT_LIBRARIES=%s", env ? env : "(not set)");
+	fails += env == NULL || strcmp(env, SHIM_PATH) != 0;
+
+	bool loaded = false;
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *n = _dyld_get_image_name(i);
+		loaded |= n != NULL && strcmp(n, SHIM_PATH) == 0;
+	}
+	void *install = dlsym(RTLD_DEFAULT, "sweeteagl_install");
+	sweetdrm_say("7.6 dyld: %s %s, sweeteagl_install %s", SHIM_PATH, loaded ? "loaded" : "NOT loaded",
+	    install ? "found" : "missing");
+	fails += !loaded || install == NULL;
+
+	/* the constructor ran if EAGLContext's initWithAPI: is already the dylib's */
+	Class eagl = objc_getClass("EAGLContext");
+	Method m = eagl ? class_getInstanceMethod(eagl, @selector(initWithAPI:)) : NULL;
+	Dl_info di = { 0 };
+	bool ours = m && dladdr((const void *)method_getImplementation(m), &di) && di.dli_fname &&
+	    strcmp(di.dli_fname, SHIM_PATH) == 0;
+	sweetdrm_say("7.6 shim: EAGLContext %s, initWithAPI: from %s", eagl ? "present" : "MISSING",
+	    di.dli_fname ? di.dli_fname : "?");
+	if (!ours) {
+		++fails;
+		if (install) {
+			int r = ((int (*)(void))install)();
+			sweetdrm_say("7.6 shim: not installed by its constructor; sweeteagl_install() now -> %d", r);
+		}
+	}
+
+	bool accel = have_service("IOAcceleratorES");
+	sweetdrm_say("7.6 accel: IOAcceleratorES %s", accel ? "found" : "NOT found (sweetaccel=1?)");
+	fails += !accel;
+	return fails;
+}
+#endif
+
 static int
 run(void)
 {
+	unsigned fails = 0;
+#if defined(SWEETEAGL_INSERTED)
+	fails += inserted_checks();
+#else
 	void *gles = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW);
 	if (gles == NULL || sweeteagl_install() != 0) {
 		sweetdrm_say("7.5: OpenGLES %s, shim not installed", gles ? "loaded" : dlerror());
 		return 1;
 	}
+#endif
 	Class eagl = objc_getClass("EAGLContext");
 	NSDictionary *props = [NSDictionary dictionary];
 	id ctx = MSG(id, NSUInteger, id)(MSG(id)((id)eagl, @selector(alloc)), @selector(initWithAPI:properties:), 3,
 	    props);
 	if (ctx == nil) {
 		sweetdrm_say("7.5: initWithAPI:3 properties: gave nil");
+		sweetdrm_say(NAME ": FAIL");
 		return 1;
 	}
-	unsigned fails = 0;
 	int zero = 0;
 	NSUInteger api = MSG(NSUInteger)(ctx, @selector(API));
 	int setp = MSG(int, int, int *)(ctx, @selector(setParameter:to:), 0x260, &zero);
@@ -310,7 +435,7 @@ run(void)
 	sweetdrm_say("7.5 context: API %lu, setParameter 0x260 -> %d, setCurrentContext %s, currentContext %s",
 	    (unsigned long)api, setp, cur ? "YES" : "NO", back == ctx ? "same" : "DIFFERENT");
 	if (api != 3 || !cur || back != ctx) {
-		sweetdrm_say("7.5 sweetgl-eagltri: FAIL");
+		sweetdrm_say(NAME ": FAIL");
 		return 1;
 	}
 	void **table = MSG(void *)(ctx, @selector(getMacroContextPrivate));
@@ -336,11 +461,20 @@ run(void)
 	CALL(672, void, (void *, GLenum, GLuint), GL_FRAMEBUFFER, fbo);
 	CALL(677, void, (void *, GLenum, GLenum, GLenum, GLuint, GLint), GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 	    GL_TEXTURE_2D, tex[0], 0);
+#if defined(SWEETEAGL_INSERTED)
+	/* no slot for it in CA's list and no Mesa here to ask; the clear check below shows it */
+	GLenum status = GL_FRAMEBUFFER_COMPLETE;
+#else
 	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+#endif
 	sweetdrm_say("7.5 display buffer: attachImage %s, fbo status 0x%04x%s", att ? "YES" : "NO", status,
+#if defined(SWEETEAGL_INSERTED)
+	    " (not checked)");
+#else
 	    status == GL_FRAMEBUFFER_COMPLETE ? " (complete)" : "");
+#endif
 	if (!att || status != GL_FRAMEBUFFER_COMPLETE || gl_errors("display buffer")) {
-		sweetdrm_say("7.5 sweetgl-eagltri: FAIL");
+		sweetdrm_say(NAME ": FAIL");
 		return 1;
 	}
 	CALL(335, void, (void *, GLint, GLint, GLsizei, GLsizei), 0, 0, W, H);
@@ -411,7 +545,7 @@ run(void)
 	[ctx release];
 	CFRelease(source);
 	CFRelease(target);
-	sweetdrm_say("7.5 sweetgl-eagltri: %s, footprint %u MB", fails ? "FAIL" : "pass", footprint_mb());
+	sweetdrm_say(NAME ": %s, footprint %u MB", fails ? "FAIL" : "pass", footprint_mb());
 	return fails ? 1 : 0;
 }
 
@@ -420,11 +554,28 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (!asked_for()) {
-		printf("sweetgl-eagltri: no " ASK " in the boot-args, nothing to do\n");
+		printf("%s: no " ASK " in the boot-args, nothing to do\n", getprogname());
 		return 0;
 	}
-	int fd = -1;
 	unsigned waited = 0;
+#if defined(SWEETEAGL_INSERTED)
+	/* SweetGPU's user-client service appears once the GPU service is ready, as IOAcceleratorES does */
+	io_service_t svc = 0;
+	while ((svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("SweetGPU"))) == 0 &&
+	    waited < WAIT_MAX_S) {
+		sleep(WAIT_STEP_S);
+		waited += WAIT_STEP_S;
+	}
+	kern_return_t kr = svc ? IOServiceOpen(svc, mach_task_self(), 0, &report_conn) : KERN_FAILURE;
+	if (svc) {
+		IOObjectRelease(svc);
+	}
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sweetgl-eagldy: no SweetGPU connection after %u s (0x%x)\n", waited, kr);
+		return 1;
+	}
+#else
+	int fd = -1;
 	while ((fd = drmOpenWithType("msm", NULL, 0)) < 0 && waited < WAIT_MAX_S) {
 		sleep(WAIT_STEP_S);
 		waited += WAIT_STEP_S;
@@ -435,7 +586,8 @@ main(void)
 	}
 	/* the shim opens its own on the first context */
 	close(fd);
-	sweetdrm_say("7.5 sweetgl-eagltri: SweetGPU open after %u s", waited);
+#endif
+	sweetdrm_say(NAME ": SweetGPU open after %u s", waited);
 	raise_memlimit();
 	@autoreleasepool {
 		return run();
