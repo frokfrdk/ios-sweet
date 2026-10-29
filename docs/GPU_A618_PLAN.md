@@ -2238,6 +2238,17 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   Risk for that boot (a guess): with `IOAcceleratorES` present, backboardd's CA stops waiting 30 s and
   tries Metal and then GLES at once. Without the shim, Apple's EAGLContext should fail and CA fall
   back to the CPU renderer as now, but that is not observed yet.
+
+  *G6o (2026-10-30, root v6o): all four 7.6 lines came out right ("7.6 env:
+  DYLD_INSERT_LIBRARIES=/usr/lib/libsweeteagl.dylib", "7.6 dyld: … loaded, sweeteagl_install found",
+  "7.6 shim: … initWithAPI: from /usr/lib/libsweeteagl.dylib", "7.6 accel: IOAcceleratorES found"),
+  then GL_VERSION through slot 117 and "7.5 clear: 0 of 4096 pixels wrong". The log stops there: the
+  bootloader keys were pressed (log line 5701) before the triangle and texture checks, which in G6n
+  came ~290 log lines after the clear. So 7.6 is not passed yet; nothing failed. Seen: "SWEET env:
+  sweetgl-eagldy += DYLD_INSERT_LIBRARIES=…", and "SWEET ACCEL: IOAcceleratorES stand-in registered"
+  only after the 6.7 hold (~260 s), long after backboardd started, so the risk above was not
+  exercised (no backboardd crash; FB swaps and GPU copies as in G6n). Next: boot G6o again (same root)
+  and wait at least 12 min.*
 - **7.7 backboardd** with `DYLD_INSERT_LIBRARIES`, then SpringBoard, CC toggles, App Library, blur.
 
 Risks to check early (guesses):
