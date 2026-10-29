@@ -2175,7 +2175,8 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   7.5.
 - **7.5 EAGL shim**, written from the 7.4 notes. ✅ when sweetgl-eagltri passes on the device.
 
-  *Written; sweetgl run 40887402788 (04dd3e4) building, not yet run on the device (2026-10-30).*
+  *Written; sweetgl run 40887402788 (04dd3e4) failed (freedreno_gmem.h needs u_inlines.h first); fixed in
+  8ae857f, run 40888280162 passed. Root v6n written to userdata 2026-10-30; boot G6n not yet run.*
 
   How it is built: `tools/sweetgl/eagl/`. `sweeteagl.m` (no ARC) does not link OpenGLES: once the
   `EAGLContext` class is in the process, `sweeteagl_install()` (also run from the dylib's constructor)
