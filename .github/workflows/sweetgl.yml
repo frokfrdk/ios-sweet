@@ -2,7 +2,8 @@ name: sweetgl
 
 # Stage 7.0: Mesa freedreno (gallium, msm kmd) cross-built for iOS arm64 against
 # sweetdrm, as static libraries. 7.2: sweetgl-tri links them into an offscreen
-# clear-and-triangle test for the device.
+# clear-and-triangle test for the device. 7.3: libsweetgl.a, the surfaceless
+# GLES frontend, and sweetgl-gltri, the same test through GL calls.
 on:
   workflow_dispatch:
   push:
@@ -84,6 +85,18 @@ jobs:
           mkdir -p out/bin
           bash tools/sweetgl/test/build-tri.sh "$RUNNER_TEMP/mesa" out/build out/lib out/bin/sweetgl-tri
           (cd out/bin && shasum -a 256 sweetgl-tri > SHA256SUMS)
+
+      - name: sweetgl frontend and sweetgl-gltri
+        run: |
+          XC=/Applications/Xcode_16.4.app
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          bash tools/sweetgl/frontend/build.sh "$RUNNER_TEMP/mesa" out/build out/lib/libsweetgl.a
+          nm -g out/lib/libglapi.a | grep -q ' T _mesa_glapi_set_dispatch'
+          nm -g out/lib/libsweetgl.a | grep -q ' T _sweetgl_context_create'
+          nm -g out/lib/libsweetgl.a | grep -q ' T _glClear$'
+          bash tools/sweetgl/test/build-gltri.sh "$RUNNER_TEMP/mesa" out/build out/lib out/bin/sweetgl-gltri
+          (cd out/lib && shasum -a 256 *.a > SHA256SUMS)
+          (cd out/bin && shasum -a 256 sweetgl-tri sweetgl-gltri > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:

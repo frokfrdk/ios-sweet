@@ -10,34 +10,14 @@ L=$(cd "$3" && pwd)
 OUT=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-# Compile with freedreno_screen.c's command from meson (defines, generated
-# include dirs, target flags) minus its source and outputs, plus the winsys
-# and driver dirs for freedreno_drm_public.h and driinfo_freedreno.h.
-python3 - "$B" "$SRC" > "$B/sweetgl-cc.sh" <<'EOF'
-import json, shlex, sys
-b, mesa = sys.argv[1:]
-for e in json.load(open(b + "/compile_commands.json")):
-    if e["file"].endswith("drivers/freedreno/freedreno_screen.c"):
-        args = e["arguments"] if "arguments" in e else shlex.split(e["command"])
-        break
-else:
-    sys.exit("freedreno_screen.c is not in compile_commands.json")
-out, skip = [], False
-for a in args:
-    if skip:
-        skip = False
-    elif a in ("-o", "-MF", "-MQ", "-MT"):
-        skip = True
-    elif a not in ("-c", "-MD") and not a.endswith("freedreno_screen.c"):
-        out.append(a)
-extra = ["-I" + mesa + "/src/gallium/winsys", "-I" + mesa + "/src/gallium/drivers", "-Wno-error"]
-print("cd " + shlex.quote(e["directory"]) + " && " + shlex.join(out + extra) + ' -c "$1" -o "$2"')
-EOF
+# Compile with freedreno_screen.c's command from meson
+bash "$HERE/../mesa/mesa-cc.sh" "$SRC" "$B" drivers/freedreno/freedreno_screen.c > "$B/sweetgl-cc.sh"
 cat "$B/sweetgl-cc.sh"
 OBJS=()
-for f in sweetgl-tri renderonly_stub; do
-  bash "$B/sweetgl-cc.sh" "$HERE/$f.c" "$B/$f.o"
-  OBJS+=("$B/$f.o")
+for f in "$HERE/sweetgl-tri.c" "$HERE/../frontend/renderonly_stub.c"; do
+  o="$B/$(basename "$f" .c).o"
+  bash "$B/sweetgl-cc.sh" "$f" "$o"
+  OBJS+=("$o")
 done
 
 # ld64 searches every archive for what is still undefined, so their order does not matter.

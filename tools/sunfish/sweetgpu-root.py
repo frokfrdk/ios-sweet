@@ -5,22 +5,26 @@
     sudo python3 -I tools/sunfish/sweetgpu-root.py /mnt/iosroot --remove [TOOL]
 
 BIN is out/sweetgpu-test from the sweetgpu-test (or xnu) workflow, or
-out/bin/sweetgl-tri from the sweetgl workflow; its file name picks the tool.
+out/bin/sweetgl-tri or out/bin/sweetgl-gltri from the sweetgl workflow; its
+file name picks the tool.
 TOOL defaults to sweetgpu-test. The tool goes to /usr/libexec/<tool>
 (root:wheel 0755). launchd on this root reads its jobs from
 /System/Library/xpc/launchd.plist (boot-arg launchd_unsecure_cache=1), so the
 job goes there: run once at load, as root, stdout and stderr to /dev/console.
 Each tool does nothing unless the boot-args ask for it: sweetgputest=1
-(docs/GPU_A618_PLAN.md 6U) or sweetgltri=1 (Stage 7.2).
+(docs/GPU_A618_PLAN.md 6U), sweetgltri=1 (Stage 7.2) or sweetglgltri=1 (7.3).
 A job without JetsamProperties gets the small default daemon limit; Mesa went
 over it (G6l, killed with jetsam reason 7, per-process limit), so sweetgl-tri
 gets its own JetsamMemoryLimit (MB), as Apple's jobs in launchd.plist do.
+launchd turned out to ignore it (G6l 3rd boot); the GL tests now raise their
+own limit with memorystatus_control.
 """
 import os, plistlib, shutil, sys
 
 TOOLS = {
     'sweetgpu-test': 'com.sweet.gpu-test',
     'sweetgl-tri': 'com.sweet.gl-tri',
+    'sweetgl-gltri': 'com.sweet.gl-gltri',
 }
 MEMORY_LIMIT_MB = {
     'sweetgl-tri': 1024,
