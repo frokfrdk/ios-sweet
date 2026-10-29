@@ -12,6 +12,9 @@ TOOL defaults to sweetgpu-test. The tool goes to /usr/libexec/<tool>
 job goes there: run once at load, as root, stdout and stderr to /dev/console.
 Each tool does nothing unless the boot-args ask for it: sweetgputest=1
 (docs/GPU_A618_PLAN.md 6U) or sweetgltri=1 (Stage 7.2).
+A job without JetsamProperties gets the small default daemon limit; Mesa went
+over it (G6l, killed with jetsam reason 7, per-process limit), so sweetgl-tri
+gets its own JetsamMemoryLimit (MB), as Apple's jobs in launchd.plist do.
 """
 import os, plistlib, shutil, sys
 
@@ -19,10 +22,13 @@ TOOLS = {
     'sweetgpu-test': 'com.sweet.gpu-test',
     'sweetgl-tri': 'com.sweet.gl-tri',
 }
+MEMORY_LIMIT_MB = {
+    'sweetgl-tri': 1024,
+}
 
 
 def job(tool):
-    return {
+    j = {
         'Label': TOOLS[tool],
         'ProgramArguments': ['/usr/libexec/' + tool],
         'RunAtLoad': True,
@@ -31,6 +37,9 @@ def job(tool):
         'StandardOutPath': '/dev/console',
         'StandardErrorPath': '/dev/console',
     }
+    if tool in MEMORY_LIMIT_MB:
+        j['JetsamProperties'] = {'JetsamMemoryLimit': MEMORY_LIMIT_MB[tool]}
+    return j
 
 
 def launchd(root, tool, add):
