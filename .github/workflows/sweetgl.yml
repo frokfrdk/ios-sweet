@@ -91,8 +91,9 @@ jobs:
           XC=/Applications/Xcode_16.4.app
           export DEVELOPER_DIR="$XC/Contents/Developer"
           bash tools/sweetgl/frontend/build.sh "$RUNNER_TEMP/mesa" out/build out/lib/libsweetgl.a
-          # exported (not private extern) definitions, as the EAGL shim's dylib will need them
-          for c in libglapi.a:_mesa_glapi_set_dispatch libsweetgl.a:_sweetgl_context_create libsweetgl.a:_glClear; do
+          # exported (not private extern) definitions, as the EAGL shim's dylib will need them;
+          # Mach-O names, so C's _mesa_glapi_set_dispatch is __mesa_glapi_set_dispatch
+          for c in libglapi.a:__mesa_glapi_set_dispatch libsweetgl.a:_sweetgl_context_create libsweetgl.a:_glClear; do
             lib=out/lib/${c%%:*} sym=${c#*:}
             if ! nm -gU "$lib" | grep -q " T $sym\$"; then
               echo "$sym is not an exported definition in $lib:"; nm -m "$lib" | grep -w "$sym" || true; exit 1
