@@ -9,10 +9,16 @@
  * FD_MESA_DEBUG defaults to nogmem,noubwc (sysmem rendering, no compression),
  * the simplest path; set it in the environment to try others.
  * Exit status 0 only if every check passes.
+ *
+ * Run at boot by a launchd job, as sweetgpu-test is: it does nothing unless the
+ * boot-args contain sweetgltri=1, and then retries the open every 5 s for up to
+ * 15 min, since SweetGPU only appears after the kernel's 6.7 hold.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/sysctl.h>
 
 #include "xf86drm.h"
 #include "sweetdrm.h"
@@ -144,15 +150,48 @@ draw_triangle(void)
 	pipe_resource_reference(&vbuf, NULL);
 }
 
+#define WAIT_STEP_S     5u
+#define WAIT_MAX_S      900u
+
+/* the boot-args hold " sweetgltri=1" (or start with it) */
+static int
+asked_for(void)
+{
+	char args[1024];
+	size_t len = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len] = '\0';
+	for (const char *p = args; (p = strstr(p, "sweetgltri=1")) != NULL; p++) {
+		char end = p[strlen("sweetgltri=1")];
+		if ((p == args || p[-1] == ' ') && (end == '\0' || end == ' ')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (!asked_for()) {
+		printf("sweetgl-tri: no sweetgltri=1 in the boot-args, nothing to do\n");
+		return 0;
+	}
 	setenv("FD_MESA_DEBUG", "nogmem,noubwc", 0);
-	int fd = drmOpenWithType("msm", NULL, 0);
+	int fd = -1;
+	unsigned waited = 0;
+	while ((fd = drmOpenWithType("msm", NULL, 0)) < 0 && waited < WAIT_MAX_S) {
+		sleep(WAIT_STEP_S);
+		waited += WAIT_STEP_S;
+	}
 	if (fd < 0) {
-		fprintf(stderr, "sweetgl-tri: no sweetdrm device (%d)\n", fd);
+		fprintf(stderr, "sweetgl-tri: no sweetdrm device after %u s (%d)\n", waited, fd);
 		return 1;
 	}
+	sweetdrm_say("7.2 sweetgl-tri: SweetGPU open after %u s", waited);
 	sweetdrm_say("7.2 sweetgl-tri: FD_MESA_DEBUG=%s", getenv("FD_MESA_DEBUG"));
 
 	driOptionCache options_info = { 0 }, options = { 0 };
