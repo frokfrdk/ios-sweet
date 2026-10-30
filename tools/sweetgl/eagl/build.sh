@@ -38,8 +38,10 @@ CFLAGS=(-arch arm64 -isysroot "$SDK" -mios-version-min=16.0 -O2 -g -Wall -Wextra
 
 "$CC" "${CFLAGS[@]}" -c "$W/sweeteagl_stubs.S" -o "$W/sweeteagl_stubs.o"
 "$CC" "${CFLAGS[@]}" -std=gnu11 -c "$HERE/sweeteagl_slots.c" -o "$W/sweeteagl_slots.o"
+# sweeteagl_gen.c is committed (gen_slots.py needs the local slot map)
+"$CC" "${CFLAGS[@]}" -std=gnu11 -Wno-unused-parameter -c "$HERE/sweeteagl_gen.c" -o "$W/sweeteagl_gen.o"
 "$CC" "${CFLAGS[@]}" -fno-objc-arc -c "$HERE/sweeteagl.m" -o "$W/sweeteagl.o"
-OBJS=("$W/sweeteagl.o" "$W/sweeteagl_slots.o" "$W/sweeteagl_stubs.o")
+OBJS=("$W/sweeteagl.o" "$W/sweeteagl_slots.o" "$W/sweeteagl_gen.o" "$W/sweeteagl_stubs.o")
 
 # Mesa's archives before anything else, so every gl* the shim names is Mesa's
 LIBS=()

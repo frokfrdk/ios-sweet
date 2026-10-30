@@ -40,6 +40,16 @@ _Static_assert(offsetof(struct sweeteagl_priv, gl) == 0x40e8, "size of Apple's p
 /* Fill fn[] (sweeteagl_slots.c): Mesa for the slots we know, a logging stub elsewhere */
 void sweeteagl_fill_table(void *fn[SWEETEAGL_SLOTS]);
 
+/* The generated wrappers (sweeteagl_gen.c, from gen_slots.py): applied before the hand-written ones */
+struct sweeteagl_gen_slot {
+	uint16_t slot;
+	void *fn;
+};
+extern const struct sweeteagl_gen_slot sweeteagl_gen_slots[];
+extern const unsigned sweeteagl_gen_count;
+/* Logs a generated slot's first use, once per slot */
+void sweeteagl_gen_used(unsigned slot, const char *name);
+
 /* The generated stubs (sweeteagl_stubs.S): stub i loads i and calls this, which logs once and returns 0 */
 extern const uint32_t sweeteagl_unknown_stubs[SWEETEAGL_SLOTS * 2u];
 long sweeteagl_unknown_slot(unsigned slot);

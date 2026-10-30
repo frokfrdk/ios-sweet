@@ -139,16 +139,32 @@ static const struct {
 
 static atomic_uint_least64_t logged[(SWEETEAGL_SLOTS + 63u) / 64u];
 
+/* True the first time a slot is seen (one bit per slot, shared by both loggers) */
+static int
+first_use(unsigned slot)
+{
+	if (slot >= SWEETEAGL_SLOTS) {
+		return 0;
+	}
+	uint64_t bit = 1ull << (slot % 64u);
+	return (atomic_fetch_or(&logged[slot / 64u], bit) & bit) == 0;
+}
+
 long
 sweeteagl_unknown_slot(unsigned slot)
 {
-	if (slot < SWEETEAGL_SLOTS) {
-		uint64_t bit = 1ull << (slot % 64u);
-		if ((atomic_fetch_or(&logged[slot / 64u], bit) & bit) == 0) {
-			sweetdrm_say("7.5 eagl: slot %u called, which the shim does not implement (returns 0)", slot);
-		}
+	if (first_use(slot)) {
+		sweetdrm_say("7.5 eagl: slot %u called, which the shim does not implement (returns 0)", slot);
 	}
 	return 0;
+}
+
+void
+sweeteagl_gen_used(unsigned slot, const char *name)
+{
+	if (first_use(slot)) {
+		sweetdrm_say("7.7 eagl: slot %u %s first used (generated wrapper)", slot, name);
+	}
 }
 
 void
@@ -156,6 +172,9 @@ sweeteagl_fill_table(void *fn[SWEETEAGL_SLOTS])
 {
 	for (unsigned i = 0; i < SWEETEAGL_SLOTS; i++) {
 		fn[i] = (void *)&sweeteagl_unknown_stubs[2u * i];
+	}
+	for (unsigned k = 0; k < sweeteagl_gen_count; k++) {
+		fn[sweeteagl_gen_slots[k].slot] = sweeteagl_gen_slots[k].fn;
 	}
 	for (unsigned k = 0; k < sizeof(known) / sizeof(known[0]); k++) {
 		fn[known[k].slot] = known[k].fn;
