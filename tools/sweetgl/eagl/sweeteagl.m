@@ -61,6 +61,7 @@ size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
 #define PNAME_MULTITHREADED     0x139
 #define SWEETEAGL_WAIT_S        300u    /* for SweetGPU; G6o published it ~260 s after launchd */
 #define BIND_LOG_MAX            16u     /* IOSurface binds reported */
+#define BIND_SAMPLE_MAX         32u     /* small BGRA/RGBA surfaces whose pixels are sampled at bind */
 #define CONTEXT_LOG_MAX         4u      /* contexts reported */
 #define DIAG_SURFACES           4u      /* bound surfaces whose pixels the diag thread samples */
 #define DIAG_PERIOD_S           5u
@@ -536,6 +537,15 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		ok = e == GL_NO_ERROR;
 		if (ok) {
 			diag_record_surface(surf, sid);
+			/* G6w: icon-sized RGBA surfaces bind fine but the icons stay invisible; is there anything in them? */
+			static unsigned sampled;
+			if ((fourcc == SWEETGL_FOURCC_BGRA || fourcc == SWEETGL_FOURCC_RGBA) && width < 512 && height < 512 &&
+			    __atomic_fetch_add(&sampled, 1u, __ATOMIC_RELAXED) < BIND_SAMPLE_MAX) {
+				uint32_t centre;
+				unsigned nz = diag_sample(surf, &centre);
+				sweetdrm_say("7.7 eagl: %s surface %u %ux%u at bind: %u/%u samples nonzero, centre 0x%08x", how, sid,
+				    width, height, nz, DIAG_GRID * DIAG_GRID, centre);
+			}
 		} else {
 			sweetdrm_say("7.5 eagl: %s: surface %u: GL error 0x%04x", how, sid, e);
 		}
