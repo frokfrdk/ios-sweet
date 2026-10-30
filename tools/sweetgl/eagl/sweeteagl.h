@@ -64,10 +64,10 @@ void sweeteagl_ensure_current(void *p);
  * its whole call: SWEETEAGL_ENTER(p) takes it (counting contention), makes p
  * current if p is not NULL, and lets it go when the scope ends.
  */
-int sweeteagl_enter(void *p);
+int sweeteagl_enter(void *p, const char *fn);
 void sweeteagl_leave(int *entered);
 #define SWEETEAGL_ENTER(p) \
-	int sweeteagl_entered_ __attribute__((cleanup(sweeteagl_leave), unused)) = sweeteagl_enter(p)
+	int sweeteagl_entered_ __attribute__((cleanup(sweeteagl_leave), unused)) = sweeteagl_enter(p, __func__)
 
 /* 7.7 diagnostics: counted by the slots (sweeteagl_slots.c), reported by sweeteagl.m's diag thread */
 #ifndef __cplusplus

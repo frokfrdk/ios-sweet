@@ -134,8 +134,18 @@ sweeteagl_ensure_current(void *ctx)
 
 static pthread_mutex_t gl_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
+/*
+ * G6y: the 128x128 icon surfaces stay empty after drawing, so nothing CA does
+ * reaches their pages. After the first ones are bound, log the calls that
+ * follow (with the bound draw framebuffer and 2D texture) to see how CA means
+ * to fill them. Guarded by gl_lock.
+ */
+#define TRACE_CALLS             60u     /* calls logged after each traced bind */
+#define TRACE_BINDS             3u      /* icon-sized binds that start a trace */
+static unsigned trace_left;
+
 int
-sweeteagl_enter(void *p)
+sweeteagl_enter(void *p, const char *fn)
 {
 	if (pthread_mutex_trylock(&gl_lock) != 0) {
 		static unsigned logged;
@@ -149,6 +159,16 @@ sweeteagl_enter(void *p)
 		pthread_mutex_lock(&gl_lock);
 	}
 	sweeteagl_ensure_current(p);
+	if (trace_left > 0) {
+		trace_left--;
+		/* -1: a shim method with no context of its own, nothing to ask */
+		GLint fb = -1, tex = -1;
+		if (p != NULL) {
+			glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+		}
+		sweetdrm_say("7.7 trace: %s (fb %d tex %d)", fn, fb, tex);
+	}
 	return 1;
 }
 
@@ -546,6 +566,15 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 				unsigned nz = diag_sample(surf, &centre);
 				sweetdrm_say("7.7 eagl: %s surface %u %ux%u at bind: %u/%u samples nonzero, centre 0x%08x", how, sid,
 				    width, height, nz, DIAG_GRID * DIAG_GRID, centre);
+			}
+			static unsigned traced;
+			if (width == 128 && height == 128 && traced < TRACE_BINDS) {
+				traced++;
+				GLint tex = -1;
+				glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+				sweetdrm_say("7.7 trace: %s surface %u -> texture %d; next %u calls follow", how, sid, tex,
+				    TRACE_CALLS);
+				trace_left = TRACE_CALLS;
 			}
 		} else {
 			sweetdrm_say("7.5 eagl: %s: surface %u: GL error 0x%04x", how, sid, e);
