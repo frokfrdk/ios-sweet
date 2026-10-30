@@ -234,9 +234,10 @@ sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, voi
 	switch (fourcc) {
 	case SWEETGL_FOURCC_BGRA:       format = PIPE_FORMAT_B8G8R8A8_UNORM; bind |= PIPE_BIND_RENDER_TARGET; break;
 	case SWEETGL_FOURCC_RGBA:       format = PIPE_FORMAT_R8G8B8A8_UNORM; bind |= PIPE_BIND_RENDER_TARGET; break;
-	case SWEETGL_FOURCC_LA08:       format = PIPE_FORMAT_L8A8_UNORM; break;
-	case SWEETGL_FOURCC_L008:       format = PIPE_FORMAT_L8_UNORM; break;
-	case SWEETGL_FOURCC_A008:       format = PIPE_FORMAT_A8_UNORM; break;
+	/* same bytes as R8G8/R8; freedreno refuses SHARED for the unrenderable L/A formats (G6u), so the caller swizzles */
+	case SWEETGL_FOURCC_LA08:       format = PIPE_FORMAT_R8G8_UNORM; break;
+	case SWEETGL_FOURCC_L008:
+	case SWEETGL_FOURCC_A008:       format = PIPE_FORMAT_R8_UNORM; break;
 	default:
 		sweetdrm_say("7.5 image: surface %u has pixel format 0x%08x, not BGRA, RGBA, LA08, L008 or A008",
 		    surface_id, fourcc);

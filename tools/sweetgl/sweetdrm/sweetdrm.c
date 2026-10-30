@@ -294,6 +294,22 @@ gem_new(struct drm_msm_gem_new *r)
 		}
 	}
 	r->handle = e ? 0 : h;
+	/* G6u: Mesa crashes soon after a refused BO; say whether the BO table or the GPU window ran out */
+	static unsigned refused;
+	if (e && __atomic_fetch_add(&refused, 1u, __ATOMIC_RELAXED) < 8u) {
+		uint32_t live = 0;
+		uint64_t bytes = 0;
+		pthread_mutex_lock(&lock);
+		for (uint32_t i = 0; i < nbos; i++) {
+			if (bos[i].handle != 0) {
+				live++;
+				bytes += bos[i].size;
+			}
+		}
+		pthread_mutex_unlock(&lock);
+		say("bo new %llu bytes refused: %s; %u BOs live, %llu KiB of the %llu KiB window", (unsigned long long)r->size,
+		    strerror(e), live, (unsigned long long)(bytes >> 10), (unsigned long long)(info.window_size >> 10));
+	}
 	return e;
 }
 

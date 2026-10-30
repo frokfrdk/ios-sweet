@@ -445,6 +445,30 @@ m_getParameter_to(id self, SEL _cmd, int pname, int *value)
 }
 
 /*
+ * The swizzle that makes the image's R8G8/R8 read as fourcc's L/A (sweetgl.h);
+ * identity otherwise, since CA reuses texture objects across formats.
+ */
+static void
+set_swizzle(uint32_t fourcc)
+{
+	GLint s[4] = { GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA };
+	if (fourcc == SWEETGL_FOURCC_LA08) {
+		s[0] = s[1] = s[2] = GL_RED;
+		s[3] = GL_GREEN;
+	} else if (fourcc == SWEETGL_FOURCC_L008) {
+		s[0] = s[1] = s[2] = GL_RED;
+		s[3] = GL_ONE;
+	} else if (fourcc == SWEETGL_FOURCC_A008) {
+		s[0] = s[1] = s[2] = GL_ZERO;
+		s[3] = GL_RED;
+	}
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, s[0]);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, s[1]);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, s[2]);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, s[3]);
+}
+
+/*
  * Give the texture bound to target on self the surface's pages, width x height
  * pixels of format fourcc from its base address. self is made current for the
  * call if it is not.
@@ -472,6 +496,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		/* an error pending from the client's own calls would be mistaken for ours: log it, drop it */
 		GLenum before = glGetError(), e;
 		egl_image_target_texture_2d(GL_TEXTURE_2D, (GLeglImageOES)img);
+		set_swizzle(fourcc);
 		e = glGetError();
 		/* the texture now holds the resource */
 		sweetgl_image_destroy(img);
