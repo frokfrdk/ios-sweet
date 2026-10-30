@@ -63,7 +63,8 @@ size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
 #define BIND_LOG_MAX            16u     /* IOSurface binds reported */
 #define BIND_SAMPLE_MAX         32u     /* small BGRA/RGBA surfaces whose pixels are sampled at bind */
 #define CONTEXT_LOG_MAX         4u      /* contexts reported */
-#define DIAG_SURFACES           4u      /* bound surfaces whose pixels the diag thread samples */
+#define DIAG_SURFACES           16u     /* bound surfaces whose pixels the diag thread samples; G6x: the
+                                         * 128x128 icon candidates are empty at bind, so follow them after */
 #define DIAG_PERIOD_S           5u
 #define DIAG_REPORTS            120u    /* 10 minutes */
 #define DIAG_GRID               16u     /* samples per row and per column */

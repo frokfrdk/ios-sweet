@@ -1,0 +1,73 @@
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c	2026-10-31 07:44:15.680848742 +1030
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c	2026-10-31 07:44:15.695795358 +1030
+@@ -212,6 +212,30 @@
+ static void
+ batch_flush(struct fd_batch *batch, bool last_batch) assert_dt;
+ 
++/*
++ * sweet: tracking a draw's resources can flush the very batch being tracked
++ * (flush_write_batch -> its dependencies), and the flush frees the batch's
++ * rings and submit. fd_draw_vbo()/fd_clear() then track again on a fresh
++ * batch, so nothing may be recorded on the flushed one: libmalloc zeroes what
++ * is freed, and attaching a BO to the freed submit faulted in
++ * fd_submit_append_bo (G6t-G6x).
++ */
++void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++
++static bool
++batch_flushed_in_tracking(struct fd_batch *batch, struct fd_resource *rsc)
++{
++   if (likely(!batch->flushed))
++      return false;
++   static unsigned logged;
++   if (logged < 8) {
++      logged++;
++      sweetdrm_say("7.7 mesa: batch %u flushed while tracking; resource %ux%u not recorded on it",
++                   batch->seqno, rsc->b.b.width0, rsc->b.b.height0);
++   }
++   return true;
++}
++
+ static void
+ batch_flush_dependencies(struct fd_batch *batch) assert_dt
+ {
+@@ -496,6 +520,9 @@
+       return;
+    }
+ 
++   if (batch_flushed_in_tracking(batch, rsc))
++      return;
++
+    assert(!_mesa_set_search(batch->resources, rsc));
+ 
+    _mesa_set_add_pre_hashed(batch->resources, rsc->hash, rsc);
+@@ -546,7 +573,8 @@
+           * it asked for:
+           */
+          if (track->write_batch->ctx != batch->ctx) {
+-            fd_ringbuffer_attach_bo(batch->draw, rsc->bo);
++            if (!batch_flushed_in_tracking(batch, rsc))
++               fd_ringbuffer_attach_bo(batch->draw, rsc->bo);
+             return;
+          }
+ 
+@@ -567,6 +595,9 @@
+          fd_batch_reference_locked(&b, NULL);
+       }
+    }
++   if (batch_flushed_in_tracking(batch, rsc))
++      return;
++
+    fd_batch_reference_locked(&track->write_batch, batch);
+ 
+    fd_batch_add_resource(batch, rsc);
+@@ -597,7 +628,8 @@
+           * by avoiding cross-ctx dependencies and let the app have the
+           * undefined behavior it asked for:
+           */
+-         fd_ringbuffer_attach_bo(batch->draw, rsc->bo);
++         if (!batch_flushed_in_tracking(batch, rsc))
++            fd_ringbuffer_attach_bo(batch->draw, rsc->bo);
+          return;
+       }
+ 
