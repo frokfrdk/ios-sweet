@@ -2290,6 +2290,19 @@ Steps (each ends in something testable; 7.0, 7.4 and 7.6 need no phone and can r
   Any Mesa crash takes backboardd down; launchd restarts it, so the screen may cycle. The boot is
   temporary; a normal reboot leaves it.
 
+  *State 2026-10-30 (observed):* commits 2df8c42 + 1a580eb. sweetgl run 40974501682 passed. xnu run
+  40974641808 failed: `static_assert(sizeof(SweetGPUUserClient) <= 16 KiB)`, because 512 inline BO
+  slots made it 20 KiB. 1a580eb allocates the table in `initWithTask` instead, and xnu run 40976250176
+  passed. Root v6p is built from a fresh pull and differs in 5000 blocks (4991 dylib, 9 HFS
+  metadata). The read-only check on the phone says the target blocks are unchanged since the pull.
+  G6p is packed (546-byte cmdline). **Not yet written or booted.**
+  Checked offline: dyld keeps `DYLD_INSERT_LIBRARIES` in backboardd because sweet_amfi answers the
+  dyld policy query with 0xfb for every process. Library validation should pass because every
+  signed file on the root volume is marked a platform binary, and that includes the dylib. Mesa's
+  shader cache is built out, and the "device" is `/dev/null`, so running as `mobile` needs no new
+  file access. Baseline crashes in G6o, before 7.7: Siri TTS x12 (3 processes), assetsd x2,
+  driverkitd, com.apple.mobile*, SpringBoard x1; no backboardd crash.
+
 Risks to check early (guesses):
 
 - **The GPU VA window is 64 MiB** (0x200000000 + 0x4000000). Three 6 MB CA surfaces plus textures and
