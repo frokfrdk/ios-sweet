@@ -8,967 +8,967 @@
 
 static void g_ClearStencil(CTX, GLint s)
 {
-	sweeteagl_gen_used(15, "glClearStencil");
+	sweeteagl_gen_used(ctx, 15, "glClearStencil");
 	glClearStencil(s);
 }
 static void g_ColorMask(CTX, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
 {
-	sweeteagl_gen_used(49, "glColorMask");
+	sweeteagl_gen_used(ctx, 49, "glColorMask");
 	glColorMask(red, green, blue, alpha);
 }
 static void g_CopyTexImage2D(CTX, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
 {
-	sweeteagl_gen_used(54, "glCopyTexImage2D");
+	sweeteagl_gen_used(ctx, 54, "glCopyTexImage2D");
 	glCopyTexImage2D(target, level, internalformat, x, y, width, height, border);
 }
 static void g_CullFace(CTX, GLenum mode)
 {
-	sweeteagl_gen_used(57, "glCullFace");
+	sweeteagl_gen_used(ctx, 57, "glCullFace");
 	glCullFace(mode);
 }
 static void g_DepthFunc(CTX, GLenum func)
 {
-	sweeteagl_gen_used(60, "glDepthFunc");
+	sweeteagl_gen_used(ctx, 60, "glDepthFunc");
 	glDepthFunc(func);
 }
 static void g_DepthMask(CTX, GLboolean flag)
 {
-	sweeteagl_gen_used(61, "glDepthMask");
+	sweeteagl_gen_used(ctx, 61, "glDepthMask");
 	glDepthMask(flag);
 }
 static void g_FrontFace(CTX, GLenum mode)
 {
-	sweeteagl_gen_used(95, "glFrontFace");
+	sweeteagl_gen_used(ctx, 95, "glFrontFace");
 	glFrontFace(mode);
 }
 static void g_GetBooleanv(CTX, GLenum pname, GLboolean *data)
 {
-	sweeteagl_gen_used(99, "glGetBooleanv");
+	sweeteagl_gen_used(ctx, 99, "glGetBooleanv");
 	glGetBooleanv(pname, data);
 }
 static void g_GetFloatv(CTX, GLenum pname, GLfloat *data)
 {
-	sweeteagl_gen_used(103, "glGetFloatv");
+	sweeteagl_gen_used(ctx, 103, "glGetFloatv");
 	glGetFloatv(pname, data);
 }
 static void g_GetPointerv(CTX, GLenum pname, void **params)
 {
-	sweeteagl_gen_used(115, "glGetPointerv");
+	sweeteagl_gen_used(ctx, 115, "glGetPointerv");
 	glGetPointerv(pname, params);
 }
 static void g_GetTexLevelParameterfv(CTX, GLenum target, GLint level, GLenum pname, GLfloat *params)
 {
-	sweeteagl_gen_used(124, "glGetTexLevelParameterfv");
+	sweeteagl_gen_used(ctx, 124, "glGetTexLevelParameterfv");
 	glGetTexLevelParameterfv(target, level, pname, params);
 }
 static void g_GetTexLevelParameteriv(CTX, GLenum target, GLint level, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(125, "glGetTexLevelParameteriv");
+	sweeteagl_gen_used(ctx, 125, "glGetTexLevelParameteriv");
 	glGetTexLevelParameteriv(target, level, pname, params);
 }
 static void g_GetTexParameterfv(CTX, GLenum target, GLenum pname, GLfloat *params)
 {
-	sweeteagl_gen_used(126, "glGetTexParameterfv");
+	sweeteagl_gen_used(ctx, 126, "glGetTexParameterfv");
 	glGetTexParameterfv(target, pname, params);
 }
 static void g_GetTexParameteriv(CTX, GLenum target, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(127, "glGetTexParameteriv");
+	sweeteagl_gen_used(ctx, 127, "glGetTexParameteriv");
 	glGetTexParameteriv(target, pname, params);
 }
 static void g_Hint(CTX, GLenum target, GLenum mode)
 {
-	sweeteagl_gen_used(128, "glHint");
+	sweeteagl_gen_used(ctx, 128, "glHint");
 	glHint(target, mode);
 }
 static GLboolean g_IsEnabled(CTX, GLenum cap)
 {
-	sweeteagl_gen_used(143, "glIsEnabled");
+	sweeteagl_gen_used(ctx, 143, "glIsEnabled");
 	return glIsEnabled(cap);
 }
 static GLboolean g_IsTexture(CTX, GLuint texture)
 {
-	sweeteagl_gen_used(145, "glIsTexture");
+	sweeteagl_gen_used(ctx, 145, "glIsTexture");
 	return glIsTexture(texture);
 }
 static void g_LineWidth(CTX, GLfloat width)
 {
-	sweeteagl_gen_used(155, "glLineWidth");
+	sweeteagl_gen_used(ctx, 155, "glLineWidth");
 	glLineWidth(width);
 }
 static void g_PolygonOffset(CTX, GLfloat factor, GLfloat units)
 {
-	sweeteagl_gen_used(201, "glPolygonOffset");
+	sweeteagl_gen_used(ctx, 201, "glPolygonOffset");
 	glPolygonOffset(factor, units);
 }
 static void g_ReadBuffer(CTX, GLenum src)
 {
-	sweeteagl_gen_used(236, "glReadBuffer");
+	sweeteagl_gen_used(ctx, 236, "glReadBuffer");
 	glReadBuffer(src);
 }
 static void g_ReadPixels(CTX, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels)
 {
-	sweeteagl_gen_used(237, "glReadPixels");
+	sweeteagl_gen_used(ctx, 237, "glReadPixels");
 	glReadPixels(x, y, width, height, format, type, pixels);
 }
 static void g_StencilFunc(CTX, GLenum func, GLint ref, GLuint mask)
 {
-	sweeteagl_gen_used(254, "glStencilFunc");
+	sweeteagl_gen_used(ctx, 254, "glStencilFunc");
 	glStencilFunc(func, ref, mask);
 }
 static void g_StencilMask(CTX, GLuint mask)
 {
-	sweeteagl_gen_used(255, "glStencilMask");
+	sweeteagl_gen_used(ctx, 255, "glStencilMask");
 	glStencilMask(mask);
 }
 static void g_StencilOp(CTX, GLenum fail, GLenum zfail, GLenum zpass)
 {
-	sweeteagl_gen_used(256, "glStencilOp");
+	sweeteagl_gen_used(ctx, 256, "glStencilOp");
 	glStencilOp(fail, zfail, zpass);
 }
 static void g_TexParameterfv(CTX, GLenum target, GLenum pname, const GLfloat *params)
 {
-	sweeteagl_gen_used(303, "glTexParameterfv");
+	sweeteagl_gen_used(ctx, 303, "glTexParameterfv");
 	glTexParameterfv(target, pname, params);
 }
 static void g_TexParameteriv(CTX, GLenum target, GLenum pname, const GLint *params)
 {
-	sweeteagl_gen_used(305, "glTexParameteriv");
+	sweeteagl_gen_used(ctx, 305, "glTexParameteriv");
 	glTexParameteriv(target, pname, params);
 }
 static void g_BlendColor(CTX, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
-	sweeteagl_gen_used(337, "glBlendColor");
+	sweeteagl_gen_used(ctx, 337, "glBlendColor");
 	glBlendColor(red, green, blue, alpha);
 }
 static void g_CompressedTexImage3D(CTX, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data)
 {
-	sweeteagl_gen_used(379, "glCompressedTexImage3D");
+	sweeteagl_gen_used(ctx, 379, "glCompressedTexImage3D");
 	glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
 }
 static void g_CompressedTexSubImage3D(CTX, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
 {
-	sweeteagl_gen_used(382, "glCompressedTexSubImage3D");
+	sweeteagl_gen_used(ctx, 382, "glCompressedTexSubImage3D");
 	glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
 }
 static void g_CompressedTexSubImage2D(CTX, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data)
 {
-	sweeteagl_gen_used(383, "glCompressedTexSubImage2D");
+	sweeteagl_gen_used(ctx, 383, "glCompressedTexSubImage2D");
 	glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 static void g_DrawRangeElements(CTX, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices)
 {
-	sweeteagl_gen_used(405, "glDrawRangeElements");
+	sweeteagl_gen_used(ctx, 405, "glDrawRangeElements");
 	glDrawRangeElements(mode, start, end, count, type, indices);
 }
 static void g_TexImage3D(CTX, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels)
 {
-	sweeteagl_gen_used(438, "glTexImage3D");
+	sweeteagl_gen_used(ctx, 438, "glTexImage3D");
 	glTexImage3D(target, level, internalformat, width, height, depth, border, format, type, pixels);
 }
 static void g_TexSubImage3D(CTX, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
 {
-	sweeteagl_gen_used(439, "glTexSubImage3D");
+	sweeteagl_gen_used(ctx, 439, "glTexSubImage3D");
 	glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
 }
 static void g_CopyTexSubImage3D(CTX, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height)
 {
-	sweeteagl_gen_used(440, "glCopyTexSubImage3D");
+	sweeteagl_gen_used(ctx, 440, "glCopyTexSubImage3D");
 	glCopyTexSubImage3D(target, level, xoffset, yoffset, zoffset, x, y, width, height);
 }
 static void g_GetUniformIndices(CTX, GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices)
 {
-	sweeteagl_gen_used(441, "glGetUniformIndices");
+	sweeteagl_gen_used(ctx, 441, "glGetUniformIndices");
 	glGetUniformIndices(program, uniformCount, uniformNames, uniformIndices);
 }
 static void g_GetActiveUniformsiv(CTX, GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(442, "glGetActiveUniformsiv");
+	sweeteagl_gen_used(ctx, 442, "glGetActiveUniformsiv");
 	glGetActiveUniformsiv(program, uniformCount, uniformIndices, pname, params);
 }
 static GLuint g_GetUniformBlockIndex(CTX, GLuint program, const GLchar *uniformBlockName)
 {
-	sweeteagl_gen_used(444, "glGetUniformBlockIndex");
+	sweeteagl_gen_used(ctx, 444, "glGetUniformBlockIndex");
 	return glGetUniformBlockIndex(program, uniformBlockName);
 }
 static void g_GetActiveUniformBlockiv(CTX, GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(445, "glGetActiveUniformBlockiv");
+	sweeteagl_gen_used(ctx, 445, "glGetActiveUniformBlockiv");
 	glGetActiveUniformBlockiv(program, uniformBlockIndex, pname, params);
 }
 static void g_GetActiveUniformBlockName(CTX, GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformBlockName)
 {
-	sweeteagl_gen_used(446, "glGetActiveUniformBlockName");
+	sweeteagl_gen_used(ctx, 446, "glGetActiveUniformBlockName");
 	glGetActiveUniformBlockName(program, uniformBlockIndex, bufSize, length, uniformBlockName);
 }
 static void g_UniformBlockBinding(CTX, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding)
 {
-	sweeteagl_gen_used(447, "glUniformBlockBinding");
+	sweeteagl_gen_used(ctx, 447, "glUniformBlockBinding");
 	glUniformBlockBinding(program, uniformBlockIndex, uniformBlockBinding);
 }
 static void g_BlendEquationSeparate(CTX, GLenum modeRGB, GLenum modeAlpha)
 {
-	sweeteagl_gen_used(458, "glBlendEquationSeparate");
+	sweeteagl_gen_used(ctx, 458, "glBlendEquationSeparate");
 	glBlendEquationSeparate(modeRGB, modeAlpha);
 }
 static void g_SampleCoverage(CTX, GLfloat value, GLboolean invert)
 {
-	sweeteagl_gen_used(459, "glSampleCoverage");
+	sweeteagl_gen_used(ctx, 459, "glSampleCoverage");
 	glSampleCoverage(value, invert);
 }
 static void g_VertexAttrib1f(CTX, GLuint index, GLfloat x)
 {
-	sweeteagl_gen_used(476, "glVertexAttrib1f");
+	sweeteagl_gen_used(ctx, 476, "glVertexAttrib1f");
 	glVertexAttrib1f(index, x);
 }
 static void g_VertexAttrib2f(CTX, GLuint index, GLfloat x, GLfloat y)
 {
-	sweeteagl_gen_used(479, "glVertexAttrib2f");
+	sweeteagl_gen_used(ctx, 479, "glVertexAttrib2f");
 	glVertexAttrib2f(index, x, y);
 }
 static void g_VertexAttrib3f(CTX, GLuint index, GLfloat x, GLfloat y, GLfloat z)
 {
-	sweeteagl_gen_used(482, "glVertexAttrib3f");
+	sweeteagl_gen_used(ctx, 482, "glVertexAttrib3f");
 	glVertexAttrib3f(index, x, y, z);
 }
 static void g_VertexAttrib4f(CTX, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-	sweeteagl_gen_used(485, "glVertexAttrib4f");
+	sweeteagl_gen_used(ctx, 485, "glVertexAttrib4f");
 	glVertexAttrib4f(index, x, y, z, w);
 }
 static void g_VertexAttrib1fv(CTX, GLuint index, const GLfloat *v)
 {
-	sweeteagl_gen_used(489, "glVertexAttrib1fv");
+	sweeteagl_gen_used(ctx, 489, "glVertexAttrib1fv");
 	glVertexAttrib1fv(index, v);
 }
 static void g_VertexAttrib2fv(CTX, GLuint index, const GLfloat *v)
 {
-	sweeteagl_gen_used(492, "glVertexAttrib2fv");
+	sweeteagl_gen_used(ctx, 492, "glVertexAttrib2fv");
 	glVertexAttrib2fv(index, v);
 }
 static void g_VertexAttrib3fv(CTX, GLuint index, const GLfloat *v)
 {
-	sweeteagl_gen_used(495, "glVertexAttrib3fv");
+	sweeteagl_gen_used(ctx, 495, "glVertexAttrib3fv");
 	glVertexAttrib3fv(index, v);
 }
 static void g_VertexAttrib4fv(CTX, GLuint index, const GLfloat *v)
 {
-	sweeteagl_gen_used(503, "glVertexAttrib4fv");
+	sweeteagl_gen_used(ctx, 503, "glVertexAttrib4fv");
 	glVertexAttrib4fv(index, v);
 }
 static void g_GetVertexAttribfv(CTX, GLuint index, GLenum pname, GLfloat *params)
 {
-	sweeteagl_gen_used(515, "glGetVertexAttribfv");
+	sweeteagl_gen_used(ctx, 515, "glGetVertexAttribfv");
 	glGetVertexAttribfv(index, pname, params);
 }
 static void g_GetVertexAttribiv(CTX, GLuint index, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(516, "glGetVertexAttribiv");
+	sweeteagl_gen_used(ctx, 516, "glGetVertexAttribiv");
 	glGetVertexAttribiv(index, pname, params);
 }
 static void g_GetVertexAttribPointerv(CTX, GLuint index, GLenum pname, void **pointer)
 {
-	sweeteagl_gen_used(517, "glGetVertexAttribPointerv");
+	sweeteagl_gen_used(ctx, 517, "glGetVertexAttribPointerv");
 	glGetVertexAttribPointerv(index, pname, pointer);
 }
 static void g_StencilOpSeparate(CTX, GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass)
 {
-	sweeteagl_gen_used(586, "glStencilOpSeparate");
+	sweeteagl_gen_used(ctx, 586, "glStencilOpSeparate");
 	glStencilOpSeparate(face, sfail, dpfail, dppass);
 }
 static void g_DetachShader(CTX, GLuint program, GLuint shader)
 {
-	sweeteagl_gen_used(593, "glDetachShader");
+	sweeteagl_gen_used(ctx, 593, "glDetachShader");
 	glDetachShader(program, shader);
 }
 static void g_ValidateProgram(CTX, GLuint program)
 {
-	sweeteagl_gen_used(601, "glValidateProgram");
+	sweeteagl_gen_used(ctx, 601, "glValidateProgram");
 	glValidateProgram(program);
 }
 static void g_Uniform2f(CTX, GLint location, GLfloat v0, GLfloat v1)
 {
-	sweeteagl_gen_used(603, "glUniform2f");
+	sweeteagl_gen_used(ctx, 603, "glUniform2f");
 	glUniform2f(location, v0, v1);
 }
 static void g_Uniform3f(CTX, GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
 {
-	sweeteagl_gen_used(604, "glUniform3f");
+	sweeteagl_gen_used(ctx, 604, "glUniform3f");
 	glUniform3f(location, v0, v1, v2);
 }
 static void g_Uniform2i(CTX, GLint location, GLint v0, GLint v1)
 {
-	sweeteagl_gen_used(607, "glUniform2i");
+	sweeteagl_gen_used(ctx, 607, "glUniform2i");
 	glUniform2i(location, v0, v1);
 }
 static void g_Uniform3i(CTX, GLint location, GLint v0, GLint v1, GLint v2)
 {
-	sweeteagl_gen_used(608, "glUniform3i");
+	sweeteagl_gen_used(ctx, 608, "glUniform3i");
 	glUniform3i(location, v0, v1, v2);
 }
 static void g_Uniform4i(CTX, GLint location, GLint v0, GLint v1, GLint v2, GLint v3)
 {
-	sweeteagl_gen_used(609, "glUniform4i");
+	sweeteagl_gen_used(ctx, 609, "glUniform4i");
 	glUniform4i(location, v0, v1, v2, v3);
 }
 static void g_Uniform1fv(CTX, GLint location, GLsizei count, const GLfloat *value)
 {
-	sweeteagl_gen_used(610, "glUniform1fv");
+	sweeteagl_gen_used(ctx, 610, "glUniform1fv");
 	glUniform1fv(location, count, value);
 }
 static void g_Uniform2fv(CTX, GLint location, GLsizei count, const GLfloat *value)
 {
-	sweeteagl_gen_used(611, "glUniform2fv");
+	sweeteagl_gen_used(ctx, 611, "glUniform2fv");
 	glUniform2fv(location, count, value);
 }
 static void g_Uniform1iv(CTX, GLint location, GLsizei count, const GLint *value)
 {
-	sweeteagl_gen_used(614, "glUniform1iv");
+	sweeteagl_gen_used(ctx, 614, "glUniform1iv");
 	glUniform1iv(location, count, value);
 }
 static void g_Uniform2iv(CTX, GLint location, GLsizei count, const GLint *value)
 {
-	sweeteagl_gen_used(615, "glUniform2iv");
+	sweeteagl_gen_used(ctx, 615, "glUniform2iv");
 	glUniform2iv(location, count, value);
 }
 static void g_Uniform3iv(CTX, GLint location, GLsizei count, const GLint *value)
 {
-	sweeteagl_gen_used(616, "glUniform3iv");
+	sweeteagl_gen_used(ctx, 616, "glUniform3iv");
 	glUniform3iv(location, count, value);
 }
 static void g_Uniform4iv(CTX, GLint location, GLsizei count, const GLint *value)
 {
-	sweeteagl_gen_used(617, "glUniform4iv");
+	sweeteagl_gen_used(ctx, 617, "glUniform4iv");
 	glUniform4iv(location, count, value);
 }
 static void g_UniformMatrix2fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(618, "glUniformMatrix2fv");
+	sweeteagl_gen_used(ctx, 618, "glUniformMatrix2fv");
 	glUniformMatrix2fv(location, count, transpose, value);
 }
 static void g_GetActiveUniform(CTX, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
 {
-	sweeteagl_gen_used(626, "glGetActiveUniform");
+	sweeteagl_gen_used(ctx, 626, "glGetActiveUniform");
 	glGetActiveUniform(program, index, bufSize, length, size, type, name);
 }
 static void g_GetUniformfv(CTX, GLuint program, GLint location, GLfloat *params)
 {
-	sweeteagl_gen_used(627, "glGetUniformfv");
+	sweeteagl_gen_used(ctx, 627, "glGetUniformfv");
 	glGetUniformfv(program, location, params);
 }
 static void g_GetUniformiv(CTX, GLuint program, GLint location, GLint *params)
 {
-	sweeteagl_gen_used(628, "glGetUniformiv");
+	sweeteagl_gen_used(ctx, 628, "glGetUniformiv");
 	glGetUniformiv(program, location, params);
 }
 static void g_GetShaderSource(CTX, GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *source)
 {
-	sweeteagl_gen_used(629, "glGetShaderSource");
+	sweeteagl_gen_used(ctx, 629, "glGetShaderSource");
 	glGetShaderSource(shader, bufSize, length, source);
 }
 static void g_GetActiveAttrib(CTX, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
 {
-	sweeteagl_gen_used(631, "glGetActiveAttrib");
+	sweeteagl_gen_used(ctx, 631, "glGetActiveAttrib");
 	glGetActiveAttrib(program, index, bufSize, length, size, type, name);
 }
 static GLint g_GetAttribLocation(CTX, GLuint program, const GLchar *name)
 {
-	sweeteagl_gen_used(632, "glGetAttribLocation");
+	sweeteagl_gen_used(ctx, 632, "glGetAttribLocation");
 	return glGetAttribLocation(program, name);
 }
 static void g_GenQueries(CTX, GLsizei n, GLuint *ids)
 {
-	sweeteagl_gen_used(634, "glGenQueries");
+	sweeteagl_gen_used(ctx, 634, "glGenQueries");
 	glGenQueries(n, ids);
 }
 static void g_DeleteQueries(CTX, GLsizei n, const GLuint *ids)
 {
-	sweeteagl_gen_used(635, "glDeleteQueries");
+	sweeteagl_gen_used(ctx, 635, "glDeleteQueries");
 	glDeleteQueries(n, ids);
 }
 static GLboolean g_IsQuery(CTX, GLuint id)
 {
-	sweeteagl_gen_used(636, "glIsQuery");
+	sweeteagl_gen_used(ctx, 636, "glIsQuery");
 	return glIsQuery(id);
 }
 static void g_BeginQuery(CTX, GLenum target, GLuint id)
 {
-	sweeteagl_gen_used(637, "glBeginQuery");
+	sweeteagl_gen_used(ctx, 637, "glBeginQuery");
 	glBeginQuery(target, id);
 }
 static void g_EndQuery(CTX, GLenum target)
 {
-	sweeteagl_gen_used(638, "glEndQuery");
+	sweeteagl_gen_used(ctx, 638, "glEndQuery");
 	glEndQuery(target);
 }
 static void g_GetQueryiv(CTX, GLenum target, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(639, "glGetQueryiv");
+	sweeteagl_gen_used(ctx, 639, "glGetQueryiv");
 	glGetQueryiv(target, pname, params);
 }
 static void g_GetQueryObjectuiv(CTX, GLuint id, GLenum pname, GLuint *params)
 {
-	sweeteagl_gen_used(641, "glGetQueryObjectuiv");
+	sweeteagl_gen_used(ctx, 641, "glGetQueryObjectuiv");
 	glGetQueryObjectuiv(id, pname, params);
 }
 static void g_BindBuffer(CTX, GLenum target, GLuint buffer)
 {
-	sweeteagl_gen_used(642, "glBindBuffer");
+	sweeteagl_gen_used(ctx, 642, "glBindBuffer");
 	glBindBuffer(target, buffer);
 }
 static void g_DeleteBuffers(CTX, GLsizei n, const GLuint *buffers)
 {
-	sweeteagl_gen_used(643, "glDeleteBuffers");
+	sweeteagl_gen_used(ctx, 643, "glDeleteBuffers");
 	glDeleteBuffers(n, buffers);
 }
 static void g_GenBuffers(CTX, GLsizei n, GLuint *buffers)
 {
-	sweeteagl_gen_used(644, "glGenBuffers");
+	sweeteagl_gen_used(ctx, 644, "glGenBuffers");
 	glGenBuffers(n, buffers);
 }
 static GLboolean g_IsBuffer(CTX, GLuint buffer)
 {
-	sweeteagl_gen_used(645, "glIsBuffer");
+	sweeteagl_gen_used(ctx, 645, "glIsBuffer");
 	return glIsBuffer(buffer);
 }
 static void g_BufferData(CTX, GLenum target, GLsizeiptr size, const void *data, GLenum usage)
 {
-	sweeteagl_gen_used(646, "glBufferData");
+	sweeteagl_gen_used(ctx, 646, "glBufferData");
 	glBufferData(target, size, data, usage);
 }
 static void g_BufferSubData(CTX, GLenum target, GLintptr offset, GLsizeiptr size, const void *data)
 {
-	sweeteagl_gen_used(647, "glBufferSubData");
+	sweeteagl_gen_used(ctx, 647, "glBufferSubData");
 	glBufferSubData(target, offset, size, data);
 }
 static GLboolean g_UnmapBuffer(CTX, GLenum target)
 {
-	sweeteagl_gen_used(650, "glUnmapBuffer");
+	sweeteagl_gen_used(ctx, 650, "glUnmapBuffer");
 	return glUnmapBuffer(target);
 }
 static void g_GetBufferParameteriv(CTX, GLenum target, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(651, "glGetBufferParameteriv");
+	sweeteagl_gen_used(ctx, 651, "glGetBufferParameteriv");
 	glGetBufferParameteriv(target, pname, params);
 }
 static void g_GetBufferPointerv(CTX, GLenum target, GLenum pname, void **params)
 {
-	sweeteagl_gen_used(652, "glGetBufferPointerv");
+	sweeteagl_gen_used(ctx, 652, "glGetBufferPointerv");
 	glGetBufferPointerv(target, pname, params);
 }
 static void g_DrawBuffers(CTX, GLsizei n, const GLenum *bufs)
 {
-	sweeteagl_gen_used(654, "glDrawBuffers");
+	sweeteagl_gen_used(ctx, 654, "glDrawBuffers");
 	glDrawBuffers(n, bufs);
 }
 static GLboolean g_IsShader(CTX, GLuint shader)
 {
-	sweeteagl_gen_used(655, "glIsShader");
+	sweeteagl_gen_used(ctx, 655, "glIsShader");
 	return glIsShader(shader);
 }
 static GLboolean g_IsProgram(CTX, GLuint program)
 {
-	sweeteagl_gen_used(656, "glIsProgram");
+	sweeteagl_gen_used(ctx, 656, "glIsProgram");
 	return glIsProgram(program);
 }
 static void g_GetShaderiv(CTX, GLuint shader, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(657, "glGetShaderiv");
+	sweeteagl_gen_used(ctx, 657, "glGetShaderiv");
 	glGetShaderiv(shader, pname, params);
 }
 static void g_GetProgramiv(CTX, GLuint program, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(658, "glGetProgramiv");
+	sweeteagl_gen_used(ctx, 658, "glGetProgramiv");
 	glGetProgramiv(program, pname, params);
 }
 static void g_GetShaderInfoLog(CTX, GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
-	sweeteagl_gen_used(659, "glGetShaderInfoLog");
+	sweeteagl_gen_used(ctx, 659, "glGetShaderInfoLog");
 	glGetShaderInfoLog(shader, bufSize, length, infoLog);
 }
 static void g_GetProgramInfoLog(CTX, GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
-	sweeteagl_gen_used(660, "glGetProgramInfoLog");
+	sweeteagl_gen_used(ctx, 660, "glGetProgramInfoLog");
 	glGetProgramInfoLog(program, bufSize, length, infoLog);
 }
 static void g_StencilFuncSeparate(CTX, GLenum face, GLenum func, GLint ref, GLuint mask)
 {
-	sweeteagl_gen_used(661, "glStencilFuncSeparate");
+	sweeteagl_gen_used(ctx, 661, "glStencilFuncSeparate");
 	glStencilFuncSeparate(face, func, ref, mask);
 }
 static void g_StencilMaskSeparate(CTX, GLenum face, GLuint mask)
 {
-	sweeteagl_gen_used(662, "glStencilMaskSeparate");
+	sweeteagl_gen_used(ctx, 662, "glStencilMaskSeparate");
 	glStencilMaskSeparate(face, mask);
 }
 static GLboolean g_IsRenderbuffer(CTX, GLuint renderbuffer)
 {
-	sweeteagl_gen_used(665, "glIsRenderbuffer");
+	sweeteagl_gen_used(ctx, 665, "glIsRenderbuffer");
 	return glIsRenderbuffer(renderbuffer);
 }
 static void g_BindRenderbuffer(CTX, GLenum target, GLuint renderbuffer)
 {
-	sweeteagl_gen_used(666, "glBindRenderbuffer");
+	sweeteagl_gen_used(ctx, 666, "glBindRenderbuffer");
 	glBindRenderbuffer(target, renderbuffer);
 }
 static void g_DeleteRenderbuffers(CTX, GLsizei n, const GLuint *renderbuffers)
 {
-	sweeteagl_gen_used(667, "glDeleteRenderbuffers");
+	sweeteagl_gen_used(ctx, 667, "glDeleteRenderbuffers");
 	glDeleteRenderbuffers(n, renderbuffers);
 }
 static void g_GenRenderbuffers(CTX, GLsizei n, GLuint *renderbuffers)
 {
-	sweeteagl_gen_used(668, "glGenRenderbuffers");
+	sweeteagl_gen_used(ctx, 668, "glGenRenderbuffers");
 	glGenRenderbuffers(n, renderbuffers);
 }
 static void g_RenderbufferStorage(CTX, GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
-	sweeteagl_gen_used(669, "glRenderbufferStorage");
+	sweeteagl_gen_used(ctx, 669, "glRenderbufferStorage");
 	glRenderbufferStorage(target, internalformat, width, height);
 }
 static void g_GetRenderbufferParameteriv(CTX, GLenum target, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(670, "glGetRenderbufferParameteriv");
+	sweeteagl_gen_used(ctx, 670, "glGetRenderbufferParameteriv");
 	glGetRenderbufferParameteriv(target, pname, params);
 }
 static GLboolean g_IsFramebuffer(CTX, GLuint framebuffer)
 {
-	sweeteagl_gen_used(671, "glIsFramebuffer");
+	sweeteagl_gen_used(ctx, 671, "glIsFramebuffer");
 	return glIsFramebuffer(framebuffer);
 }
 static GLenum g_CheckFramebufferStatus(CTX, GLenum target)
 {
-	sweeteagl_gen_used(675, "glCheckFramebufferStatus");
+	sweeteagl_gen_used(ctx, 675, "glCheckFramebufferStatus");
 	return glCheckFramebufferStatus(target);
 }
 static void g_FramebufferRenderbuffer(CTX, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
 {
-	sweeteagl_gen_used(679, "glFramebufferRenderbuffer");
+	sweeteagl_gen_used(ctx, 679, "glFramebufferRenderbuffer");
 	glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
 }
 static void g_GetFramebufferAttachmentParameteriv(CTX, GLenum target, GLenum attachment, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(680, "glGetFramebufferAttachmentParameteriv");
+	sweeteagl_gen_used(ctx, 680, "glGetFramebufferAttachmentParameteriv");
 	glGetFramebufferAttachmentParameteriv(target, attachment, pname, params);
 }
 static void g_ProgramParameteri(CTX, GLuint program, GLenum pname, GLint value)
 {
-	sweeteagl_gen_used(689, "glProgramParameteri");
+	sweeteagl_gen_used(ctx, 689, "glProgramParameteri");
 	glProgramParameteri(program, pname, value);
 }
 static void g_FramebufferTextureLayer(CTX, GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer)
 {
-	sweeteagl_gen_used(691, "glFramebufferTextureLayer");
+	sweeteagl_gen_used(ctx, 691, "glFramebufferTextureLayer");
 	glFramebufferTextureLayer(target, attachment, texture, level, layer);
 }
 static void g_BindBufferRange(CTX, GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
-	sweeteagl_gen_used(693, "glBindBufferRange");
+	sweeteagl_gen_used(ctx, 693, "glBindBufferRange");
 	glBindBufferRange(target, index, buffer, offset, size);
 }
 static void g_BindBufferBase(CTX, GLenum target, GLuint index, GLuint buffer)
 {
-	sweeteagl_gen_used(695, "glBindBufferBase");
+	sweeteagl_gen_used(ctx, 695, "glBindBufferBase");
 	glBindBufferBase(target, index, buffer);
 }
 static void g_BeginTransformFeedback(CTX, GLenum primitiveMode)
 {
-	sweeteagl_gen_used(696, "glBeginTransformFeedback");
+	sweeteagl_gen_used(ctx, 696, "glBeginTransformFeedback");
 	glBeginTransformFeedback(primitiveMode);
 }
 static void g_EndTransformFeedback(CTX)
 {
-	sweeteagl_gen_used(697, "glEndTransformFeedback");
+	sweeteagl_gen_used(ctx, 697, "glEndTransformFeedback");
 	glEndTransformFeedback();
 }
 static void g_TransformFeedbackVaryings(CTX, GLuint program, GLsizei count, const GLchar *const*varyings, GLenum bufferMode)
 {
-	sweeteagl_gen_used(698, "glTransformFeedbackVaryings");
+	sweeteagl_gen_used(ctx, 698, "glTransformFeedbackVaryings");
 	glTransformFeedbackVaryings(program, count, varyings, bufferMode);
 }
 static void g_GetTransformFeedbackVarying(CTX, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLsizei *size, GLenum *type, GLchar *name)
 {
-	sweeteagl_gen_used(699, "glGetTransformFeedbackVarying");
+	sweeteagl_gen_used(ctx, 699, "glGetTransformFeedbackVarying");
 	glGetTransformFeedbackVarying(program, index, bufSize, length, size, type, name);
 }
 static void g_GetIntegeri_v(CTX, GLenum target, GLuint index, GLint *data)
 {
-	sweeteagl_gen_used(700, "glGetIntegeri_v");
+	sweeteagl_gen_used(ctx, 700, "glGetIntegeri_v");
 	glGetIntegeri_v(target, index, data);
 }
 static void g_VertexAttribI4i(CTX, GLuint index, GLint x, GLint y, GLint z, GLint w)
 {
-	sweeteagl_gen_used(714, "glVertexAttribI4i");
+	sweeteagl_gen_used(ctx, 714, "glVertexAttribI4i");
 	glVertexAttribI4i(index, x, y, z, w);
 }
 static void g_VertexAttribI4ui(CTX, GLuint index, GLuint x, GLuint y, GLuint z, GLuint w)
 {
-	sweeteagl_gen_used(718, "glVertexAttribI4ui");
+	sweeteagl_gen_used(ctx, 718, "glVertexAttribI4ui");
 	glVertexAttribI4ui(index, x, y, z, w);
 }
 static void g_VertexAttribI4iv(CTX, GLuint index, const GLint *v)
 {
-	sweeteagl_gen_used(722, "glVertexAttribI4iv");
+	sweeteagl_gen_used(ctx, 722, "glVertexAttribI4iv");
 	glVertexAttribI4iv(index, v);
 }
 static void g_VertexAttribI4uiv(CTX, GLuint index, const GLuint *v)
 {
-	sweeteagl_gen_used(726, "glVertexAttribI4uiv");
+	sweeteagl_gen_used(ctx, 726, "glVertexAttribI4uiv");
 	glVertexAttribI4uiv(index, v);
 }
 static void g_VertexAttribIPointer(CTX, GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer)
 {
-	sweeteagl_gen_used(731, "glVertexAttribIPointer");
+	sweeteagl_gen_used(ctx, 731, "glVertexAttribIPointer");
 	glVertexAttribIPointer(index, size, type, stride, pointer);
 }
 static void g_GetVertexAttribIiv(CTX, GLuint index, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(732, "glGetVertexAttribIiv");
+	sweeteagl_gen_used(ctx, 732, "glGetVertexAttribIiv");
 	glGetVertexAttribIiv(index, pname, params);
 }
 static void g_GetVertexAttribIuiv(CTX, GLuint index, GLenum pname, GLuint *params)
 {
-	sweeteagl_gen_used(733, "glGetVertexAttribIuiv");
+	sweeteagl_gen_used(ctx, 733, "glGetVertexAttribIuiv");
 	glGetVertexAttribIuiv(index, pname, params);
 }
 static void g_Uniform1ui(CTX, GLint location, GLuint v0)
 {
-	sweeteagl_gen_used(734, "glUniform1ui");
+	sweeteagl_gen_used(ctx, 734, "glUniform1ui");
 	glUniform1ui(location, v0);
 }
 static void g_Uniform2ui(CTX, GLint location, GLuint v0, GLuint v1)
 {
-	sweeteagl_gen_used(735, "glUniform2ui");
+	sweeteagl_gen_used(ctx, 735, "glUniform2ui");
 	glUniform2ui(location, v0, v1);
 }
 static void g_Uniform3ui(CTX, GLint location, GLuint v0, GLuint v1, GLuint v2)
 {
-	sweeteagl_gen_used(736, "glUniform3ui");
+	sweeteagl_gen_used(ctx, 736, "glUniform3ui");
 	glUniform3ui(location, v0, v1, v2);
 }
 static void g_Uniform4ui(CTX, GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3)
 {
-	sweeteagl_gen_used(737, "glUniform4ui");
+	sweeteagl_gen_used(ctx, 737, "glUniform4ui");
 	glUniform4ui(location, v0, v1, v2, v3);
 }
 static void g_Uniform1uiv(CTX, GLint location, GLsizei count, const GLuint *value)
 {
-	sweeteagl_gen_used(738, "glUniform1uiv");
+	sweeteagl_gen_used(ctx, 738, "glUniform1uiv");
 	glUniform1uiv(location, count, value);
 }
 static void g_Uniform2uiv(CTX, GLint location, GLsizei count, const GLuint *value)
 {
-	sweeteagl_gen_used(739, "glUniform2uiv");
+	sweeteagl_gen_used(ctx, 739, "glUniform2uiv");
 	glUniform2uiv(location, count, value);
 }
 static void g_Uniform3uiv(CTX, GLint location, GLsizei count, const GLuint *value)
 {
-	sweeteagl_gen_used(740, "glUniform3uiv");
+	sweeteagl_gen_used(ctx, 740, "glUniform3uiv");
 	glUniform3uiv(location, count, value);
 }
 static void g_Uniform4uiv(CTX, GLint location, GLsizei count, const GLuint *value)
 {
-	sweeteagl_gen_used(741, "glUniform4uiv");
+	sweeteagl_gen_used(ctx, 741, "glUniform4uiv");
 	glUniform4uiv(location, count, value);
 }
 static void g_GetUniformuiv(CTX, GLuint program, GLint location, GLuint *params)
 {
-	sweeteagl_gen_used(742, "glGetUniformuiv");
+	sweeteagl_gen_used(ctx, 742, "glGetUniformuiv");
 	glGetUniformuiv(program, location, params);
 }
 static GLint g_GetFragDataLocation(CTX, GLuint program, const GLchar *name)
 {
-	sweeteagl_gen_used(744, "glGetFragDataLocation");
+	sweeteagl_gen_used(ctx, 744, "glGetFragDataLocation");
 	return glGetFragDataLocation(program, name);
 }
 static void g_UniformMatrix2x3fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(749, "glUniformMatrix2x3fv");
+	sweeteagl_gen_used(ctx, 749, "glUniformMatrix2x3fv");
 	glUniformMatrix2x3fv(location, count, transpose, value);
 }
 static void g_UniformMatrix3x2fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(750, "glUniformMatrix3x2fv");
+	sweeteagl_gen_used(ctx, 750, "glUniformMatrix3x2fv");
 	glUniformMatrix3x2fv(location, count, transpose, value);
 }
 static void g_UniformMatrix2x4fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(751, "glUniformMatrix2x4fv");
+	sweeteagl_gen_used(ctx, 751, "glUniformMatrix2x4fv");
 	glUniformMatrix2x4fv(location, count, transpose, value);
 }
 static void g_UniformMatrix4x2fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(752, "glUniformMatrix4x2fv");
+	sweeteagl_gen_used(ctx, 752, "glUniformMatrix4x2fv");
 	glUniformMatrix4x2fv(location, count, transpose, value);
 }
 static void g_UniformMatrix3x4fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(753, "glUniformMatrix3x4fv");
+	sweeteagl_gen_used(ctx, 753, "glUniformMatrix3x4fv");
 	glUniformMatrix3x4fv(location, count, transpose, value);
 }
 static void g_UniformMatrix4x3fv(CTX, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	sweeteagl_gen_used(754, "glUniformMatrix4x3fv");
+	sweeteagl_gen_used(ctx, 754, "glUniformMatrix4x3fv");
 	glUniformMatrix4x3fv(location, count, transpose, value);
 }
 static void g_BlitFramebuffer(CTX, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
 {
-	sweeteagl_gen_used(755, "glBlitFramebuffer");
+	sweeteagl_gen_used(ctx, 755, "glBlitFramebuffer");
 	glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 static void g_RenderbufferStorageMultisample(CTX, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
 {
-	sweeteagl_gen_used(756, "glRenderbufferStorageMultisample");
+	sweeteagl_gen_used(ctx, 756, "glRenderbufferStorageMultisample");
 	glRenderbufferStorageMultisample(target, samples, internalformat, width, height);
 }
 static void g_GetAttachedShaders(CTX, GLuint program, GLsizei maxCount, GLsizei *count, GLuint *shaders)
 {
-	sweeteagl_gen_used(759, "glGetAttachedShaders");
+	sweeteagl_gen_used(ctx, 759, "glGetAttachedShaders");
 	glGetAttachedShaders(program, maxCount, count, shaders);
 }
 static void g_VertexAttribDivisor(CTX, GLuint index, GLuint divisor)
 {
-	sweeteagl_gen_used(761, "glVertexAttribDivisor");
+	sweeteagl_gen_used(ctx, 761, "glVertexAttribDivisor");
 	glVertexAttribDivisor(index, divisor);
 }
 static void g_DrawArraysInstanced(CTX, GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
 {
-	sweeteagl_gen_used(762, "glDrawArraysInstanced");
+	sweeteagl_gen_used(ctx, 762, "glDrawArraysInstanced");
 	glDrawArraysInstanced(mode, first, count, instancecount);
 }
 static void g_DrawElementsInstanced(CTX, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount)
 {
-	sweeteagl_gen_used(763, "glDrawElementsInstanced");
+	sweeteagl_gen_used(ctx, 763, "glDrawElementsInstanced");
 	glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 static void g_BindVertexArray(CTX, GLuint array)
 {
-	sweeteagl_gen_used(768, "glBindVertexArray");
+	sweeteagl_gen_used(ctx, 768, "glBindVertexArray");
 	glBindVertexArray(array);
 }
 static void g_DeleteVertexArrays(CTX, GLsizei n, const GLuint *arrays)
 {
-	sweeteagl_gen_used(769, "glDeleteVertexArrays");
+	sweeteagl_gen_used(ctx, 769, "glDeleteVertexArrays");
 	glDeleteVertexArrays(n, arrays);
 }
 static void g_GenVertexArrays(CTX, GLsizei n, GLuint *arrays)
 {
-	sweeteagl_gen_used(770, "glGenVertexArrays");
+	sweeteagl_gen_used(ctx, 770, "glGenVertexArrays");
 	glGenVertexArrays(n, arrays);
 }
 static GLboolean g_IsVertexArray(CTX, GLuint array)
 {
-	sweeteagl_gen_used(771, "glIsVertexArray");
+	sweeteagl_gen_used(ctx, 771, "glIsVertexArray");
 	return glIsVertexArray(array);
 }
 static void g_ClearBufferiv(CTX, GLenum buffer, GLint drawbuffer, const GLint *value)
 {
-	sweeteagl_gen_used(774, "glClearBufferiv");
+	sweeteagl_gen_used(ctx, 774, "glClearBufferiv");
 	glClearBufferiv(buffer, drawbuffer, value);
 }
 static void g_ClearBufferuiv(CTX, GLenum buffer, GLint drawbuffer, const GLuint *value)
 {
-	sweeteagl_gen_used(775, "glClearBufferuiv");
+	sweeteagl_gen_used(ctx, 775, "glClearBufferuiv");
 	glClearBufferuiv(buffer, drawbuffer, value);
 }
 static void g_ClearBufferfv(CTX, GLenum buffer, GLint drawbuffer, const GLfloat *value)
 {
-	sweeteagl_gen_used(776, "glClearBufferfv");
+	sweeteagl_gen_used(ctx, 776, "glClearBufferfv");
 	glClearBufferfv(buffer, drawbuffer, value);
 }
 static void g_ClearBufferfi(CTX, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil)
 {
-	sweeteagl_gen_used(777, "glClearBufferfi");
+	sweeteagl_gen_used(ctx, 777, "glClearBufferfi");
 	glClearBufferfi(buffer, drawbuffer, depth, stencil);
 }
 static const GLubyte * g_GetStringi(CTX, GLenum name, GLuint index)
 {
-	sweeteagl_gen_used(778, "glGetStringi");
+	sweeteagl_gen_used(ctx, 778, "glGetStringi");
 	return glGetStringi(name, index);
 }
 static GLboolean g_IsSync(CTX, GLsync sync)
 {
-	sweeteagl_gen_used(780, "glIsSync");
+	sweeteagl_gen_used(ctx, 780, "glIsSync");
 	return glIsSync(sync);
 }
 static void g_WaitSync(CTX, GLsync sync, GLbitfield flags, GLuint64 timeout)
 {
-	sweeteagl_gen_used(783, "glWaitSync");
+	sweeteagl_gen_used(ctx, 783, "glWaitSync");
 	glWaitSync(sync, flags, timeout);
 }
 static void g_GetInteger64v(CTX, GLenum pname, GLint64 *data)
 {
-	sweeteagl_gen_used(784, "glGetInteger64v");
+	sweeteagl_gen_used(ctx, 784, "glGetInteger64v");
 	glGetInteger64v(pname, data);
 }
 static void g_GetSynciv(CTX, GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values)
 {
-	sweeteagl_gen_used(785, "glGetSynciv");
+	sweeteagl_gen_used(ctx, 785, "glGetSynciv");
 	glGetSynciv(sync, pname, bufSize, length, values);
 }
 static void g_CopyBufferSubData(CTX, GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size)
 {
-	sweeteagl_gen_used(791, "glCopyBufferSubData");
+	sweeteagl_gen_used(ctx, 791, "glCopyBufferSubData");
 	glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
 }
 static void * g_MapBufferRange(CTX, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access)
 {
-	sweeteagl_gen_used(795, "glMapBufferRange");
+	sweeteagl_gen_used(ctx, 795, "glMapBufferRange");
 	return glMapBufferRange(target, offset, length, access);
 }
 static void g_FlushMappedBufferRange(CTX, GLenum target, GLintptr offset, GLsizeiptr length)
 {
-	sweeteagl_gen_used(796, "glFlushMappedBufferRange");
+	sweeteagl_gen_used(ctx, 796, "glFlushMappedBufferRange");
 	glFlushMappedBufferRange(target, offset, length);
 }
 static void g_GetInteger64i_v(CTX, GLenum target, GLuint index, GLint64 *data)
 {
-	sweeteagl_gen_used(798, "glGetInteger64i_v");
+	sweeteagl_gen_used(ctx, 798, "glGetInteger64i_v");
 	glGetInteger64i_v(target, index, data);
 }
 static void g_GetBufferParameteri64v(CTX, GLenum target, GLenum pname, GLint64 *params)
 {
-	sweeteagl_gen_used(799, "glGetBufferParameteri64v");
+	sweeteagl_gen_used(ctx, 799, "glGetBufferParameteri64v");
 	glGetBufferParameteri64v(target, pname, params);
 }
 static void g_GenSamplers(CTX, GLsizei count, GLuint *samplers)
 {
-	sweeteagl_gen_used(800, "glGenSamplers");
+	sweeteagl_gen_used(ctx, 800, "glGenSamplers");
 	glGenSamplers(count, samplers);
 }
 static void g_DeleteSamplers(CTX, GLsizei count, const GLuint *samplers)
 {
-	sweeteagl_gen_used(801, "glDeleteSamplers");
+	sweeteagl_gen_used(ctx, 801, "glDeleteSamplers");
 	glDeleteSamplers(count, samplers);
 }
 static GLboolean g_IsSampler(CTX, GLuint sampler)
 {
-	sweeteagl_gen_used(802, "glIsSampler");
+	sweeteagl_gen_used(ctx, 802, "glIsSampler");
 	return glIsSampler(sampler);
 }
 static void g_BindSampler(CTX, GLuint unit, GLuint sampler)
 {
-	sweeteagl_gen_used(803, "glBindSampler");
+	sweeteagl_gen_used(ctx, 803, "glBindSampler");
 	glBindSampler(unit, sampler);
 }
 static void g_SamplerParameteri(CTX, GLuint sampler, GLenum pname, GLint param)
 {
-	sweeteagl_gen_used(804, "glSamplerParameteri");
+	sweeteagl_gen_used(ctx, 804, "glSamplerParameteri");
 	glSamplerParameteri(sampler, pname, param);
 }
 static void g_SamplerParameteriv(CTX, GLuint sampler, GLenum pname, const GLint *param)
 {
-	sweeteagl_gen_used(805, "glSamplerParameteriv");
+	sweeteagl_gen_used(ctx, 805, "glSamplerParameteriv");
 	glSamplerParameteriv(sampler, pname, param);
 }
 static void g_SamplerParameterf(CTX, GLuint sampler, GLenum pname, GLfloat param)
 {
-	sweeteagl_gen_used(806, "glSamplerParameterf");
+	sweeteagl_gen_used(ctx, 806, "glSamplerParameterf");
 	glSamplerParameterf(sampler, pname, param);
 }
 static void g_SamplerParameterfv(CTX, GLuint sampler, GLenum pname, const GLfloat *param)
 {
-	sweeteagl_gen_used(807, "glSamplerParameterfv");
+	sweeteagl_gen_used(ctx, 807, "glSamplerParameterfv");
 	glSamplerParameterfv(sampler, pname, param);
 }
 static void g_GetSamplerParameteriv(CTX, GLuint sampler, GLenum pname, GLint *params)
 {
-	sweeteagl_gen_used(810, "glGetSamplerParameteriv");
+	sweeteagl_gen_used(ctx, 810, "glGetSamplerParameteriv");
 	glGetSamplerParameteriv(sampler, pname, params);
 }
 static void g_GetSamplerParameterfv(CTX, GLuint sampler, GLenum pname, GLfloat *params)
 {
-	sweeteagl_gen_used(811, "glGetSamplerParameterfv");
+	sweeteagl_gen_used(ctx, 811, "glGetSamplerParameterfv");
 	glGetSamplerParameterfv(sampler, pname, params);
 }
 static void g_ReleaseShaderCompiler(CTX)
 {
-	sweeteagl_gen_used(874, "glReleaseShaderCompiler");
+	sweeteagl_gen_used(ctx, 874, "glReleaseShaderCompiler");
 	glReleaseShaderCompiler();
 }
 static void g_ShaderBinary(CTX, GLsizei count, const GLuint *shaders, GLenum binaryformat, const void *binary, GLsizei length)
 {
-	sweeteagl_gen_used(875, "glShaderBinary");
+	sweeteagl_gen_used(ctx, 875, "glShaderBinary");
 	glShaderBinary(count, shaders, binaryformat, binary, length);
 }
 static void g_GetShaderPrecisionFormat(CTX, GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision)
 {
-	sweeteagl_gen_used(876, "glGetShaderPrecisionFormat");
+	sweeteagl_gen_used(ctx, 876, "glGetShaderPrecisionFormat");
 	glGetShaderPrecisionFormat(shadertype, precisiontype, range, precision);
 }
 static void g_DepthRangef(CTX, GLfloat n, GLfloat f)
 {
-	sweeteagl_gen_used(877, "glDepthRangef");
+	sweeteagl_gen_used(ctx, 877, "glDepthRangef");
 	glDepthRangef(n, f);
 }
 static void g_ClearDepthf(CTX, GLfloat d)
 {
-	sweeteagl_gen_used(878, "glClearDepthf");
+	sweeteagl_gen_used(ctx, 878, "glClearDepthf");
 	glClearDepthf(d);
 }
 static void g_GetProgramBinary(CTX, GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary)
 {
-	sweeteagl_gen_used(887, "glGetProgramBinary");
+	sweeteagl_gen_used(ctx, 887, "glGetProgramBinary");
 	glGetProgramBinary(program, bufSize, length, binaryFormat, binary);
 }
 static void g_ProgramBinary(CTX, GLuint program, GLenum binaryFormat, const void *binary, GLsizei length)
 {
-	sweeteagl_gen_used(888, "glProgramBinary");
+	sweeteagl_gen_used(ctx, 888, "glProgramBinary");
 	glProgramBinary(program, binaryFormat, binary, length);
 }
 static void g_BindTransformFeedback(CTX, GLenum target, GLuint id)
 {
-	sweeteagl_gen_used(904, "glBindTransformFeedback");
+	sweeteagl_gen_used(ctx, 904, "glBindTransformFeedback");
 	glBindTransformFeedback(target, id);
 }
 static void g_GenTransformFeedbacks(CTX, GLsizei n, GLuint *ids)
 {
-	sweeteagl_gen_used(905, "glGenTransformFeedbacks");
+	sweeteagl_gen_used(ctx, 905, "glGenTransformFeedbacks");
 	glGenTransformFeedbacks(n, ids);
 }
 static void g_DeleteTransformFeedbacks(CTX, GLsizei n, const GLuint *ids)
 {
-	sweeteagl_gen_used(906, "glDeleteTransformFeedbacks");
+	sweeteagl_gen_used(ctx, 906, "glDeleteTransformFeedbacks");
 	glDeleteTransformFeedbacks(n, ids);
 }
 static void g_PauseTransformFeedback(CTX)
 {
-	sweeteagl_gen_used(907, "glPauseTransformFeedback");
+	sweeteagl_gen_used(ctx, 907, "glPauseTransformFeedback");
 	glPauseTransformFeedback();
 }
 static void g_ResumeTransformFeedback(CTX)
 {
-	sweeteagl_gen_used(908, "glResumeTransformFeedback");
+	sweeteagl_gen_used(ctx, 908, "glResumeTransformFeedback");
 	glResumeTransformFeedback();
 }
 static GLboolean g_IsTransformFeedback(CTX, GLuint id)
 {
-	sweeteagl_gen_used(909, "glIsTransformFeedback");
+	sweeteagl_gen_used(ctx, 909, "glIsTransformFeedback");
 	return glIsTransformFeedback(id);
 }
 static void g_InvalidateFramebuffer(CTX, GLenum target, GLsizei numAttachments, const GLenum *attachments)
 {
-	sweeteagl_gen_used(1023, "glInvalidateFramebuffer");
+	sweeteagl_gen_used(ctx, 1023, "glInvalidateFramebuffer");
 	glInvalidateFramebuffer(target, numAttachments, attachments);
 }
 static void g_InvalidateSubFramebuffer(CTX, GLenum target, GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y, GLsizei width, GLsizei height)
 {
-	sweeteagl_gen_used(1028, "glInvalidateSubFramebuffer");
+	sweeteagl_gen_used(ctx, 1028, "glInvalidateSubFramebuffer");
 	glInvalidateSubFramebuffer(target, numAttachments, attachments, x, y, width, height);
 }
 static void g_GetInternalformativ(CTX, GLenum target, GLenum internalformat, GLenum pname, GLsizei bufSize, GLint *params)
 {
-	sweeteagl_gen_used(1029, "glGetInternalformativ");
+	sweeteagl_gen_used(ctx, 1029, "glGetInternalformativ");
 	glGetInternalformativ(target, internalformat, pname, bufSize, params);
 }
 static void g_TexStorage2D(CTX, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
 {
-	sweeteagl_gen_used(1031, "glTexStorage2D");
+	sweeteagl_gen_used(ctx, 1031, "glTexStorage2D");
 	glTexStorage2D(target, levels, internalformat, width, height);
 }
 static void g_TexStorage3D(CTX, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
 {
-	sweeteagl_gen_used(1032, "glTexStorage3D");
+	sweeteagl_gen_used(ctx, 1032, "glTexStorage3D");
 	glTexStorage3D(target, levels, internalformat, width, height, depth);
 }
 

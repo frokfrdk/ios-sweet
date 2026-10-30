@@ -30,6 +30,7 @@
  */
 #include <errno.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -102,6 +103,28 @@ static inline struct sweeteagl_priv *
 priv_of(id ctx)
 {
 	return *(struct sweeteagl_priv **)((char *)ctx + private_offset);
+}
+
+#define HEAL_LOG_MAX            8u      /* slot calls that had to make their context current, reported */
+
+void
+sweeteagl_ensure_current(void *ctx)
+{
+	struct sweeteagl_priv *p = ctx;
+	struct sweetgl_context *was = sweetgl_get_current();
+	if (p == NULL || was == p->gl) {
+		return;
+	}
+	atomic_fetch_add_explicit(&sweeteagl_diag.not_current, 1u, memory_order_relaxed);
+	bool ok = sweetgl_make_current(p->gl);
+	static unsigned logged;
+	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < HEAL_LOG_MAX) {
+		uint64_t tid = 0;
+		pthread_threadid_np(NULL, &tid);
+		sweetdrm_say("7.7 eagl: slot call on thread %llu had Mesa context %p, not %p (TSD slot %s): made current -> %s",
+		    (unsigned long long)tid, (void *)was, (void *)p->gl, current_priv() == p ? "has it" : "does not",
+		    ok ? "ok" : "FAILED");
+	}
 }
 
 /* ---- the GPU, opened once ---- */
@@ -356,7 +379,7 @@ m_setCurrentContext(id cls, SEL _cmd, id ctx)
 	if (ctx && p == NULL) {
 		return NO;
 	}
-	if (p == old) {
+	if (p == old && sweetgl_get_current() == (p ? p->gl : NULL)) {
 		return YES;
 	}
 	if (!sweetgl_make_current(p ? p->gl : NULL)) {
@@ -427,12 +450,14 @@ m_getParameter_to(id self, SEL _cmd, int pname, int *value)
 static BOOL
 bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsigned height, const char *how)
 {
-	struct sweeteagl_priv *p = priv_of(self), *old = current_priv();
+	struct sweeteagl_priv *p = priv_of(self);
 	if (p == NULL || surf == NULL || target != GL_TEXTURE_2D) {
 		sweetdrm_say("7.5 eagl: %s: target 0x%x or surface %p refused", how, target, (void *)surf);
 		return NO;
 	}
-	if (old != p) {
+	/* Mesa's own current context decides, not the TSD slot: CA can set that one alone (G6r) */
+	struct sweetgl_context *old = sweetgl_get_current();
+	if (old != p->gl) {
 		sweetgl_make_current(p->gl);
 	}
 	BOOL ok = NO;
@@ -457,8 +482,8 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 			sweetdrm_say("7.5 eagl: %s: GL error 0x%04x pending before it (dropped)", how, before);
 		}
 	}
-	if (old != p) {
-		sweetgl_make_current(old ? old->gl : NULL);
+	if (old != p->gl) {
+		sweetgl_make_current(old);
 	}
 	/* 7.7: which surfaces CA hands us, without a line per frame */
 	static unsigned logged;

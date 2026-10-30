@@ -69,7 +69,7 @@ def main():
         decl = ', '.join(['CTX'] + [p for p, _ in params])
         call = ', '.join(n for _, n in params)
         body = '%s%s(%s);' % ('' if ret == 'void' else 'return ', name, call)
-        w('static %s g_%s(%s)\n{\n\tsweeteagl_gen_used(%d, "%s");\n\t%s\n}\n' % (ret, name[2:], decl, slot, name, body))
+        w('static %s g_%s(%s)\n{\n\tsweeteagl_gen_used(ctx, %d, "%s");\n\t%s\n}\n' % (ret, name[2:], decl, slot, name, body))
     w('\nconst struct sweeteagl_gen_slot sweeteagl_gen_slots[] = {\n')
     for slot, name in chosen:
         w('\t{ %d, (void *)g_%s },\n' % (slot, name[2:]))

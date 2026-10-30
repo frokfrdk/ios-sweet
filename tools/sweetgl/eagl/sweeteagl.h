@@ -47,8 +47,15 @@ struct sweeteagl_gen_slot {
 };
 extern const struct sweeteagl_gen_slot sweeteagl_gen_slots[];
 extern const unsigned sweeteagl_gen_count;
-/* Logs a generated slot's first use, once per slot */
-void sweeteagl_gen_used(unsigned slot, const char *name);
+/* Makes ctx (a slot's first argument) current in Mesa, then logs a generated slot's first use, once per slot */
+void sweeteagl_gen_used(void *ctx, unsigned slot, const char *name);
+
+/*
+ * Makes p's Mesa context current on this thread if it is not (sweeteagl.m).
+ * Every slot calls it first: CA reaches the table on threads where only
+ * OpenGLES's TSD slot names the context.
+ */
+void sweeteagl_ensure_current(void *p);
 
 /* 7.7 diagnostics: counted by the slots (sweeteagl_slots.c), reported by sweeteagl.m's diag thread */
 #ifndef __cplusplus

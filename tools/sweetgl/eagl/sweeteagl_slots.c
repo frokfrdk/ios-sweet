@@ -20,20 +20,19 @@
 #define INFO_LOG_CHARS  240
 
 /*
- * 7.7 diagnostics (G6q drew a black screen with no slot logged): what CA calls,
- * and whether the slot's context is the one current in Mesa on that thread (a
- * gl* call with another or no current context draws nothing).
+ * 7.7 diagnostics (G6q drew a black screen with no slot logged): what CA calls.
+ * G6r showed every call arriving where the slot's context was not current in
+ * Mesa (CA sets the current context without +setCurrentContext:), so every
+ * slot now starts with sweeteagl_ensure_current, which counts those as
+ * not_current and makes the context current.
  */
 struct sweeteagl_diag sweeteagl_diag;
 
 static inline void
 count(atomic_uint *c, void *ctx)
 {
+	(void)ctx;
 	atomic_fetch_add_explicit(c, 1u, memory_order_relaxed);
-	const struct sweeteagl_priv *p = ctx;
-	if (p == NULL || sweetgl_get_current() != p->gl) {
-		atomic_fetch_add_explicit(&sweeteagl_diag.not_current, 1u, memory_order_relaxed);
-	}
 }
 
 static int
@@ -43,28 +42,31 @@ fail_logged(void)
 	return atomic_fetch_add_explicit(&n, 1u, memory_order_relaxed) < FAIL_LOG_MAX;
 }
 
-static void s_BindTexture(CTX, GLenum t, GLuint n) { glBindTexture(t, n); }
-static void s_BlendFunc(CTX, GLenum s, GLenum d) { glBlendFunc(s, d); }
-static void s_Clear(CTX, GLbitfield m) { count(&sweeteagl_diag.clears, ctx); glClear(m); }
-static void s_ClearColor(CTX, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { glClearColor(r, g, b, a); }
+static void s_BindTexture(CTX, GLenum t, GLuint n) { sweeteagl_ensure_current(ctx); glBindTexture(t, n); }
+static void s_BlendFunc(CTX, GLenum s, GLenum d) { sweeteagl_ensure_current(ctx); glBlendFunc(s, d); }
+static void s_Clear(CTX, GLbitfield m) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.clears, ctx); glClear(m); }
+static void s_ClearColor(CTX, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { sweeteagl_ensure_current(ctx); glClearColor(r, g, b, a); }
 static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 {
+	sweeteagl_ensure_current(ctx);
 	glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h);
 }
-static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t) { glDeleteTextures(n, t); }
-static void s_Disable(CTX, GLenum c) { glDisable(c); }
-static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { count(&sweeteagl_diag.draws, ctx); glDrawArrays(m, f, n); }
+static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t) { sweeteagl_ensure_current(ctx); glDeleteTextures(n, t); }
+static void s_Disable(CTX, GLenum c) { sweeteagl_ensure_current(ctx); glDisable(c); }
+static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.draws, ctx); glDrawArrays(m, f, n); }
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
+	sweeteagl_ensure_current(ctx);
 	count(&sweeteagl_diag.draws, ctx);
 	glDrawElements(m, n, t, i);
 }
-static void s_Enable(CTX, GLenum c) { glEnable(c); }
-static void s_Finish(CTX) { count(&sweeteagl_diag.finishes, ctx); glFinish(); }
-static void s_Flush(CTX) { count(&sweeteagl_diag.flushes, ctx); glFlush(); }
-static void s_GenTextures(CTX, GLsizei n, GLuint *t) { glGenTextures(n, t); }
+static void s_Enable(CTX, GLenum c) { sweeteagl_ensure_current(ctx); glEnable(c); }
+static void s_Finish(CTX) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.finishes, ctx); glFinish(); }
+static void s_Flush(CTX) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.flushes, ctx); glFlush(); }
+static void s_GenTextures(CTX, GLsizei n, GLuint *t) { sweeteagl_ensure_current(ctx); glGenTextures(n, t); }
 static GLenum s_GetError(CTX)
 {
+	sweeteagl_ensure_current(ctx);
 	GLenum e = glGetError();
 	if (e != GL_NO_ERROR) {
 		atomic_fetch_add_explicit(&sweeteagl_diag.gl_errors, 1u, memory_order_relaxed);
@@ -72,34 +74,38 @@ static GLenum s_GetError(CTX)
 	}
 	return e;
 }
-static void s_GetIntegerv(CTX, GLenum p, GLint *v) { glGetIntegerv(p, v); }
-static const GLubyte *s_GetString(CTX, GLenum n) { return glGetString(n); }
-static void s_PixelStorei(CTX, GLenum p, GLint v) { glPixelStorei(p, v); }
-static void s_Scissor(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { glScissor(x, y, w, h); }
+static void s_GetIntegerv(CTX, GLenum p, GLint *v) { sweeteagl_ensure_current(ctx); glGetIntegerv(p, v); }
+static const GLubyte *s_GetString(CTX, GLenum n) { sweeteagl_ensure_current(ctx); return glGetString(n); }
+static void s_PixelStorei(CTX, GLenum p, GLint v) { sweeteagl_ensure_current(ctx); glPixelStorei(p, v); }
+static void s_Scissor(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { sweeteagl_ensure_current(ctx); glScissor(x, y, w, h); }
 static void s_TexImage2D(CTX, GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty,
     const void *p)
 {
+	sweeteagl_ensure_current(ctx);
 	glTexImage2D(t, l, ifmt, w, h, b, f, ty, p);
 }
-static void s_TexParameterf(CTX, GLenum t, GLenum p, GLfloat v) { glTexParameterf(t, p, v); }
-static void s_TexParameteri(CTX, GLenum t, GLenum p, GLint v) { glTexParameteri(t, p, v); }
+static void s_TexParameterf(CTX, GLenum t, GLenum p, GLfloat v) { sweeteagl_ensure_current(ctx); glTexParameterf(t, p, v); }
+static void s_TexParameteri(CTX, GLenum t, GLenum p, GLint v) { sweeteagl_ensure_current(ctx); glTexParameteri(t, p, v); }
 static void s_TexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum ty,
     const void *p)
 {
+	sweeteagl_ensure_current(ctx);
 	glTexSubImage2D(t, l, xo, yo, w, h, f, ty, p);
 }
-static void s_Viewport(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { glViewport(x, y, w, h); }
-static void s_BlendFuncSeparate(CTX, GLenum a, GLenum b, GLenum c, GLenum d) { glBlendFuncSeparate(a, b, c, d); }
-static void s_BlendEquation(CTX, GLenum m) { glBlendEquation(m); }
-static void s_ActiveTexture(CTX, GLenum t) { glActiveTexture(t); }
+static void s_Viewport(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { sweeteagl_ensure_current(ctx); glViewport(x, y, w, h); }
+static void s_BlendFuncSeparate(CTX, GLenum a, GLenum b, GLenum c, GLenum d) { sweeteagl_ensure_current(ctx); glBlendFuncSeparate(a, b, c, d); }
+static void s_BlendEquation(CTX, GLenum m) { sweeteagl_ensure_current(ctx); glBlendEquation(m); }
+static void s_ActiveTexture(CTX, GLenum t) { sweeteagl_ensure_current(ctx); glActiveTexture(t); }
 static void s_CompressedTexImage2D(CTX, GLenum t, GLint l, GLenum ifmt, GLsizei w, GLsizei h, GLint b, GLsizei n,
     const void *d)
 {
+	sweeteagl_ensure_current(ctx);
 	glCompressedTexImage2D(t, l, ifmt, w, h, b, n, d);
 }
 /* GL_APPLE_fence's wait for one object: a full finish does that too */
 static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
 {
+	sweeteagl_ensure_current(ctx);
 	(void)o;
 	(void)n;
 	count(&sweeteagl_diag.finishes, ctx);
@@ -107,26 +113,30 @@ static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
 }
 static void s_VertexAttribPointer(CTX, GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p)
 {
+	sweeteagl_ensure_current(ctx);
 	glVertexAttribPointer(i, s, t, n, st, p);
 }
-static void s_EnableVertexAttribArray(CTX, GLuint i) { glEnableVertexAttribArray(i); }
-static void s_DisableVertexAttribArray(CTX, GLuint i) { glDisableVertexAttribArray(i); }
+static void s_EnableVertexAttribArray(CTX, GLuint i) { sweeteagl_ensure_current(ctx); glEnableVertexAttribArray(i); }
+static void s_DisableVertexAttribArray(CTX, GLuint i) { sweeteagl_ensure_current(ctx); glDisableVertexAttribArray(i); }
 /* both glDeleteShader and glDeleteProgram land here; Mesa's names share one space */
 static void s_DeleteShaderOrProgram(CTX, GLuint n)
 {
+	sweeteagl_ensure_current(ctx);
 	if (glIsProgram(n)) {
 		glDeleteProgram(n);
 	} else {
 		glDeleteShader(n);
 	}
 }
-static GLuint s_CreateShader(CTX, GLenum t) { return glCreateShader(t); }
+static GLuint s_CreateShader(CTX, GLenum t) { sweeteagl_ensure_current(ctx); return glCreateShader(t); }
 static void s_ShaderSource(CTX, GLuint s, GLsizei n, const GLchar *const *str, const GLint *len)
 {
+	sweeteagl_ensure_current(ctx);
 	glShaderSource(s, n, str, len);
 }
 static void s_CompileShader(CTX, GLuint s)
 {
+	sweeteagl_ensure_current(ctx);
 	glCompileShader(s);
 	GLint ok = GL_FALSE;
 	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
@@ -140,10 +150,11 @@ static void s_CompileShader(CTX, GLuint s)
 		sweetdrm_say("7.7 eagl: shader %u source starts: %s", s, src);
 	}
 }
-static GLuint s_CreateProgram(CTX) { return glCreateProgram(); }
-static void s_AttachShader(CTX, GLuint p, GLuint s) { glAttachShader(p, s); }
+static GLuint s_CreateProgram(CTX) { sweeteagl_ensure_current(ctx); return glCreateProgram(); }
+static void s_AttachShader(CTX, GLuint p, GLuint s) { sweeteagl_ensure_current(ctx); glAttachShader(p, s); }
 static void s_LinkProgram(CTX, GLuint p)
 {
+	sweeteagl_ensure_current(ctx);
 	glLinkProgram(p);
 	GLint ok = GL_FALSE;
 	glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -154,21 +165,22 @@ static void s_LinkProgram(CTX, GLuint p)
 		sweetdrm_say("7.7 eagl: program %u does not link: %s", p, log);
 	}
 }
-static void s_UseProgram(CTX, GLuint p) { count(&sweeteagl_diag.programs, ctx); glUseProgram(p); }
-static void s_Uniform1f(CTX, GLint l, GLfloat a) { glUniform1f(l, a); }
-static void s_Uniform4f(CTX, GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) { glUniform4f(l, a, b, c, d); }
-static void s_Uniform1i(CTX, GLint l, GLint a) { glUniform1i(l, a); }
-static void s_Uniform3fv(CTX, GLint l, GLsizei n, const GLfloat *v) { glUniform3fv(l, n, v); }
-static void s_Uniform4fv(CTX, GLint l, GLsizei n, const GLfloat *v) { glUniform4fv(l, n, v); }
-static void s_UniformMatrix3fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { glUniformMatrix3fv(l, n, t, v); }
-static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { glUniformMatrix4fv(l, n, t, v); }
-static GLint s_GetUniformLocation(CTX, GLuint p, const GLchar *n) { return glGetUniformLocation(p, n); }
-static void s_BindAttribLocation(CTX, GLuint p, GLuint i, const GLchar *n) { glBindAttribLocation(p, i, n); }
-static void s_BindFramebuffer(CTX, GLenum t, GLuint f) { count(&sweeteagl_diag.fb_binds, ctx); glBindFramebuffer(t, f); }
-static void s_DeleteFramebuffers(CTX, GLsizei n, const GLuint *f) { glDeleteFramebuffers(n, f); }
-static void s_GenFramebuffers(CTX, GLsizei n, GLuint *f) { glGenFramebuffers(n, f); }
+static void s_UseProgram(CTX, GLuint p) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.programs, ctx); glUseProgram(p); }
+static void s_Uniform1f(CTX, GLint l, GLfloat a) { sweeteagl_ensure_current(ctx); glUniform1f(l, a); }
+static void s_Uniform4f(CTX, GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) { sweeteagl_ensure_current(ctx); glUniform4f(l, a, b, c, d); }
+static void s_Uniform1i(CTX, GLint l, GLint a) { sweeteagl_ensure_current(ctx); glUniform1i(l, a); }
+static void s_Uniform3fv(CTX, GLint l, GLsizei n, const GLfloat *v) { sweeteagl_ensure_current(ctx); glUniform3fv(l, n, v); }
+static void s_Uniform4fv(CTX, GLint l, GLsizei n, const GLfloat *v) { sweeteagl_ensure_current(ctx); glUniform4fv(l, n, v); }
+static void s_UniformMatrix3fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { sweeteagl_ensure_current(ctx); glUniformMatrix3fv(l, n, t, v); }
+static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { sweeteagl_ensure_current(ctx); glUniformMatrix4fv(l, n, t, v); }
+static GLint s_GetUniformLocation(CTX, GLuint p, const GLchar *n) { sweeteagl_ensure_current(ctx); return glGetUniformLocation(p, n); }
+static void s_BindAttribLocation(CTX, GLuint p, GLuint i, const GLchar *n) { sweeteagl_ensure_current(ctx); glBindAttribLocation(p, i, n); }
+static void s_BindFramebuffer(CTX, GLenum t, GLuint f) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.fb_binds, ctx); glBindFramebuffer(t, f); }
+static void s_DeleteFramebuffers(CTX, GLsizei n, const GLuint *f) { sweeteagl_ensure_current(ctx); glDeleteFramebuffers(n, f); }
+static void s_GenFramebuffers(CTX, GLsizei n, GLuint *f) { sweeteagl_ensure_current(ctx); glGenFramebuffers(n, f); }
 static void s_FramebufferTexture2D(CTX, GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l)
 {
+	sweeteagl_ensure_current(ctx);
 	glFramebufferTexture2D(t, a, tt, tex, l);
 	GLenum st = glCheckFramebufferStatus(t);
 	if (st != GL_FRAMEBUFFER_COMPLETE) {
@@ -178,11 +190,12 @@ static void s_FramebufferTexture2D(CTX, GLenum t, GLenum a, GLenum tt, GLuint te
 		}
 	}
 }
-static void s_GenerateMipmap(CTX, GLenum t) { glGenerateMipmap(t); }
-static GLsync s_FenceSync(CTX, GLenum c, GLbitfield f) { return glFenceSync(c, f); }
-static void s_DeleteSync(CTX, GLsync s) { glDeleteSync(s); }
+static void s_GenerateMipmap(CTX, GLenum t) { sweeteagl_ensure_current(ctx); glGenerateMipmap(t); }
+static GLsync s_FenceSync(CTX, GLenum c, GLbitfield f) { sweeteagl_ensure_current(ctx); return glFenceSync(c, f); }
+static void s_DeleteSync(CTX, GLsync s) { sweeteagl_ensure_current(ctx); glDeleteSync(s); }
 static GLenum s_ClientWaitSync(CTX, GLsync s, GLbitfield f, GLuint64 t)
 {
+	sweeteagl_ensure_current(ctx);
 	GLenum r = glClientWaitSync(s, f, t);
 	if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
 		atomic_fetch_add_explicit(&sweeteagl_diag.wait_fails, 1u, memory_order_relaxed);
@@ -190,9 +203,9 @@ static GLenum s_ClientWaitSync(CTX, GLsync s, GLbitfield f, GLuint64 t)
 	return r;
 }
 /* debug markers: nothing to do */
-static void s_InsertEventMarkerEXT(CTX, GLsizei n, const GLchar *m) { (void)n; (void)m; }
-static void s_PushGroupMarkerEXT(CTX, GLsizei n, const GLchar *m) { (void)n; (void)m; }
-static void s_PopGroupMarkerEXT(CTX) { }
+static void s_InsertEventMarkerEXT(CTX, GLsizei n, const GLchar *m) { sweeteagl_ensure_current(ctx); (void)n; (void)m; }
+static void s_PushGroupMarkerEXT(CTX, GLsizei n, const GLchar *m) { sweeteagl_ensure_current(ctx); (void)n; (void)m; }
+static void s_PopGroupMarkerEXT(CTX) { sweeteagl_ensure_current(ctx); }
 
 static const struct {
 	uint16_t slot;
@@ -245,8 +258,9 @@ sweeteagl_unknown_slot(unsigned slot)
 }
 
 void
-sweeteagl_gen_used(unsigned slot, const char *name)
+sweeteagl_gen_used(void *ctx, unsigned slot, const char *name)
 {
+	sweeteagl_ensure_current(ctx);
 	atomic_fetch_add_explicit(&sweeteagl_diag.gen_calls, 1u, memory_order_relaxed);
 	if (first_use(slot)) {
 		sweetdrm_say("7.7 eagl: slot %u %s first used (generated wrapper)", slot, name);
