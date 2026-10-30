@@ -57,6 +57,18 @@ void sweeteagl_gen_used(void *ctx, unsigned slot, const char *name);
  */
 void sweeteagl_ensure_current(void *p);
 
+/*
+ * G6w: backboardd still crashed on a freed freedreno batch with the release
+ * flush off, so CA's threads are taken to run Mesa at the same time. Every
+ * slot and every shim method that touches Mesa holds one recursive lock for
+ * its whole call: SWEETEAGL_ENTER(p) takes it (counting contention), makes p
+ * current if p is not NULL, and lets it go when the scope ends.
+ */
+int sweeteagl_enter(void *p);
+void sweeteagl_leave(int *entered);
+#define SWEETEAGL_ENTER(p) \
+	int sweeteagl_entered_ __attribute__((cleanup(sweeteagl_leave), unused)) = sweeteagl_enter(p)
+
 /* 7.7 diagnostics: counted by the slots (sweeteagl_slots.c), reported by sweeteagl.m's diag thread */
 #ifndef __cplusplus
 #include <stdatomic.h>
@@ -67,6 +79,7 @@ struct sweeteagl_diag {
 	atomic_uint gl_errors, last_gl_error;   /* as CA's own glGetError calls saw them */
 	atomic_uint wait_fails;                 /* glClientWaitSync timeouts and failures */
 	atomic_uint gen_calls, unknown_calls;   /* generated-wrapper and stub slots */
+	atomic_uint contended;                  /* SWEETEAGL_ENTER found another thread inside */
 };
 extern struct sweeteagl_diag sweeteagl_diag;
 #endif

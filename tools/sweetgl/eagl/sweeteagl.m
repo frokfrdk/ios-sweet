@@ -128,6 +128,35 @@ sweeteagl_ensure_current(void *ctx)
 	}
 }
 
+#define CONTENTION_LOG_MAX      8u
+
+static pthread_mutex_t gl_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+
+int
+sweeteagl_enter(void *p)
+{
+	if (pthread_mutex_trylock(&gl_lock) != 0) {
+		static unsigned logged;
+		atomic_fetch_add_explicit(&sweeteagl_diag.contended, 1u, memory_order_relaxed);
+		if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < CONTENTION_LOG_MAX) {
+			uint64_t tid = 0;
+			pthread_threadid_np(NULL, &tid);
+			sweetdrm_say("7.7 eagl: thread %llu waits for the GL lock: another thread is in Mesa",
+			    (unsigned long long)tid);
+		}
+		pthread_mutex_lock(&gl_lock);
+	}
+	sweeteagl_ensure_current(p);
+	return 1;
+}
+
+void
+sweeteagl_leave(int *entered)
+{
+	(void)entered;
+	pthread_mutex_unlock(&gl_lock);
+}
+
 /* ---- the GPU, opened once ---- */
 
 static pthread_once_t display_once = PTHREAD_ONCE_INIT;
@@ -241,8 +270,8 @@ diag_thread(void *arg)
 			sweetdrm_say("7.7 diag %us: draw %u clear %u fbbind %u prog %u flush %u finish %u NOTCUR %u", r * DIAG_PERIOD_S,
 			    now[0], now[1], now[2], now[3], now[4], now[5], now[6]);
 			sweetdrm_say("7.7 diag %us: compile %u fail %u link %u fail %u fbinc %u glerr %u (last 0x%x) waitfail %u "
-			    "gen %u unknown %u", r * DIAG_PERIOD_S, now[7], now[8], now[9], now[10], now[11], now[12],
-			    LOAD(last_gl_error), now[13], now[14], now[15]);
+			    "gen %u unknown %u contended %u", r * DIAG_PERIOD_S, now[7], now[8], now[9], now[10], now[11], now[12],
+			    LOAD(last_gl_error), now[13], now[14], now[15], LOAD(contended));
 			memcpy(prev, now, sizeof(prev));
 		}
 		pthread_mutex_lock(&diag_lock);
@@ -310,6 +339,7 @@ init_common(id self, NSUInteger api_arg, id sharegroup)
 		return nil;
 	}
 	/* Mesa gives ES 3.2 for either; the API reported is the one asked for */
+	SWEETEAGL_ENTER(NULL);
 	p->gl = sweetgl_context_create(display, (int)api, 0, NULL);
 	if (p->gl == NULL) {
 		sweetdrm_say("7.5 eagl: no GLES %lu context", (unsigned long)api);
@@ -357,6 +387,7 @@ m_dealloc(id self, SEL _cmd)
 {
 	struct sweeteagl_priv *p = priv_of(self);
 	if (p) {
+		SWEETEAGL_ENTER(NULL);
 		if (current_priv() == p) {
 			/* only reached if the client released the context it had current */
 			tsd()[TSD_EAGL_SLOT] = NULL;
@@ -383,6 +414,7 @@ m_setCurrentContext(id cls, SEL _cmd, id ctx)
 	if (p == old && sweetgl_get_current() == (p ? p->gl : NULL)) {
 		return YES;
 	}
+	SWEETEAGL_ENTER(NULL);
 	if (!sweetgl_make_current(p ? p->gl : NULL)) {
 		sweetdrm_say("7.5 eagl: make current failed");
 		return NO;
@@ -483,6 +515,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		return NO;
 	}
 	/* Mesa's own current context decides, not the TSD slot: CA can set that one alone (G6r) */
+	SWEETEAGL_ENTER(NULL);
 	struct sweetgl_context *old = sweetgl_get_current();
 	if (old != p->gl) {
 		sweetgl_make_current(p->gl);
