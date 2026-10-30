@@ -55,6 +55,7 @@ size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
 size_t IOSurfaceGetWidth(IOSurfaceRef buffer);
 size_t IOSurfaceGetHeight(IOSurfaceRef buffer);
 uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef buffer);
+size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
 
 #define TSD_EAGL_SLOT           30      /* OpenGLES's thread-specific slot for the current priv */
 #define PNAME_MULTITHREADED     0x139
@@ -445,10 +446,12 @@ m_getParameter_to(id self, SEL _cmd, int pname, int *value)
 
 /*
  * Give the texture bound to target on self the surface's pages, width x height
- * pixels from its base address. self is made current for the call if it is not.
+ * pixels of format fourcc from its base address. self is made current for the
+ * call if it is not.
  */
 static BOOL
-bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsigned height, const char *how)
+bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsigned height, uint32_t fourcc,
+    const char *how)
 {
 	struct sweeteagl_priv *p = priv_of(self);
 	if (p == NULL || surf == NULL || target != GL_TEXTURE_2D) {
@@ -461,7 +464,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		sweetgl_make_current(p->gl);
 	}
 	BOOL ok = NO;
-	uint32_t sid = IOSurfaceGetID(surf), fourcc = IOSurfaceGetPixelFormat(surf);
+	uint32_t sid = IOSurfaceGetID(surf);
 	unsigned stride = (unsigned)IOSurfaceGetBytesPerRow(surf);
 	struct sweetgl_image *img = sweetgl_image_from_iosurface(display, sid, IOSurfaceGetBaseAddress(surf), width,
 	    height, stride, fourcc);
@@ -501,8 +504,46 @@ m_attachImage(id self, SEL _cmd, NSUInteger target, IOSurfaceRef surf, BOOL inve
 	if (inverted) {
 		sweetdrm_say("7.5 eagl: attachImage: invertedRender YES is drawn upright");
 	}
+	/* CA's own small render targets carry no pixel format (G6t: 24x28, 4 bytes per element) */
+	uint32_t fourcc = IOSurfaceGetPixelFormat(surf);
+	if (fourcc == 0 && IOSurfaceGetBytesPerElement(surf) == 4) {
+		fourcc = SWEETGL_FOURCC_BGRA;
+	}
 	return bind_iosurface(self, (GLenum)target, surf, (unsigned)IOSurfaceGetWidth(surf),
-	    (unsigned)IOSurfaceGetHeight(surf), "attachImage");
+	    (unsigned)IOSurfaceGetHeight(surf), fourcc, "attachImage");
+}
+
+/*
+ * The fourcc for texImageIOSurface: the surface's own if it has one, else what
+ * the GL format describes at the surface's bytes per element; 0 if neither fits.
+ */
+static uint32_t
+teximage_fourcc(IOSurfaceRef surf, GLenum ifmt, GLenum fmt, GLenum ty)
+{
+	uint32_t own = IOSurfaceGetPixelFormat(surf);
+	size_t bpe = IOSurfaceGetBytesPerElement(surf);
+	if (ty != GL_UNSIGNED_BYTE) {
+		return 0;
+	}
+	if ((fmt == GL_BGRA_EXT || fmt == GL_RGBA) && (ifmt == GL_RGBA || ifmt == GL_BGRA_EXT || ifmt == GL_RGBA8)) {
+		if (own != 0) {
+			return own;
+		}
+		return bpe == 4 ? (fmt == GL_BGRA_EXT ? SWEETGL_FOURCC_BGRA : SWEETGL_FOURCC_RGBA) : 0;
+	}
+	if (fmt != ifmt) {
+		return 0;
+	}
+	if (fmt == GL_LUMINANCE_ALPHA && bpe == 2) {
+		return SWEETGL_FOURCC_LA08;
+	}
+	if (fmt == GL_LUMINANCE && bpe == 1) {
+		return SWEETGL_FOURCC_L008;
+	}
+	if (fmt == GL_ALPHA && bpe == 1) {
+		return SWEETGL_FOURCC_A008;
+	}
+	return 0;
 }
 
 /*
@@ -516,13 +557,13 @@ m_texImageIOSurface(id self, SEL _cmd, IOSurfaceRef surf, NSUInteger target, NSU
 {
 	(void)_cmd;
 	GLenum ifmt = (GLenum)internal_format, fmt = (GLenum)format, ty = (GLenum)type;
-	/* the surface's own format decides; the GL ones must describe 32-bit BGRA or RGBA */
-	if (plane != 0 || ty != GL_UNSIGNED_BYTE || (fmt != GL_BGRA_EXT && fmt != GL_RGBA) ||
-	    (ifmt != GL_RGBA && ifmt != GL_BGRA_EXT && ifmt != GL_RGBA8)) {
-		sweetdrm_say("7.5 eagl: texImageIOSurface: plane %u, formats 0x%x/0x%x/0x%x refused", plane, ifmt, fmt, ty);
+	uint32_t fourcc = plane == 0 ? teximage_fourcc(surf, ifmt, fmt, ty) : 0;
+	if (fourcc == 0) {
+		sweetdrm_say("7.5 eagl: texImageIOSurface: plane %u, formats 0x%x/0x%x/0x%x, %zu bytes per element refused",
+		    plane, ifmt, fmt, ty, IOSurfaceGetBytesPerElement(surf));
 		return NO;
 	}
-	return bind_iosurface(self, (GLenum)target, surf, width, height, "texImageIOSurface");
+	return bind_iosurface(self, (GLenum)target, surf, width, height, fourcc, "texImageIOSurface");
 }
 
 static BOOL

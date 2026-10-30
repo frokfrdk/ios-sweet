@@ -71,6 +71,10 @@ struct sweetgl_image;
 /* IOSurface pixel formats (kIOSurfacePixelFormat) an image can have */
 #define SWEETGL_FOURCC_BGRA     0x42475241u     /* 'BGRA': B8G8R8A8 in memory order */
 #define SWEETGL_FOURCC_RGBA     0x52474241u     /* 'RGBA' */
+/* sampled only (CA's 256x1 curves and masks); a surface without a format gets these from its GL format */
+#define SWEETGL_FOURCC_LA08     0x4c413038u     /* 'LA08': L8A8 */
+#define SWEETGL_FOURCC_L008     0x4c303038u     /* 'L008' */
+#define SWEETGL_FOURCC_A008     0x41303038u     /* 'A008' */
 
 /*
  * Import surface_id (IOSurfaceGetID) as a width x height image with stride bytes

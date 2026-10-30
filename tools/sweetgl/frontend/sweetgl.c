@@ -230,11 +230,20 @@ sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, voi
     unsigned height, unsigned stride, uint32_t fourcc)
 {
 	enum pipe_format format;
+	unsigned bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED;
 	switch (fourcc) {
-	case SWEETGL_FOURCC_BGRA:       format = PIPE_FORMAT_B8G8R8A8_UNORM; break;
-	case SWEETGL_FOURCC_RGBA:       format = PIPE_FORMAT_R8G8B8A8_UNORM; break;
+	case SWEETGL_FOURCC_BGRA:       format = PIPE_FORMAT_B8G8R8A8_UNORM; bind |= PIPE_BIND_RENDER_TARGET; break;
+	case SWEETGL_FOURCC_RGBA:       format = PIPE_FORMAT_R8G8B8A8_UNORM; bind |= PIPE_BIND_RENDER_TARGET; break;
+	case SWEETGL_FOURCC_LA08:       format = PIPE_FORMAT_L8A8_UNORM; break;
+	case SWEETGL_FOURCC_L008:       format = PIPE_FORMAT_L8_UNORM; break;
+	case SWEETGL_FOURCC_A008:       format = PIPE_FORMAT_A8_UNORM; break;
 	default:
-		sweetdrm_say("7.5 image: surface %u has pixel format 0x%08x, not BGRA or RGBA", surface_id, fourcc);
+		sweetdrm_say("7.5 image: surface %u has pixel format 0x%08x, not BGRA, RGBA, LA08, L008 or A008",
+		    surface_id, fourcc);
+		return NULL;
+	}
+	if (!d->fscreen.screen->is_format_supported(d->fscreen.screen, format, PIPE_TEXTURE_2D, 0, 0, bind)) {
+		sweetdrm_say("7.5 image: surface %u: format 0x%08x is not supported for bind 0x%x", surface_id, fourcc, bind);
 		return NULL;
 	}
 	struct sweetgl_image *i = CALLOC_STRUCT(sweetgl_image);
@@ -248,7 +257,7 @@ sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, voi
 		.height0 = height,
 		.depth0 = 1,
 		.array_size = 1,
-		.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED,
+		.bind = bind,
 	};
 	i->res = sweetgl_fd_import_iosurface(d->fscreen.screen, d->fd, surface_id, cpu, &tmpl, stride);
 	if (i->res == NULL) {
