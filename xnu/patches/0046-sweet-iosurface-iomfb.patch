@@ -116,7 +116,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,883 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -131,6 +131,10 @@
 + *   sel 4   lookup by id: scalar [id], struct out = lock result
 + *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
 + *   sel 35  create mach port: scalars [id, options], scalar out [port name]
++ *   sel 6/7 wrap client image / memory: refused, so IOSurfaceWrapClientImage
++ *           returns NULL and CoreAnimation uploads the pixels itself. A
++ *           zeroed lock result made a client with no state page, and
++ *           IOSurfaceClientGetBulkAttachments faulted reading +0x30 of it.
 + *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
 + *           (id, options, &seed), 4/5 release (id)
 + *
@@ -162,6 +166,8 @@
 +enum {
 +	kSweetSurfaceCreate             = 0,
 +	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
 +	kSweetSurfaceLimits             = 13,
 +	kSweetSurfaceLookupFromPort     = 34,
 +	kSweetSurfaceCreatePort         = 35,
@@ -879,6 +885,11 @@
 +		sweet_surf_log_once("sel", selector);
 +		return kIOReturnSuccess;
 +	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory:
++		/* No surfaces over user memory: the caller copies instead (see top). */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
 +	default:
 +		/* Values, notifications, ownership, timestamps...: accept and ignore. */
 +		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
