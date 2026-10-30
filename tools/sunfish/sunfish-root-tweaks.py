@@ -64,9 +64,9 @@ until the app is snapshotted again.
 --sweetwall PKGDIR DYLIB: the layered iOS 16 wallpaper (Stage 7.7). PKGDIR holds
 {Background,Foreground,Floating}.ca from tools/sunfish/sweetwall-pkg.py (the system's 7400 packages
 with PNG assets), installed to /Library/Wallpaper/SweetLayered; DYLIB is libsweetwall.dylib (sweetwall
-CI), installed to /usr/lib. SpringBoard loads it through the boot-arg
-sweetenv=...;SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/libsweetwall.dylib. Keep the --wallpaper
-CPBitmap: it stays underneath.
+CI), installed as /usr/lib/sweetwall.dylib. SpringBoard loads it through the boot-arg
+sweetenv=...;SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/sweetwall.dylib (the short name keeps the
+G7a cmdline + this at 605 of the 607 bytes). Keep the --wallpaper CPBitmap: it stays underneath.
 
 --migrate-once: let DataMigration run on the next boot. The staged system apps
 (/var/staged_system_apps: Calculator, Books, ...; "Waiting..." placeholders)
@@ -182,11 +182,11 @@ if sweetwall:
             os.chmod(p, 0o755 if n in dirs else 0o644)
     os.chown(dst, 0, 0)
     os.chmod(dst, 0o755)
-    path = os.path.join(root, 'usr/lib/libsweetwall.dylib')
+    path = os.path.join(root, 'usr/lib/sweetwall.dylib')
     shutil.copyfile(dylib, path)
     os.chown(path, 0, 0)
     os.chmod(path, 0o755)
-    print(f'sweetwall: {pkgdir} -> /Library/Wallpaper/SweetLayered, {dylib} -> /usr/lib/libsweetwall.dylib')
+    print(f'sweetwall: {pkgdir} -> /Library/Wallpaper/SweetLayered, {dylib} -> /usr/lib/sweetwall.dylib')
 
 if migrate_once:
     rel = 'private/var/mobile/Library/Preferences/com.apple.migration.plist'
