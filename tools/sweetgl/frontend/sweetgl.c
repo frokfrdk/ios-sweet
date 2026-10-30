@@ -172,6 +172,13 @@ sweetgl_context_create(struct sweetgl_display *d, int major, int minor, struct s
 	attribs.visual.color_format = PIPE_FORMAT_NONE;
 	attribs.visual.depth_stencil_format = PIPE_FORMAT_NONE;
 	attribs.visual.accum_format = PIPE_FORMAT_NONE;
+	/*
+	 * No flush when a thread lets go of the context: CA uses one context from
+	 * several threads, and a release on one flushed the batch another was
+	 * still drawing into (G6v: fd_submit_append_bo on a freed submit). CA
+	 * flushes explicitly.
+	 */
+	attribs.flags = ST_CONTEXT_FLAG_RELEASE_NONE;
 
 	enum st_context_error error;
 	c->st = st_api_create_context(&d->fscreen, &attribs, &error, share ? share->st : NULL);
