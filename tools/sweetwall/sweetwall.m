@@ -132,7 +132,7 @@ host_layout(SweetwallHost *h)
 	for (unsigned i = 0; i < NPACKAGES; i++) {
 		CALayer *root = [h->packages[i] rootLayer];
 
-		root.position = CGPointMake(CGRectGetMidX(b) - b.origin.x, CGRectGetMidY(b) - b.origin.y);
+		root.position = CGPointMake(b.size.width / 2, b.size.height / 2);
 		root.transform = CATransform3DMakeScale(k, k, 1.0);
 	}
 	[CATransaction commit];
