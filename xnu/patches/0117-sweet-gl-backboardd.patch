@@ -73,7 +73,7 @@
  #define GS_PTE_PAGE_RW          0xe43ull        /* page, AP read/write, outer shareable, AF, nG, MAIR attr 0 */
  #define GS_PTE_ADDR_MASK        0x0000fffffffff000ull
 -#define GS_MAX_BO               64u
-+#define GS_MAX_BO               512u
++#define GS_MAX_BO               4096u           /* G6u: Mesa in backboardd filled 512 */
  #define GS_BO_MAX_BYTES         (16u << 20)
  #define GS_MAX_IBS              16u
  #define GS_SCRATCH_WORDS        1024u
@@ -131,7 +131,7 @@
  #define SWEET_GPU_PAGE          4096u           /* GPU pages; XNU's are 16 KiB */
  #define SWEET_GPU_BO_MAX        (16u << 20)
 -#define SWEET_GPU_CLIENT_BOS    64u
-+#define SWEET_GPU_CLIENT_BOS    512u            /* 0117: Mesa in backboardd; the service's GS_MAX_BO */
++#define SWEET_GPU_CLIENT_BOS    4096u           /* 0117: Mesa in backboardd; the service's GS_MAX_BO */
  #define SWEET_GPU_WAIT_MAX_MS   10000u
  #define SWEET_GPU_CLOSE_WAIT_MS 2000u
  #define SWEET_GPU_UC_PAUSE_MS   2000u
@@ -146,7 +146,7 @@
  	task_t fTask;
  	IOLock *fLock;
 -	struct sweet_gpu_bo fBOs[SWEET_GPU_CLIENT_BOS];
-+	struct sweet_gpu_bo *fBOs;              /* SWEET_GPU_CLIENT_BOS; 20 KiB, so not inline (classes <= 16 KiB) */
++	struct sweet_gpu_bo *fBOs;              /* SWEET_GPU_CLIENT_BOS; 160 KiB, so not inline (classes <= 16 KiB) */
  	uint32_t fLastSeq;
  	bool fSubmitted;
  	IOMemoryMap *fFenceMap;
