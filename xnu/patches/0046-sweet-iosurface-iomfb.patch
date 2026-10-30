@@ -427,7 +427,7 @@
 +	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 +		return kIOReturnBadArgument;
 +	}
-+	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * ((sweet_div_up(s->height, s->elementHeight) + 3u) & ~3u); /* Mesa pads to 4 rows */
 +
 +	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 +	s->planeCount = 0;
