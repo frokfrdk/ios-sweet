@@ -116,7 +116,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,886 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -421,6 +421,9 @@
 +	}
 +	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
 +	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	/* The GPU imports surfaces as linear textures, whose rows must be 64-byte aligned (CA asks for 96). */
++	s->bytesPerRow = (uint32_t)(((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++	    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
 +	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 +		return kIOReturnBadArgument;
 +	}
