@@ -16,9 +16,36 @@
 
 #define CTX     void *ctx __attribute__((unused))
 
+#define FAIL_LOG_MAX    8u      /* shader, program and framebuffer failures reported */
+#define INFO_LOG_CHARS  240
+
+/*
+ * 7.7 diagnostics (G6q drew a black screen with no slot logged): what CA calls,
+ * and whether the slot's context is the one current in Mesa on that thread (a
+ * gl* call with another or no current context draws nothing).
+ */
+struct sweeteagl_diag sweeteagl_diag;
+
+static inline void
+count(atomic_uint *c, void *ctx)
+{
+	atomic_fetch_add_explicit(c, 1u, memory_order_relaxed);
+	const struct sweeteagl_priv *p = ctx;
+	if (p == NULL || sweetgl_get_current() != p->gl) {
+		atomic_fetch_add_explicit(&sweeteagl_diag.not_current, 1u, memory_order_relaxed);
+	}
+}
+
+static int
+fail_logged(void)
+{
+	static atomic_uint n;
+	return atomic_fetch_add_explicit(&n, 1u, memory_order_relaxed) < FAIL_LOG_MAX;
+}
+
 static void s_BindTexture(CTX, GLenum t, GLuint n) { glBindTexture(t, n); }
 static void s_BlendFunc(CTX, GLenum s, GLenum d) { glBlendFunc(s, d); }
-static void s_Clear(CTX, GLbitfield m) { glClear(m); }
+static void s_Clear(CTX, GLbitfield m) { count(&sweeteagl_diag.clears, ctx); glClear(m); }
 static void s_ClearColor(CTX, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { glClearColor(r, g, b, a); }
 static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 {
@@ -26,13 +53,25 @@ static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLin
 }
 static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t) { glDeleteTextures(n, t); }
 static void s_Disable(CTX, GLenum c) { glDisable(c); }
-static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { glDrawArrays(m, f, n); }
-static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i) { glDrawElements(m, n, t, i); }
+static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { count(&sweeteagl_diag.draws, ctx); glDrawArrays(m, f, n); }
+static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
+{
+	count(&sweeteagl_diag.draws, ctx);
+	glDrawElements(m, n, t, i);
+}
 static void s_Enable(CTX, GLenum c) { glEnable(c); }
-static void s_Finish(CTX) { glFinish(); }
-static void s_Flush(CTX) { glFlush(); }
+static void s_Finish(CTX) { count(&sweeteagl_diag.finishes, ctx); glFinish(); }
+static void s_Flush(CTX) { count(&sweeteagl_diag.flushes, ctx); glFlush(); }
 static void s_GenTextures(CTX, GLsizei n, GLuint *t) { glGenTextures(n, t); }
-static GLenum s_GetError(CTX) { return glGetError(); }
+static GLenum s_GetError(CTX)
+{
+	GLenum e = glGetError();
+	if (e != GL_NO_ERROR) {
+		atomic_fetch_add_explicit(&sweeteagl_diag.gl_errors, 1u, memory_order_relaxed);
+		atomic_store_explicit(&sweeteagl_diag.last_gl_error, e, memory_order_relaxed);
+	}
+	return e;
+}
 static void s_GetIntegerv(CTX, GLenum p, GLint *v) { glGetIntegerv(p, v); }
 static const GLubyte *s_GetString(CTX, GLenum n) { return glGetString(n); }
 static void s_PixelStorei(CTX, GLenum p, GLint v) { glPixelStorei(p, v); }
@@ -59,7 +98,13 @@ static void s_CompressedTexImage2D(CTX, GLenum t, GLint l, GLenum ifmt, GLsizei 
 	glCompressedTexImage2D(t, l, ifmt, w, h, b, n, d);
 }
 /* GL_APPLE_fence's wait for one object: a full finish does that too */
-static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n) { (void)o; (void)n; glFinish(); }
+static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
+{
+	(void)o;
+	(void)n;
+	count(&sweeteagl_diag.finishes, ctx);
+	glFinish();
+}
 static void s_VertexAttribPointer(CTX, GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p)
 {
 	glVertexAttribPointer(i, s, t, n, st, p);
@@ -80,11 +125,36 @@ static void s_ShaderSource(CTX, GLuint s, GLsizei n, const GLchar *const *str, c
 {
 	glShaderSource(s, n, str, len);
 }
-static void s_CompileShader(CTX, GLuint s) { glCompileShader(s); }
+static void s_CompileShader(CTX, GLuint s)
+{
+	glCompileShader(s);
+	GLint ok = GL_FALSE;
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	atomic_fetch_add_explicit(ok ? &sweeteagl_diag.compiles : &sweeteagl_diag.compile_fails, 1u,
+	    memory_order_relaxed);
+	if (!ok && fail_logged()) {
+		char log[INFO_LOG_CHARS + 1] = "", src[INFO_LOG_CHARS + 1] = "";
+		glGetShaderInfoLog(s, sizeof(log), NULL, log);
+		glGetShaderSource(s, sizeof(src), NULL, src);
+		sweetdrm_say("7.7 eagl: shader %u does not compile: %s", s, log);
+		sweetdrm_say("7.7 eagl: shader %u source starts: %s", s, src);
+	}
+}
 static GLuint s_CreateProgram(CTX) { return glCreateProgram(); }
 static void s_AttachShader(CTX, GLuint p, GLuint s) { glAttachShader(p, s); }
-static void s_LinkProgram(CTX, GLuint p) { glLinkProgram(p); }
-static void s_UseProgram(CTX, GLuint p) { glUseProgram(p); }
+static void s_LinkProgram(CTX, GLuint p)
+{
+	glLinkProgram(p);
+	GLint ok = GL_FALSE;
+	glGetProgramiv(p, GL_LINK_STATUS, &ok);
+	atomic_fetch_add_explicit(ok ? &sweeteagl_diag.links : &sweeteagl_diag.link_fails, 1u, memory_order_relaxed);
+	if (!ok && fail_logged()) {
+		char log[INFO_LOG_CHARS + 1] = "";
+		glGetProgramInfoLog(p, sizeof(log), NULL, log);
+		sweetdrm_say("7.7 eagl: program %u does not link: %s", p, log);
+	}
+}
+static void s_UseProgram(CTX, GLuint p) { count(&sweeteagl_diag.programs, ctx); glUseProgram(p); }
 static void s_Uniform1f(CTX, GLint l, GLfloat a) { glUniform1f(l, a); }
 static void s_Uniform4f(CTX, GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) { glUniform4f(l, a, b, c, d); }
 static void s_Uniform1i(CTX, GLint l, GLint a) { glUniform1i(l, a); }
@@ -94,17 +164,31 @@ static void s_UniformMatrix3fv(CTX, GLint l, GLsizei n, GLboolean t, const GLflo
 static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { glUniformMatrix4fv(l, n, t, v); }
 static GLint s_GetUniformLocation(CTX, GLuint p, const GLchar *n) { return glGetUniformLocation(p, n); }
 static void s_BindAttribLocation(CTX, GLuint p, GLuint i, const GLchar *n) { glBindAttribLocation(p, i, n); }
-static void s_BindFramebuffer(CTX, GLenum t, GLuint f) { glBindFramebuffer(t, f); }
+static void s_BindFramebuffer(CTX, GLenum t, GLuint f) { count(&sweeteagl_diag.fb_binds, ctx); glBindFramebuffer(t, f); }
 static void s_DeleteFramebuffers(CTX, GLsizei n, const GLuint *f) { glDeleteFramebuffers(n, f); }
 static void s_GenFramebuffers(CTX, GLsizei n, GLuint *f) { glGenFramebuffers(n, f); }
 static void s_FramebufferTexture2D(CTX, GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l)
 {
 	glFramebufferTexture2D(t, a, tt, tex, l);
+	GLenum st = glCheckFramebufferStatus(t);
+	if (st != GL_FRAMEBUFFER_COMPLETE) {
+		atomic_fetch_add_explicit(&sweeteagl_diag.fb_incomplete, 1u, memory_order_relaxed);
+		if (fail_logged()) {
+			sweetdrm_say("7.7 eagl: framebuffer incomplete 0x%04x after texture %u at 0x%04x", st, tex, a);
+		}
+	}
 }
 static void s_GenerateMipmap(CTX, GLenum t) { glGenerateMipmap(t); }
 static GLsync s_FenceSync(CTX, GLenum c, GLbitfield f) { return glFenceSync(c, f); }
 static void s_DeleteSync(CTX, GLsync s) { glDeleteSync(s); }
-static GLenum s_ClientWaitSync(CTX, GLsync s, GLbitfield f, GLuint64 t) { return glClientWaitSync(s, f, t); }
+static GLenum s_ClientWaitSync(CTX, GLsync s, GLbitfield f, GLuint64 t)
+{
+	GLenum r = glClientWaitSync(s, f, t);
+	if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
+		atomic_fetch_add_explicit(&sweeteagl_diag.wait_fails, 1u, memory_order_relaxed);
+	}
+	return r;
+}
 /* debug markers: nothing to do */
 static void s_InsertEventMarkerEXT(CTX, GLsizei n, const GLchar *m) { (void)n; (void)m; }
 static void s_PushGroupMarkerEXT(CTX, GLsizei n, const GLchar *m) { (void)n; (void)m; }
@@ -153,6 +237,7 @@ first_use(unsigned slot)
 long
 sweeteagl_unknown_slot(unsigned slot)
 {
+	atomic_fetch_add_explicit(&sweeteagl_diag.unknown_calls, 1u, memory_order_relaxed);
 	if (first_use(slot)) {
 		sweetdrm_say("7.5 eagl: slot %u called, which the shim does not implement (returns 0)", slot);
 	}
@@ -162,6 +247,7 @@ sweeteagl_unknown_slot(unsigned slot)
 void
 sweeteagl_gen_used(unsigned slot, const char *name)
 {
+	atomic_fetch_add_explicit(&sweeteagl_diag.gen_calls, 1u, memory_order_relaxed);
 	if (first_use(slot)) {
 		sweetdrm_say("7.7 eagl: slot %u %s first used (generated wrapper)", slot, name);
 	}

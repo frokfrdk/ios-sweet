@@ -50,6 +50,20 @@ extern const unsigned sweeteagl_gen_count;
 /* Logs a generated slot's first use, once per slot */
 void sweeteagl_gen_used(unsigned slot, const char *name);
 
+/* 7.7 diagnostics: counted by the slots (sweeteagl_slots.c), reported by sweeteagl.m's diag thread */
+#ifndef __cplusplus
+#include <stdatomic.h>
+struct sweeteagl_diag {
+	atomic_uint draws, clears, fb_binds, programs, flushes, finishes;
+	atomic_uint not_current;                /* counted calls whose slot context was not Mesa's current one */
+	atomic_uint compiles, compile_fails, links, link_fails, fb_incomplete;
+	atomic_uint gl_errors, last_gl_error;   /* as CA's own glGetError calls saw them */
+	atomic_uint wait_fails;                 /* glClientWaitSync timeouts and failures */
+	atomic_uint gen_calls, unknown_calls;   /* generated-wrapper and stub slots */
+};
+extern struct sweeteagl_diag sweeteagl_diag;
+#endif
+
 /* The generated stubs (sweeteagl_stubs.S): stub i loads i and calls this, which logs once and returns 0 */
 extern const uint32_t sweeteagl_unknown_stubs[SWEETEAGL_SLOTS * 2u];
 long sweeteagl_unknown_slot(unsigned slot);

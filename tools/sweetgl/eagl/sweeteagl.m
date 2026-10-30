@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
 
@@ -59,6 +60,10 @@ uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef buffer);
 #define SWEETEAGL_WAIT_S        300u    /* for SweetGPU; G6o published it ~260 s after launchd */
 #define BIND_LOG_MAX            16u     /* IOSurface binds reported */
 #define CONTEXT_LOG_MAX         4u      /* contexts reported */
+#define DIAG_SURFACES           4u      /* bound surfaces whose pixels the diag thread samples */
+#define DIAG_PERIOD_S           5u
+#define DIAG_REPORTS            120u    /* 10 minutes */
+#define DIAG_GRID               16u     /* samples per row and per column */
 
 /* bsd/sys/kern_memorystatus.h (private): only to log the jetsam limit the process runs under */
 #define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES        8
@@ -143,6 +148,109 @@ open_display(void)
 	sweetdrm_say("7.5 eagl: display \"%s\"", sweetgl_display_name(display));
 }
 
+/*
+ * ---- 7.7 diagnostics ----
+ * Every DIAG_PERIOD_S a thread logs the slot counters (when they changed) and
+ * samples the pixels of the surfaces CA bound, read through their CPU
+ * mapping: the GPU renders into those pages, and MDP scans them out. The
+ * surfaces are retained so their pages stay mapped while sampled.
+ */
+
+static pthread_mutex_t diag_lock = PTHREAD_MUTEX_INITIALIZER;
+static IOSurfaceRef diag_surf[DIAG_SURFACES];
+static uint32_t diag_surf_id[DIAG_SURFACES];
+
+static void
+diag_record_surface(IOSurfaceRef surf, uint32_t sid)
+{
+	pthread_mutex_lock(&diag_lock);
+	for (unsigned k = 0; k < DIAG_SURFACES; k++) {
+		if (diag_surf[k] != NULL && diag_surf_id[k] == sid) {
+			break;
+		}
+		if (diag_surf[k] == NULL) {
+			CFRetain(surf);
+			diag_surf[k] = surf;
+			diag_surf_id[k] = sid;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&diag_lock);
+}
+
+/* nonzero samples of a DIAG_GRID x DIAG_GRID grid, and the centre pixel */
+static unsigned
+diag_sample(IOSurfaceRef surf, uint32_t *centre)
+{
+	const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+	size_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf), bpr = IOSurfaceGetBytesPerRow(surf);
+	*centre = 0;
+	if (base == NULL || w == 0 || h == 0) {
+		return 0;
+	}
+	unsigned nonzero = 0;
+	for (unsigned y = 0; y < DIAG_GRID; y++) {
+		for (unsigned x = 0; x < DIAG_GRID; x++) {
+			size_t px = (2 * x + 1) * w / (2 * DIAG_GRID), py = (2 * y + 1) * h / (2 * DIAG_GRID);
+			nonzero += *(const volatile uint32_t *)(base + py * bpr + px * 4) != 0;
+		}
+	}
+	*centre = *(const volatile uint32_t *)(base + (h / 2) * bpr + (w / 2) * 4);
+	return nonzero;
+}
+
+#define LOAD(f) atomic_load_explicit(&sweeteagl_diag.f, memory_order_relaxed)
+
+static void *
+diag_thread(void *arg)
+{
+	(void)arg;
+	unsigned prev[16] = { 0 }, prev_nz[DIAG_SURFACES], prev_c[DIAG_SURFACES];
+	memset(prev_nz, 0xff, sizeof(prev_nz));
+	memset(prev_c, 0xff, sizeof(prev_c));
+	for (unsigned r = 1; r <= DIAG_REPORTS; r++) {
+		sleep(DIAG_PERIOD_S);
+		unsigned now[16] = { LOAD(draws), LOAD(clears), LOAD(fb_binds), LOAD(programs), LOAD(flushes),
+		    LOAD(finishes), LOAD(not_current), LOAD(compiles), LOAD(compile_fails), LOAD(links), LOAD(link_fails),
+		    LOAD(fb_incomplete), LOAD(gl_errors), LOAD(wait_fails), LOAD(gen_calls), LOAD(unknown_calls) };
+		if (memcmp(now, prev, sizeof(now)) != 0 || r == 1) {
+			sweetdrm_say("7.7 diag %us: draw %u clear %u fbbind %u prog %u flush %u finish %u NOTCUR %u", r * DIAG_PERIOD_S,
+			    now[0], now[1], now[2], now[3], now[4], now[5], now[6]);
+			sweetdrm_say("7.7 diag %us: compile %u fail %u link %u fail %u fbinc %u glerr %u (last 0x%x) waitfail %u "
+			    "gen %u unknown %u", r * DIAG_PERIOD_S, now[7], now[8], now[9], now[10], now[11], now[12],
+			    LOAD(last_gl_error), now[13], now[14], now[15]);
+			memcpy(prev, now, sizeof(prev));
+		}
+		pthread_mutex_lock(&diag_lock);
+		for (unsigned k = 0; k < DIAG_SURFACES && diag_surf[k] != NULL; k++) {
+			uint32_t c;
+			unsigned nz = diag_sample(diag_surf[k], &c);
+			if (nz != prev_nz[k] || c != prev_c[k]) {
+				sweetdrm_say("7.7 diag %us: surface %u: %u/%u samples nonzero, centre 0x%08x", r * DIAG_PERIOD_S,
+				    diag_surf_id[k], nz, DIAG_GRID * DIAG_GRID, c);
+				prev_nz[k] = nz;
+				prev_c[k] = c;
+			}
+		}
+		pthread_mutex_unlock(&diag_lock);
+	}
+	sweetdrm_say("7.7 diag: done after %u reports", DIAG_REPORTS);
+	return NULL;
+}
+
+static void
+diag_start(void)
+{
+	pthread_t t;
+	if (pthread_create(&t, NULL, diag_thread, NULL) == 0) {
+		pthread_detach(t);
+	} else {
+		sweetdrm_say("7.7 diag: no thread");
+	}
+}
+
+static pthread_once_t diag_once = PTHREAD_ONCE_INIT;
+
 /* ---- EAGLContext's methods ---- */
 
 static id
@@ -190,6 +298,7 @@ init_common(id self, NSUInteger api_arg, id sharegroup)
 	p->gli_ctx = p;
 	sweeteagl_fill_table(p->fn);
 	*(struct sweeteagl_priv **)((char *)self + private_offset) = p;
+	pthread_once(&diag_once, diag_start);
 	static unsigned logged;
 	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < CONTEXT_LOG_MAX) {
 		sweetdrm_say("7.7 eagl: context %p API %u, footprint %u MB", (void *)self, api, footprint_mb());
@@ -339,7 +448,9 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		/* the texture now holds the resource */
 		sweetgl_image_destroy(img);
 		ok = e == GL_NO_ERROR;
-		if (!ok) {
+		if (ok) {
+			diag_record_surface(surf, sid);
+		} else {
 			sweetdrm_say("7.5 eagl: %s: surface %u: GL error 0x%04x", how, sid, e);
 		}
 		if (before != GL_NO_ERROR) {
