@@ -74,7 +74,8 @@
  #define GS_PTE_ADDR_MASK        0x0000fffffffff000ull
 -#define GS_MAX_BO               64u
 +#define GS_MAX_BO               4096u           /* G6u: Mesa in backboardd filled 512 */
- #define GS_BO_MAX_BYTES         (16u << 20)
+-#define GS_BO_MAX_BYTES         (16u << 20)
++#define GS_BO_MAX_BYTES         (32u << 20)     /* G6w: CA asked for a 2216x2216 RGBA texture, 20 MiB */
  #define GS_MAX_IBS              16u
  #define GS_SCRATCH_WORDS        1024u
 @@ -1485,7 +1491,11 @@ gs_clocks(void)
@@ -129,7 +130,8 @@
 @@ -96,12 +97,12 @@ enum {
  
  #define SWEET_GPU_PAGE          4096u           /* GPU pages; XNU's are 16 KiB */
- #define SWEET_GPU_BO_MAX        (16u << 20)
+-#define SWEET_GPU_BO_MAX        (16u << 20)
++#define SWEET_GPU_BO_MAX        (32u << 20)     /* the service's GS_BO_MAX_BYTES */
 -#define SWEET_GPU_CLIENT_BOS    64u
 +#define SWEET_GPU_CLIENT_BOS    4096u           /* 0117: Mesa in backboardd; the service's GS_MAX_BO */
  #define SWEET_GPU_WAIT_MAX_MS   10000u
