@@ -1,0 +1,34 @@
+name: sweetwall
+
+# Stage 7.7: libsweetwall.dylib, the layered iOS 16 wallpaper played in
+# SpringBoard on the legacy wallpaper path (tools/sweetwall/sweetwall.m).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/sweetwall/**"
+      - ".github/workflows/sweetwall.yml"
+
+jobs:
+  build:
+    # same Xcode / iPhoneOS SDK as sweetgl.yml
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          bash tools/sweetwall/build.sh out
+          # links no private class or symbol
+          if nm -u out/libsweetwall.dylib | grep -E 'CAPackage|CAStateController|kCAPackage'; then
+            echo "private QuartzCore symbol linked (above)"; exit 1
+          fi
+          otool -L out/libsweetwall.dylib
+          (cd out && shasum -a 256 libsweetwall.dylib > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetwall
+          path: out/

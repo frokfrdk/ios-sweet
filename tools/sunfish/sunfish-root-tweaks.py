@@ -54,6 +54,20 @@ CPBitmap alone the lock and home screen were full white:
   directly every time (PBUIScrollableStaticWallpaperView already returns NO).
 The kernel accepts the changed cache pages (no AMFI, so no CS_KILL). Already-patched bytes are left alone.
 
+SplashBoard snapshots, one 4-byte patch in dyld_shared_cache_arm64.31 (0x5bfbedc). The app switcher card
+showed only its left part: snapshots are saved as JPEG when the device "supports ASTC", and a JPEG
+decodes to a 420f IOSurface whose BGRA conversion needs the missing AppleM2ScalerCSCDriver (a strong
+inference from the format and the drawn part, not a proven cause). The store of the cached
+supportsASTC answer becomes strb wzr: NO, so snapshots are PNG. Snapshots already on disk stay JPEG
+until the app is snapshotted again.
+
+--sweetwall PKGDIR DYLIB: the layered iOS 16 wallpaper (Stage 7.7). PKGDIR holds
+{Background,Foreground,Floating}.ca from tools/sunfish/sweetwall-pkg.py (the system's 7400 packages
+with PNG assets), installed to /Library/Wallpaper/SweetLayered; DYLIB is libsweetwall.dylib (sweetwall
+CI), installed to /usr/lib. SpringBoard loads it through the boot-arg
+sweetenv=...;SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/libsweetwall.dylib. Keep the --wallpaper
+CPBitmap: it stays underneath.
+
 --migrate-once: let DataMigration run on the next boot. The staged system apps
 (/var/staged_system_apps: Calculator, Books, ...; "Waiting..." placeholders)
 are installed by SystemAppMigrator.migrator, which only runs during migration;
@@ -65,11 +79,12 @@ with none of them, and they wait on missing hardware and daemons
 holding the whole boot. App staging also needs the kernel's HFS+ clonefile copy
 fallback (xnu patch 0091).
 """
-import os, plistlib, struct, sys
+import os, plistlib, shutil, struct, sys
 
 root = sys.argv[1]
 migrate_once = '--migrate-once' in sys.argv[2:]
 wallpaper = sys.argv[sys.argv.index('--wallpaper') + 1] if '--wallpaper' in sys.argv else None
+sweetwall = sys.argv[sys.argv.index('--sweetwall') + 1:][:2] if '--sweetwall' in sys.argv else None
 
 PREFS = {'CUIAllowDebugPrefs': True, 'CUIAllowHardwareRendering': False}
 TARGETS = [  # (path, uid, gid)
@@ -117,20 +132,24 @@ os.chown(path, st.st_uid, st.st_gid)
 os.chmod(path, st.st_mode & 0o7777)
 print(f'{rel}: {off} disabled')
 
-rel = 'System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.15'
-DSC_PATCHES = [  # (file offset, original, patched, what)
-    (0x115c3bc, 'f44fbea9fd7b01a9', '20008052c0035fd6', 'workaround_alwaysForceNoTreatment -> YES'),
-    (0x115ba34, '20008052c0035fd6', '00008052c0035fd6', '+_canCacheImages -> NO'),
+DSC_PATCHES = [  # (cache file, file offset, original, patched, what)
+    ('dyld_shared_cache_arm64.15', 0x115c3bc, 'f44fbea9fd7b01a9', '20008052c0035fd6',
+     'PBUIStaticWallpaperView workaround_alwaysForceNoTreatment -> YES'),
+    ('dyld_shared_cache_arm64.15', 0x115ba34, '20008052c0035fd6', '00008052c0035fd6',
+     'PBUIStaticWallpaperView +_canCacheImages -> NO'),
+    ('dyld_shared_cache_arm64.31', 0x5bfbedc, '0041093920b70df0', '1f41093920b70df0',
+     'SplashBoard supportsASTC -> NO (PNG snapshots)'),
 ]
-with open(os.path.join(root, rel), 'r+b') as f:
-    for at, old, new, what in DSC_PATCHES:
+for name, at, old, new, what in DSC_PATCHES:
+    rel = 'System/Library/Caches/com.apple.dyld/' + name
+    with open(os.path.join(root, rel), 'r+b') as f:
         f.seek(at)
-        cur = f.read(8).hex()
+        cur = f.read(len(old) // 2).hex()
         assert cur in (old, new), f'{rel} +{at:#x}: {cur} is neither {old} nor {new} (not 20H392?)'
         if cur == old:
             f.seek(at)
             f.write(bytes.fromhex(new))
-        print(f'{rel} +{at:#x}: PBUIStaticWallpaperView {what} ({"patched" if cur == old else "already patched"})')
+    print(f'{rel} +{at:#x}: {what} ({"patched" if cur == old else "already patched"})')
 
 if wallpaper:
     sbdir = os.path.join(root, 'private/var/mobile/Library/SpringBoard')
@@ -145,6 +164,29 @@ if wallpaper:
         os.chown(path, 501, 501)
         os.chmod(path, 0o644)
     print(f'wallpaper: {wallpaper} -> {sbdir}/{{Lock,Home}}Background.cpbitmap ({len(data)} bytes)')
+
+if sweetwall:
+    pkgdir, dylib = sweetwall
+    dst = os.path.join(root, 'Library/Wallpaper/SweetLayered')
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst)
+    for name in ('Background', 'Foreground', 'Floating'):
+        src = os.path.join(pkgdir, name + '.ca')
+        assert os.path.exists(os.path.join(src, 'main.caml')), f'{src}: no main.caml (make it with sweetwall-pkg.py)'
+        shutil.copytree(src, os.path.join(dst, name + '.ca'))
+    for d, dirs, files in os.walk(dst):
+        for n in dirs + files:
+            p = os.path.join(d, n)
+            os.chown(p, 0, 0)
+            os.chmod(p, 0o755 if n in dirs else 0o644)
+    os.chown(dst, 0, 0)
+    os.chmod(dst, 0o755)
+    path = os.path.join(root, 'usr/lib/libsweetwall.dylib')
+    shutil.copyfile(dylib, path)
+    os.chown(path, 0, 0)
+    os.chmod(path, 0o755)
+    print(f'sweetwall: {pkgdir} -> /Library/Wallpaper/SweetLayered, {dylib} -> /usr/lib/libsweetwall.dylib')
 
 if migrate_once:
     rel = 'private/var/mobile/Library/Preferences/com.apple.migration.plist'
