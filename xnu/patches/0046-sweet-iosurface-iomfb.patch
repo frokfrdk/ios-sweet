@@ -48,7 +48,7 @@
  bool
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +/*
 + * Built-in IOSurface for SWEET (see SweetSurface.cpp).
 + *
@@ -86,8 +86,9 @@
 +	uint32_t cacheMode, planeCount, parentID;
 +	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
 +
-+	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	IOMemoryDescriptor       *memory;       /* pixels (buffer, physical or the creator's pages) */
 +	IOOptionBits              mapCache;     /* cache mode for user mappings */
++	bool                      clientWired;  /* memory is the creator's pages, prepared until free */
 +	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 +	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
 +
@@ -116,7 +117,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,933 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -127,7 +128,9 @@
 + *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
 + *           +0 offset alignment mask, +4 bytes-per-row alignment mask
 + *   sel 0   create: scalar [parent id], struct in = serialized property
-+ *           dictionary (binary or XML), struct out = lock result (0xa68)
++ *           dictionary (binary or XML), struct out = lock result (0xa68).
++ *           With IOSurfaceAddress the surface is the caller's own pages
++ *           (wired), or a copy of them if they cannot be wired.
 + *   sel 4   lookup by id: scalar [id], struct out = lock result
 + *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
 + *   sel 35  create mach port: scalars [id, options], scalar out [port name]
@@ -209,6 +212,9 @@
 +		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
 +	}
 +	OSSafeReleaseNULL(kernelMap);
++	if (clientWired) {
++		memory->complete();
++	}
 +	OSSafeReleaseNULL(memory);
 +	OSSafeReleaseNULL(state);
 +	OSObject::free();
@@ -223,7 +229,7 @@
 +	}
 +	IOLockLock(sweet_surface_lock);
 +	if (kernelMap == NULL && memory != NULL) {
-+		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(mapCache);
 +	}
 +	IOLockUnlock(sweet_surface_lock);
 +	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
@@ -800,7 +806,34 @@
 +	}
 +	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
 +	ret = sweet_surface_layout(s, props);
-+	if (ret == kIOReturnSuccess) {
++	OSNumber *addrKey = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	uint64_t client = addrKey != NULL ? addrKey->unsigned64BitValue() : 0;
++	const char *how = "";
++	if (ret == kIOReturnSuccess && client != 0) {
++		/*
++		 * kIOSurfaceClientAddress: the surface is the caller's own memory.
++		 * CA::Render::Image::retain_iosurface passes its pixels this way
++		 * (page aligned) and never writes them again, so a fresh buffer
++		 * stays empty (G6z: every 128x128 icon tile sampled as zeros).
++		 * Wire those pages; failing that, copy them into a buffer below.
++		 */
++		IOMemoryDescriptor *mem = NULL;
++		if ((client & PAGE_MASK) == 0) {
++			mem = IOMemoryDescriptor::withAddressRange(client, s->allocSize, kIODirectionInOut, fTask);
++		}
++		if (mem != NULL && mem->prepare(kIODirectionInOut) == kIOReturnSuccess) {
++			s->memory = mem;
++			s->clientWired = true;
++			s->mapCache = kIOMapDefaultCache;
++			how = " wrapped";
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		} else {
++			OSSafeReleaseNULL(mem);
++		}
++	}
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
 +		IOBufferMemoryDescriptor *mem = NULL;
 +		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 +		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
@@ -812,6 +845,20 @@
 +			ret = kIOReturnNoMemory;
 +		} else {
 +			bzero(mem->getBytesNoCopy(), s->allocSize);
++			if (client != 0) {
++				/* The pixels end at bytesPerRow * height; the 4-row padding may not be mapped. */
++				uint64_t len = (uint64_t)s->bytesPerRow * s->height;
++				IOMemoryDescriptor *src = len <= s->allocSize ?
++				    IOMemoryDescriptor::withAddressRange(client, len, kIODirectionOut, fTask) : NULL;
++				how = " copy failed";
++				if (src != NULL && src->prepare(kIODirectionOut) == kIOReturnSuccess) {
++					if (src->readBytes(0, mem->getBytesNoCopy(), len) == len) {
++						how = " copied";
++					}
++					src->complete();
++				}
++				OSSafeReleaseNULL(src);
++			}
 +			s->memory = mem;
 +			s->mapCache = kIOMapDefaultCache;
 +			if (!sweet_surface_publish(s)) {
@@ -819,13 +866,14 @@
 +			}
 +		}
 +	}
-+	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64 ||
++	    (client != 0 && sweet_surface_creates_logged < 96)) {
 +		char name[32];
 +		proc_selfname(name, sizeof(name));
 +		sweet_surface_creates_logged++;
-+		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u%s -> 0x%x\n",
 +		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
-+		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), how, ret);
 +	}
 +	props->release();
 +	if (ret != kIOReturnSuccess) {
