@@ -42,17 +42,92 @@ fail_logged(void)
 	return atomic_fetch_add_explicit(&n, 1u, memory_order_relaxed) < FAIL_LOG_MAX;
 }
 
-static void s_BindTexture(CTX, GLenum t, GLuint n) { sweeteagl_ensure_current(ctx); glBindTexture(t, n); }
+/*
+ * G6v: an error (0x0500) was pending before attachImage, from a call nobody
+ * checked, and the app icons stay invisible. So the texture and state calls
+ * below check glGetError afterwards and log the first failures with their
+ * arguments; the first uploads are logged too. A caught error is held for
+ * CA's own glGetError.
+ */
+#define UPLOAD_LOG_MAX  24u
+#define ERROR_LOG_MAX   16u
+
+static _Thread_local GLenum held_error;
+static atomic_uint logged_errors;
+
+static int
+under(atomic_uint *n, unsigned max)
+{
+	return atomic_fetch_add_explicit(n, 1u, memory_order_relaxed) < max;
+}
+
+/* before a checked call: hold an unchecked call's error, so it is not blamed on this one */
+static void
+drain(const char *call)
+{
+	GLenum err = glGetError();
+	if (err == GL_NO_ERROR) {
+		return;
+	}
+	if (held_error == GL_NO_ERROR) {
+		held_error = err;
+	}
+	if (under(&logged_errors, ERROR_LOG_MAX)) {
+		sweetdrm_say("7.7 eagl: GL error 0x%04x pending before %s, from an unchecked call", err, call);
+	}
+}
+
+static void
+checked(const char *call, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned f)
+{
+	GLenum err = glGetError();
+	if (err == GL_NO_ERROR) {
+		return;
+	}
+	if (held_error == GL_NO_ERROR) {
+		held_error = err;
+	}
+	if (under(&logged_errors, ERROR_LOG_MAX)) {
+		sweetdrm_say("7.7 eagl: %s(0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x) -> GL error 0x%04x", call, a, b, c, d, e, f, err);
+	}
+}
+
+static void
+upload_logged(const char *call, GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLenum f, GLenum ty)
+{
+	static atomic_uint logged_uploads;
+	if (under(&logged_uploads, UPLOAD_LOG_MAX)) {
+		sweetdrm_say("7.7 eagl: %s target 0x%x level %d ifmt 0x%x %dx%d format 0x%x type 0x%x", call, t, l, ifmt, w, h,
+		    f, ty);
+	}
+}
+
+static void s_BindTexture(CTX, GLenum t, GLuint n)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("BindTexture");
+	glBindTexture(t, n);
+	checked("BindTexture", t, n, 0, 0, 0, 0);
+}
 static void s_BlendFunc(CTX, GLenum s, GLenum d) { sweeteagl_ensure_current(ctx); glBlendFunc(s, d); }
 static void s_Clear(CTX, GLbitfield m) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.clears, ctx); glClear(m); }
 static void s_ClearColor(CTX, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { sweeteagl_ensure_current(ctx); glClearColor(r, g, b, a); }
 static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 {
 	sweeteagl_ensure_current(ctx);
+	drain("CopyTexSubImage2D");
+	upload_logged("CopyTexSubImage2D", t, l, 0, w, h, 0, 0);
 	glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h);
+	checked("CopyTexSubImage2D", t, l, xo, yo, w, h);
 }
 static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t) { sweeteagl_ensure_current(ctx); glDeleteTextures(n, t); }
-static void s_Disable(CTX, GLenum c) { sweeteagl_ensure_current(ctx); glDisable(c); }
+static void s_Disable(CTX, GLenum c)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("Disable");
+	glDisable(c);
+	checked("Disable", c, 0, 0, 0, 0, 0);
+}
 static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.draws, ctx); glDrawArrays(m, f, n); }
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
@@ -60,14 +135,24 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	count(&sweeteagl_diag.draws, ctx);
 	glDrawElements(m, n, t, i);
 }
-static void s_Enable(CTX, GLenum c) { sweeteagl_ensure_current(ctx); glEnable(c); }
+static void s_Enable(CTX, GLenum c)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("Enable");
+	glEnable(c);
+	checked("Enable", c, 0, 0, 0, 0, 0);
+}
 static void s_Finish(CTX) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.finishes, ctx); glFinish(); }
 static void s_Flush(CTX) { sweeteagl_ensure_current(ctx); count(&sweeteagl_diag.flushes, ctx); glFlush(); }
 static void s_GenTextures(CTX, GLsizei n, GLuint *t) { sweeteagl_ensure_current(ctx); glGenTextures(n, t); }
 static GLenum s_GetError(CTX)
 {
 	sweeteagl_ensure_current(ctx);
-	GLenum e = glGetError();
+	GLenum e = held_error;
+	held_error = GL_NO_ERROR;
+	if (e == GL_NO_ERROR) {
+		e = glGetError();
+	}
 	if (e != GL_NO_ERROR) {
 		atomic_fetch_add_explicit(&sweeteagl_diag.gl_errors, 1u, memory_order_relaxed);
 		atomic_store_explicit(&sweeteagl_diag.last_gl_error, e, memory_order_relaxed);
@@ -76,21 +161,45 @@ static GLenum s_GetError(CTX)
 }
 static void s_GetIntegerv(CTX, GLenum p, GLint *v) { sweeteagl_ensure_current(ctx); glGetIntegerv(p, v); }
 static const GLubyte *s_GetString(CTX, GLenum n) { sweeteagl_ensure_current(ctx); return glGetString(n); }
-static void s_PixelStorei(CTX, GLenum p, GLint v) { sweeteagl_ensure_current(ctx); glPixelStorei(p, v); }
+static void s_PixelStorei(CTX, GLenum p, GLint v)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("PixelStorei");
+	glPixelStorei(p, v);
+	checked("PixelStorei", p, (unsigned)v, 0, 0, 0, 0);
+}
 static void s_Scissor(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { sweeteagl_ensure_current(ctx); glScissor(x, y, w, h); }
 static void s_TexImage2D(CTX, GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty,
     const void *p)
 {
 	sweeteagl_ensure_current(ctx);
+	drain("TexImage2D");
+	upload_logged("TexImage2D", t, l, ifmt, w, h, f, ty);
 	glTexImage2D(t, l, ifmt, w, h, b, f, ty, p);
+	checked("TexImage2D", t, (unsigned)ifmt, (unsigned)w, (unsigned)h, f, ty);
 }
-static void s_TexParameterf(CTX, GLenum t, GLenum p, GLfloat v) { sweeteagl_ensure_current(ctx); glTexParameterf(t, p, v); }
-static void s_TexParameteri(CTX, GLenum t, GLenum p, GLint v) { sweeteagl_ensure_current(ctx); glTexParameteri(t, p, v); }
+static void s_TexParameterf(CTX, GLenum t, GLenum p, GLfloat v)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("TexParameterf");
+	glTexParameterf(t, p, v);
+	checked("TexParameterf", t, p, (unsigned)(v * 1000.0f), 0, 0, 0);
+}
+static void s_TexParameteri(CTX, GLenum t, GLenum p, GLint v)
+{
+	sweeteagl_ensure_current(ctx);
+	drain("TexParameteri");
+	glTexParameteri(t, p, v);
+	checked("TexParameteri", t, p, (unsigned)v, 0, 0, 0);
+}
 static void s_TexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum ty,
     const void *p)
 {
 	sweeteagl_ensure_current(ctx);
+	drain("TexSubImage2D");
+	upload_logged("TexSubImage2D", t, l, 0, w, h, f, ty);
 	glTexSubImage2D(t, l, xo, yo, w, h, f, ty, p);
+	checked("TexSubImage2D", t, (unsigned)l, (unsigned)w, (unsigned)h, f, ty);
 }
 static void s_Viewport(CTX, GLint x, GLint y, GLsizei w, GLsizei h) { sweeteagl_ensure_current(ctx); glViewport(x, y, w, h); }
 static void s_BlendFuncSeparate(CTX, GLenum a, GLenum b, GLenum c, GLenum d) { sweeteagl_ensure_current(ctx); glBlendFuncSeparate(a, b, c, d); }
@@ -100,7 +209,10 @@ static void s_CompressedTexImage2D(CTX, GLenum t, GLint l, GLenum ifmt, GLsizei 
     const void *d)
 {
 	sweeteagl_ensure_current(ctx);
+	drain("CompressedTexImage2D");
+	upload_logged("CompressedTexImage2D", t, l, (GLint)ifmt, w, h, 0, (GLenum)n);
 	glCompressedTexImage2D(t, l, ifmt, w, h, b, n, d);
+	checked("CompressedTexImage2D", t, ifmt, (unsigned)w, (unsigned)h, (unsigned)n, 0);
 }
 /* GL_APPLE_fence's wait for one object: a full finish does that too */
 static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
