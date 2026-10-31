@@ -51,6 +51,10 @@ void sweetdrm_set_backend(const struct sweetdrm_backend *backend);
  */
 int sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *handle, uint64_t *size);
 
+/* The newest seqno submitted so far (0 before the first submit), and whether seq has retired */
+uint32_t sweetdrm_last_submitted(void);
+int sweetdrm_seq_retired(uint32_t seq);
+
 /* One log line to stderr and the backend's report (the kernel log on iOS, selector 16) */
 void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

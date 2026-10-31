@@ -56,6 +56,7 @@ static struct sweetdrm_info info;
 static bool opened;
 static dev_t null_rdev;
 static uint32_t next_queue_id;
+static uint32_t last_submitted;         /* newest seqno submitted */
 static struct bo *bos;
 static uint32_t nbos, cap;
 
@@ -413,6 +414,7 @@ submit(struct drm_msm_gem_submit *r)
 		e = be->submit(ib, n, &seq);
 	}
 	if (seq) {
+		last_submitted = seq;
 		/* also after a partial failure: what did go out must be waited for */
 		for (uint32_t i = 0; i < r->nr_bos; i++) {
 			struct bo *b = find(sb[i].handle);
@@ -571,6 +573,21 @@ sweetdrm_munmap(void *addr, size_t length)
 	}
 	pthread_mutex_unlock(&lock);
 	return ours ? 0 : munmap(addr, length);  /* ours stays mapped until GEM_CLOSE */
+}
+
+uint32_t
+sweetdrm_last_submitted(void)
+{
+	pthread_mutex_lock(&lock);
+	uint32_t seq = last_submitted;
+	pthread_mutex_unlock(&lock);
+	return seq;
+}
+
+int
+sweetdrm_seq_retired(uint32_t seq)
+{
+	return opened && retired(seq);
 }
 
 int

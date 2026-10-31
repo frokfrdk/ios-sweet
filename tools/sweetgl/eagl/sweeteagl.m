@@ -56,6 +56,9 @@ size_t IOSurfaceGetWidth(IOSurfaceRef buffer);
 size_t IOSurfaceGetHeight(IOSurfaceRef buffer);
 uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef buffer);
 size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
+void IOSurfaceIncrementUseCount(IOSurfaceRef buffer);
+void IOSurfaceDecrementUseCount(IOSurfaceRef buffer);
+Boolean IOSurfaceIsInUse(IOSurfaceRef buffer);
 
 #define TSD_EAGL_SLOT           30      /* OpenGLES's thread-specific slot for the current priv */
 #define PNAME_MULTITHREADED     0x139
@@ -276,6 +279,8 @@ diag_sample(IOSurfaceRef surf, uint32_t *centre)
 
 #define LOAD(f) atomic_load_explicit(&sweeteagl_diag.f, memory_order_relaxed)
 
+static void use_reap(void);
+
 static void *
 diag_thread(void *arg)
 {
@@ -285,6 +290,7 @@ diag_thread(void *arg)
 	memset(prev_c, 0xff, sizeof(prev_c));
 	for (unsigned r = 1; r <= DIAG_REPORTS; r++) {
 		sleep(DIAG_PERIOD_S);
+		use_reap();     /* in case CA stops flushing: release what has retired */
 		unsigned now[16] = { LOAD(draws), LOAD(clears), LOAD(fb_binds), LOAD(programs), LOAD(flushes),
 		    LOAD(finishes), LOAD(not_current), LOAD(compiles), LOAD(compile_fails), LOAD(links), LOAD(link_fails),
 		    LOAD(fb_incomplete), LOAD(gl_errors), LOAD(wait_fails), LOAD(gen_calls), LOAD(unknown_calls) };
@@ -325,6 +331,95 @@ diag_start(void)
 }
 
 static pthread_once_t diag_once = PTHREAD_ONCE_INIT;
+
+/*
+ * ---- 7.7 IOSurface use counts (G7i) ----
+ * Apple's GPU driver keeps a surface "in use" while queued GPU work reads or
+ * writes it, and CA's clients check that (IOSurfaceIsInUse) before they draw
+ * into a backing store in place. Nothing did that here, so a client could
+ * redraw a label or widget while the GPU had yet to sample it, and CA, which
+ * only redraws damaged regions, kept the torn result on screen. A bound
+ * surface now holds a use count until the seqno submitted by the first flush
+ * after the bind has retired.
+ */
+#define USE_TRACK_MAX           512u
+#define USE_LOG_POW2            1u      /* stats at powers of two of the binds */
+
+struct use_entry {
+	IOSurfaceRef surf;
+	uint32_t seq;                   /* 0 = no flush since the bind */
+	bool flushed;                   /* a flush came; seq 0 then means nothing was ever submitted */
+};
+static pthread_mutex_t use_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct use_entry use_track[USE_TRACK_MAX];
+static unsigned use_n;
+static unsigned use_binds, use_busy_at_bind, use_full, use_released;
+
+/* use_lock held: drop the entries whose work has retired */
+static void
+use_reap_locked(void)
+{
+	unsigned k = 0;
+	for (unsigned i = 0; i < use_n; i++) {
+		struct use_entry e = use_track[i];
+		if (e.flushed && (e.seq == 0 || sweetdrm_seq_retired(e.seq))) {
+			IOSurfaceDecrementUseCount(e.surf);
+			CFRelease(e.surf);
+			use_released++;
+		} else {
+			use_track[k++] = e;
+		}
+	}
+	use_n = k;
+}
+
+static void
+use_hold(IOSurfaceRef surf)
+{
+	pthread_mutex_lock(&use_lock);
+	use_binds++;
+	if (IOSurfaceIsInUse(surf)) {
+		use_busy_at_bind++;
+	}
+	use_reap_locked();
+	if (use_n < USE_TRACK_MAX) {
+		CFRetain(surf);
+		IOSurfaceIncrementUseCount(surf);
+		use_track[use_n++] = (struct use_entry){ surf, 0, false };
+	} else {
+		use_full++;
+	}
+	unsigned b = use_binds, busy = use_busy_at_bind, full = use_full, rel = use_released, n = use_n;
+	pthread_mutex_unlock(&use_lock);
+	if ((b & (b - 1)) == 0 && b >= USE_LOG_POW2) {
+		sweetdrm_say("7.7 eagl: use counts: %u binds, %u already in use at bind, %u held now, %u released, %u untracked (full)",
+		    b, busy, n, rel, full);
+	}
+}
+
+void
+sweeteagl_after_flush(void)
+{
+	uint32_t seq = sweetdrm_last_submitted();
+	pthread_mutex_lock(&use_lock);
+	for (unsigned i = 0; i < use_n; i++) {
+		if (!use_track[i].flushed) {
+			/* the newest submit covers everything CA queued before this flush */
+			use_track[i].seq = seq;
+			use_track[i].flushed = true;
+		}
+	}
+	use_reap_locked();
+	pthread_mutex_unlock(&use_lock);
+}
+
+static void
+use_reap(void)
+{
+	pthread_mutex_lock(&use_lock);
+	use_reap_locked();
+	pthread_mutex_unlock(&use_lock);
+}
 
 /* ---- EAGLContext's methods ---- */
 
@@ -557,6 +652,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		sweetgl_image_destroy(img);
 		ok = e == GL_NO_ERROR;
 		if (ok) {
+			use_hold(surf);
 			diag_record_surface(surf, sid);
 			/* G6w: icon-sized RGBA surfaces bind fine but the icons stay invisible; is there anything in them? */
 			static unsigned sampled;

@@ -142,8 +142,8 @@ static void s_Enable(CTX, GLenum c)
 	glEnable(c);
 	checked("Enable", c, 0, 0, 0, 0, 0);
 }
-static void s_Finish(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.finishes, ctx); glFinish(); }
-static void s_Flush(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.flushes, ctx); glFlush(); }
+static void s_Finish(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.finishes, ctx); glFinish(); sweeteagl_after_flush(); }
+static void s_Flush(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.flushes, ctx); glFlush(); sweeteagl_after_flush(); }
 static void s_GenTextures(CTX, GLsizei n, GLuint *t) { SWEETEAGL_ENTER(ctx); glGenTextures(n, t); }
 static GLenum s_GetError(CTX)
 {
@@ -222,6 +222,7 @@ static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
 	(void)n;
 	count(&sweeteagl_diag.finishes, ctx);
 	glFinish();
+	sweeteagl_after_flush();
 }
 static void s_VertexAttribPointer(CTX, GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p)
 {

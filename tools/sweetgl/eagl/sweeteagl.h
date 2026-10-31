@@ -82,6 +82,13 @@ struct sweeteagl_diag {
 	atomic_uint contended;                  /* SWEETEAGL_ENTER found another thread inside */
 };
 extern struct sweeteagl_diag sweeteagl_diag;
+
+/*
+ * After glFlush/glFinish (GL lock held): the IOSurfaces bound since the last
+ * flush stay "in use" until the seqno submitted by now has retired; ones whose
+ * work has retired are released. See use_track in sweeteagl.m.
+ */
+void sweeteagl_after_flush(void);
 #endif
 
 /* The generated stubs (sweeteagl_stubs.S): stub i loads i and calls this, which logs once and returns 0 */
