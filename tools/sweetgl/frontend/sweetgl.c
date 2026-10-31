@@ -7,6 +7,7 @@
  */
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "sweetgl.h"
 #include "sweetdrm.h"
@@ -27,14 +28,37 @@ static const driOptionDescription fd_driconf[] = {
 #include "freedreno/driinfo_freedreno.h"
 };
 
+/*
+ * G7f: one resource per IOSurface. freedreno orders batches through the
+ * resource (its write_batch and readers), so a surface CA draws into in one
+ * batch and samples in another must be the same pipe_resource each time it
+ * is bound; a fresh import per bind let the sampling batch run before the
+ * drawing one (stale or half-drawn layers on screen). The cache's reference
+ * keeps the import, and so the surface's pages, alive: an entry nothing else
+ * holds is dropped after SURF_IDLE_NS, and the least recently used one goes
+ * when all SURF_CACHE slots are taken.
+ */
+#define SURF_CACHE      48u
+#define SURF_IDLE_NS    2000000000ull
+
+struct surf_entry {
+	struct pipe_resource *res;      /* NULL: free slot */
+	uint32_t id, fourcc;
+	void *cpu;
+	unsigned width, height, stride;
+	uint64_t used_ns;
+};
+
 struct sweetgl_display {
 	/* first, so the st's fscreen pointer is the display */
 	struct pipe_frontend_screen fscreen;
 	driOptionCache options_info, options;
 	int fd;
-	/* the live images, so a stale GLeglImageOES is refused rather than followed */
+	/* the live images, so a stale GLeglImageOES is refused rather than followed; also guards surfs */
 	pthread_mutex_t images_lock;
 	struct sweetgl_image *images;
+	struct surf_entry surfs[SURF_CACHE];
+	unsigned surf_hits, surf_misses, surf_drops;
 };
 
 struct sweetgl_context {
@@ -146,6 +170,9 @@ sweetgl_display_close(struct sweetgl_display *d)
 	while (d->images) {
 		sweetgl_image_destroy(d->images);
 	}
+	for (unsigned k = 0; k < SURF_CACHE; k++) {
+		pipe_resource_reference(&d->surfs[k].res, NULL);
+	}
 	pthread_mutex_destroy(&d->images_lock);
 	/* the st's per-screen state, made by the first context */
 	st_screen_destroy(&d->fscreen);
@@ -232,6 +259,59 @@ void (*sweetgl_get_proc_address(const char *name))(void)
 	return _mesa_glapi_get_proc_address(name);
 }
 
+static uint64_t
+now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* images_lock held. The entry for this surface, after dropping idle entries; NULL if none */
+static struct surf_entry *
+surf_find(struct sweetgl_display *d, uint32_t id, uint32_t fourcc, void *cpu, unsigned width, unsigned height,
+    unsigned stride, uint64_t now)
+{
+	struct surf_entry *hit = NULL;
+	for (unsigned k = 0; k < SURF_CACHE; k++) {
+		struct surf_entry *e = &d->surfs[k];
+		if (e->res == NULL) {
+			continue;
+		}
+		if (e->id == id && e->fourcc == fourcc && e->cpu == cpu && e->width == width && e->height == height &&
+		    e->stride == stride) {
+			hit = e;
+		} else if (p_atomic_read(&e->res->reference.count) == 1 && now - e->used_ns > SURF_IDLE_NS) {
+			pipe_resource_reference(&e->res, NULL);
+			d->surf_drops++;
+		}
+	}
+	return hit;
+}
+
+/* images_lock held: a free slot, else the least recently used one */
+static void
+surf_insert(struct sweetgl_display *d, struct pipe_resource *res, uint32_t id, uint32_t fourcc, void *cpu,
+    unsigned width, unsigned height, unsigned stride, uint64_t now)
+{
+	struct surf_entry *slot = &d->surfs[0];
+	for (unsigned k = 0; k < SURF_CACHE; k++) {
+		if (d->surfs[k].res == NULL) {
+			slot = &d->surfs[k];
+			break;
+		}
+		if (d->surfs[k].used_ns < slot->used_ns) {
+			slot = &d->surfs[k];
+		}
+	}
+	if (slot->res != NULL) {
+		d->surf_drops++;
+	}
+	pipe_resource_reference(&slot->res, res);
+	*slot = (struct surf_entry){ .res = slot->res, .id = id, .fourcc = fourcc, .cpu = cpu, .width = width,
+		.height = height, .stride = stride, .used_ns = now };
+}
+
 struct sweetgl_image *
 sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, void *cpu, unsigned width,
     unsigned height, unsigned stride, uint32_t fourcc)
@@ -258,6 +338,20 @@ sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, voi
 	if (i == NULL) {
 		return NULL;
 	}
+	uint64_t now = now_ns();
+	pthread_mutex_lock(&d->images_lock);
+	struct surf_entry *e = surf_find(d, surface_id, fourcc, cpu, width, height, stride, now);
+	if (e != NULL) {
+		pipe_resource_reference(&i->res, e->res);
+		e->used_ns = now;
+		d->surf_hits++;
+		i->display = d;
+		i->next = d->images;
+		d->images = i;
+		pthread_mutex_unlock(&d->images_lock);
+		return i;
+	}
+	pthread_mutex_unlock(&d->images_lock);
 	struct pipe_resource tmpl = {
 		.target = PIPE_TEXTURE_2D,
 		.format = format,
@@ -274,6 +368,18 @@ sweetgl_image_from_iosurface(struct sweetgl_display *d, uint32_t surface_id, voi
 	}
 	i->display = d;
 	pthread_mutex_lock(&d->images_lock);
+	/* another thread may have imported it meanwhile: keep the first, so there is still one resource */
+	e = surf_find(d, surface_id, fourcc, cpu, width, height, stride, now);
+	if (e != NULL) {
+		pipe_resource_reference(&i->res, e->res);
+	} else {
+		surf_insert(d, i->res, surface_id, fourcc, cpu, width, height, stride, now);
+	}
+	d->surf_misses++;
+	if ((d->surf_misses & (d->surf_misses - 1)) == 0) {
+		sweetdrm_say("7.7 image: surface cache: %u hits, %u imports, %u dropped", d->surf_hits, d->surf_misses,
+		    d->surf_drops);
+	}
 	i->next = d->images;
 	d->images = i;
 	pthread_mutex_unlock(&d->images_lock);
