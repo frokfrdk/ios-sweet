@@ -32,7 +32,8 @@ aborts in -[NUNIAegirRenderer getOrCreateUniformBufferforFrameBufferIndex:]
 With Autobahn off SpringBoard uses the PaperBoardUI legacy wallpaper path,
 which draws plain images with CoreAnimation.
 
---wallpaper FILE.cpbitmap: legacy wallpaper for lock and home screen. PaperBoardUI's
+--wallpaper FILE.cpbitmap [--home-wallpaper FILE.cpbitmap]: legacy wallpaper for lock and home screen
+(the home screen gets the second file if given). PaperBoardUI's
 directory data store reads ~mobile/Library/SpringBoard/{Lock,Home}Background
 .cpbitmap with AppSupport's CPBitmapCreateImagesFromData, which needs a real
 CPBitmap (trailer magic; there is no ImageIO fallback, a PNG stays black):
@@ -64,7 +65,8 @@ until the app is snapshotted again.
 --sweetwall PKGDIR DYLIB: the layered iOS 16 wallpaper (Stage 7.7). PKGDIR holds
 {Background,Foreground,Floating}.ca from tools/sunfish/sweetwall-pkg.py (the system's 7400 packages
 with PNG assets), installed to /Library/Wallpaper/SweetLayered; DYLIB is libsweetwall.dylib (sweetwall
-CI), installed as /usr/lib/sweetwall.dylib. SpringBoard loads it through the boot-arg
+CI), installed as /usr/lib/sweetwall.dylib. Tried on G7b (2026-10-31): the owner saw it flash between the
+static wallpaper and the layered one, and dropped it for static 7400 images (--wallpaper / --home-wallpaper). SpringBoard loads it through the boot-arg
 sweetenv=...;SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/sweetwall.dylib (the short name keeps the
 G7a cmdline + this at 605 of the 607 bytes). Keep the --wallpaper CPBitmap: it stays underneath.
 
@@ -84,6 +86,7 @@ import os, plistlib, shutil, struct, sys
 root = sys.argv[1]
 migrate_once = '--migrate-once' in sys.argv[2:]
 wallpaper = sys.argv[sys.argv.index('--wallpaper') + 1] if '--wallpaper' in sys.argv else None
+home_wallpaper = sys.argv[sys.argv.index('--home-wallpaper') + 1] if '--home-wallpaper' in sys.argv else wallpaper
 sweetwall = sys.argv[sys.argv.index('--sweetwall') + 1:][:2] if '--sweetwall' in sys.argv else None
 
 PREFS = {'CUIAllowDebugPrefs': True, 'CUIAllowHardwareRendering': False}
@@ -153,17 +156,17 @@ for name, at, old, new, what in DSC_PATCHES:
 
 if wallpaper:
     sbdir = os.path.join(root, 'private/var/mobile/Library/SpringBoard')
-    with open(wallpaper, 'rb') as f:
-        data = f.read()
-    assert struct.unpack('<I', data[-4:])[0] in (0xDCB543A2, 0xCBA43291), \
-        f'{wallpaper}: not a CPBitmap (convert it with png2cpbitmap.py)'
-    for name in ('LockBackground.cpbitmap', 'HomeBackground.cpbitmap'):
+    for name, src in (('LockBackground.cpbitmap', wallpaper), ('HomeBackground.cpbitmap', home_wallpaper)):
+        with open(src, 'rb') as f:
+            data = f.read()
+        assert struct.unpack('<I', data[-4:])[0] in (0xDCB543A2, 0xCBA43291), \
+            f'{src}: not a CPBitmap (convert it with png2cpbitmap.py)'
         path = os.path.join(sbdir, name)
         with open(path, 'wb') as f:
             f.write(data)
         os.chown(path, 501, 501)
         os.chmod(path, 0o644)
-    print(f'wallpaper: {wallpaper} -> {sbdir}/{{Lock,Home}}Background.cpbitmap ({len(data)} bytes)')
+        print(f'wallpaper: {src} -> {sbdir}/{name} ({len(data)} bytes)')
 
 if sweetwall:
     pkgdir, dylib = sweetwall
