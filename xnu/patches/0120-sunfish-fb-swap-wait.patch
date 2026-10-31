@@ -1,0 +1,104 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -223,6 +223,7 @@
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	bool          fPresenting;    /* 0120: the vsync loop is copying a swapped frame */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -280,6 +281,19 @@
+ static uint64_t sweet_fb_sync_n, sweet_fb_sync_abs, sweet_fb_sync_max, sweet_fb_sync_late, sweet_fb_sync_forced;
+ static uint32_t sweet_fb_sync_streak;
+ 
++/*
++ * 0120 (sweetfb_swapwait): SwapEnd only records a frame and the vsync loop
++ * copies it later, but nothing told CA when that copy was done (SwapWait
++ * returned at once, no swap-complete notifications), so CA could draw the
++ * next frame into a surface the copy was still reading or had not read yet:
++ * GMEM bins (with tiling) or triangles (sysmem) of the next frame showed up.
++ * A swap now waits (1 ms polls, 50 ms cap) until the previous frame has been
++ * copied, which is when a real display releases the old buffer.
++ */
++#define SWEET_FB_SWAP_WAIT_MS   50u
++static int sweet_fb_swapwait = 1;
++static uint64_t sweet_fb_swapwait_n, sweet_fb_swapwait_ms, sweet_fb_swapwait_max, sweet_fb_swapwait_late;
++
+ /* 8a.2 (sweetfb_gpucopy=1): see the comment at the top; one AppleCLCD, its vsync work loop only */
+ #define SWEET_FB_GPU_PAGE       4096u           /* GPU pages; XNU's are 16 KiB */
+ #define SWEET_FB_GPU_IMPORTS    3u
+@@ -424,6 +438,12 @@
+ 		    sweet_fb_sync_n, wavg / 1000, wmax / 1000, sweet_fb_sync_late, sweet_fb_sync_forced);
+ 		sweet_fb_sync_n = sweet_fb_sync_abs = sweet_fb_sync_max = sweet_fb_sync_late = sweet_fb_sync_forced = 0;
+ 	}
++	if (sweet_fb_swapwait_n != 0 || sweet_fb_swapwait_late != 0) {
++		IOLog("SWEET FBSWAP: %llu swaps waited/5s, %llu ms in all, max %llu ms, %llu gave up after %u ms\n",
++		    sweet_fb_swapwait_n, sweet_fb_swapwait_ms, sweet_fb_swapwait_max, sweet_fb_swapwait_late,
++		    SWEET_FB_SWAP_WAIT_MS);
++		sweet_fb_swapwait_n = sweet_fb_swapwait_ms = sweet_fb_swapwait_max = sweet_fb_swapwait_late = 0;
++	}
+ }
+ 
+ /* 0119: wait for the GPU before a present reads surfaces; false if it is still busy */
+@@ -580,6 +600,7 @@
+ 	PE_parse_boot_argn("sweetfbstat", &sweet_fb_stat, sizeof(sweet_fb_stat));
+ 	PE_parse_boot_argn("sweetfb_gpucopy", &sweet_fb_gpucopy, sizeof(sweet_fb_gpucopy));
+ 	PE_parse_boot_argn("sweetfb_gpusync", &sweet_fb_gpusync, sizeof(sweet_fb_gpusync));
++	PE_parse_boot_argn("sweetfb_swapwait", &sweet_fb_swapwait, sizeof(sweet_fb_swapwait));
+ 	if (sweet_fb_gpucopy == 1) {
+ 		sweet_fb_stat = 1;
+ 		IOLog("SWEET GPUCOPY: sweetfb_gpucopy=1: GPU shadow copies of presented surfaces%s\n",
+@@ -737,19 +758,20 @@
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fPresenting = true;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		if (!fb->present(rec)) {
++		bool shown = fb->present(rec);
++		IOLockLock(fb->fLock);
++		if (!shown && !fb->fDirty) {
+ 			/* the GPU was still busy: show this frame later, unless a newer swap replaced it */
+-			IOLockLock(fb->fLock);
+-			if (!fb->fDirty) {
+-				memcpy(fb->fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-				fb->fDirty = true;
+-			}
+-			IOLockUnlock(fb->fLock);
++			memcpy(fb->fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++			fb->fDirty = true;
+ 		}
++		fb->fPresenting = false;
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	if (sweet_fb_stat && (count % 300) == 0) {
+@@ -799,6 +821,24 @@
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
++	/* 0120: wait until the previous frame has been copied (see sweetfb_swapwait above) */
++	uint32_t waited = 0;
++	while (sweet_fb_swapwait && !fPowerOff && (fDirty || fPresenting) && waited < SWEET_FB_SWAP_WAIT_MS) {
++		IOLockUnlock(fLock);
++		IOSleep(1);
++		waited++;
++		IOLockLock(fLock);
++	}
++	if (waited != 0) {
++		sweet_fb_swapwait_n++;
++		sweet_fb_swapwait_ms += waited;
++		if (waited > sweet_fb_swapwait_max) {
++			sweet_fb_swapwait_max = waited;
++		}
++		if (waited >= SWEET_FB_SWAP_WAIT_MS && (fDirty || fPresenting)) {
++			sweet_fb_swapwait_late++;
++		}
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	sweet_fb_stat_swaps++;
