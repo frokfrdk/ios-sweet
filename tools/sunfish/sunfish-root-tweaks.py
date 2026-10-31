@@ -41,6 +41,11 @@ convert with tools/sunfish/png2cpbitmap.py. Needed because the stock default (Wa
 2022") only ships 375w/393w/430w @3x variants, none for the 414w-896h@2x
 screen class of the 828xr ADT, and a failed default restore leaves the
 SBLockScreenWallpapers/SBHomeScreenWallpapers entries empty (black).
+--wallpaper also resets what SpringBoard derived from the old image: it empties
+~mobile/Library/Caches/MappedImageCache/Wallpaper (blurred/tinted variants, keyed by the home entry's
+SBWallpaperImageHashDataKey, or "#" for the lock screen) and WallpaperColorBoxesCache, rewrites
+OriginalHomeBackground.cpbitmap, sets a new image hash and SBWallpaperLastChangeUserDefaultKey.
+--wallpaper-thumbs LOCK.jpg HOME.jpg replaces {Lock,Home}BackgroundThumbnail.jpg (206x446).
 
 PaperBoardUI static wallpaper, two 8-byte patches in dyld_shared_cache_arm64.15 (20H392). With the
 CPBitmap alone the lock and home screen were full white:
@@ -81,12 +86,13 @@ with none of them, and they wait on missing hardware and daemons
 holding the whole boot. App staging also needs the kernel's HFS+ clonefile copy
 fallback (xnu patch 0091).
 """
-import os, plistlib, shutil, struct, sys
+import datetime, hashlib, os, plistlib, shutil, struct, sys
 
 root = sys.argv[1]
 migrate_once = '--migrate-once' in sys.argv[2:]
 wallpaper = sys.argv[sys.argv.index('--wallpaper') + 1] if '--wallpaper' in sys.argv else None
 home_wallpaper = sys.argv[sys.argv.index('--home-wallpaper') + 1] if '--home-wallpaper' in sys.argv else wallpaper
+wallpaper_thumbs = sys.argv[sys.argv.index('--wallpaper-thumbs') + 1:][:2] if '--wallpaper-thumbs' in sys.argv else None
 sweetwall = sys.argv[sys.argv.index('--sweetwall') + 1:][:2] if '--sweetwall' in sys.argv else None
 
 PREFS = {'CUIAllowDebugPrefs': True, 'CUIAllowHardwareRendering': False}
@@ -167,6 +173,47 @@ if wallpaper:
         os.chown(path, 501, 501)
         os.chmod(path, 0o644)
         print(f'wallpaper: {src} -> {sbdir}/{name} ({len(data)} bytes)')
+        if name == 'HomeBackground.cpbitmap':
+            home_data = data
+    # Swapping the files behind SpringBoard's back left the old wallpaper in its derived copies (G7c:
+    # old image in the lock screen and in Search's blur). Reset them all.
+    path = os.path.join(sbdir, 'OriginalHomeBackground.cpbitmap')
+    with open(path, 'wb') as f:
+        f.write(home_data)
+    os.chown(path, 501, 501)
+    os.chmod(path, 0o600)
+    if wallpaper_thumbs:
+        for name, src in zip(('LockBackgroundThumbnail.jpg', 'HomeBackgroundThumbnail.jpg'), wallpaper_thumbs):
+            path = os.path.join(sbdir, name)
+            shutil.copyfile(src, path)
+            os.chown(path, 501, 501)
+            os.chmod(path, 0o644)
+            print(f'wallpaper: {src} -> {sbdir}/{name}')
+    removed = []
+    for rel in ('private/var/mobile/Library/Caches/MappedImageCache/Wallpaper',
+                'private/var/mobile/Library/Caches/com.apple.springboard/WallpaperColorBoxesCache'):
+        d = os.path.join(root, rel)
+        for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            p = os.path.join(d, n)
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+            removed.append(n)
+    print(f'wallpaper: {len(removed)} cached variants removed {removed}')
+    # The blur cache is keyed by the home entry's SBWallpaperImageHashDataKey (base64 in the file name),
+    # so a new value also misses any variant made from the old image.
+    path = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.springboard.plist')
+    with open(path, 'rb') as f:
+        sb = plistlib.load(f)
+    entry = sb.get('SBHomeScreenWallpapers', {}).get('none')
+    if entry is not None:
+        entry['SBWallpaperImageHashDataKey'] = hashlib.sha256(home_data).digest()[:8]
+    sb['SBWallpaperLastChangeUserDefaultKey'] = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    st = os.stat(path)
+    with open(path, 'wb') as f:
+        plistlib.dump(sb, f, fmt=plistlib.FMT_BINARY)
+    os.chown(path, st.st_uid, st.st_gid)
+    os.chmod(path, st.st_mode & 0o7777)
+    print(f'com.apple.springboard.plist: home image hash '
+          f'{entry["SBWallpaperImageHashDataKey"].hex() if entry else "(no home entry)"}, last change now')
 
 if sweetwall:
     pkgdir, dylib = sweetwall
