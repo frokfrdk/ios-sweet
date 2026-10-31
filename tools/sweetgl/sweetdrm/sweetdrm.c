@@ -32,6 +32,9 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#endif
 
 #include "xf86drm.h"
 #include "sweetdrm.h"
@@ -42,12 +45,14 @@
 #define MAP_COOKIE_TAG          0x5ull
 #define MAP_COOKIE(h)           ((MAP_COOKIE_TAG << 56) | ((uint64_t)(h) << 16))
 #define WAIT_CHUNK_MS           10000u  /* SWEET_GPU_WAIT_MAX_MS */
+#define SUBMIT_SURFACES_MAX     128u    /* imports reported per submit */
 
 struct bo {
 	uint32_t handle;                /* 0 = free slot */
 	uint32_t last_seq;              /* 0 = never submitted */
 	uint64_t gpu_va, size;
 	void *cpu;                      /* an import's is the surface's own mapping, or NULL */
+	uint32_t surface_id;            /* imports only */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -59,11 +64,18 @@ static uint32_t next_queue_id;
 static uint32_t last_submitted;         /* newest seqno submitted */
 static struct bo *bos;
 static uint32_t nbos, cap;
+static const struct sweetdrm_surface_hooks *hooks;
 
 void
 sweetdrm_set_backend(const struct sweetdrm_backend *backend)
 {
 	be = backend;
+}
+
+void
+sweetdrm_set_surface_hooks(const struct sweetdrm_surface_hooks *h)
+{
+	hooks = h;
 }
 
 static void
@@ -129,7 +141,7 @@ find(uint32_t handle)
 
 /* Lock held */
 static int
-add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu)
+add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface_id)
 {
 	struct bo *b = NULL;
 	for (uint32_t i = 0; i < nbos && b == NULL; i++) {
@@ -149,7 +161,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu)
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id };
 	return 0;
 }
 
@@ -288,7 +300,7 @@ gem_new(struct drm_msm_gem_new *r)
 	int e = r->size ? be->bo_new(r->size, &h, &va, &cpu) : EINVAL;
 	if (e == 0) {
 		pthread_mutex_lock(&lock);
-		e = add(h, va, r->size, cpu);
+		e = add(h, va, r->size, cpu, 0);
 		pthread_mutex_unlock(&lock);
 		if (e) {
 			be->bo_free(h);
@@ -319,10 +331,14 @@ gem_close(uint32_t handle)
 {
 	pthread_mutex_lock(&lock);
 	struct bo *b = find(handle);
+	uint32_t sid = b ? b->surface_id : 0;
 	if (b) {
 		b->handle = 0;
 	}
 	pthread_mutex_unlock(&lock);
+	if (sid && hooks && hooks->closed) {
+		hooks->closed(sid);
+	}
 	/* the kernel waits (2 s cap) for the GPU before it frees */
 	return b ? be->bo_free(handle) : ENOENT;
 }
@@ -387,7 +403,8 @@ submit(struct drm_msm_gem_submit *r)
 	const struct drm_msm_gem_submit_bo *sb = (const void *)(uintptr_t)r->bos;
 	const struct drm_msm_gem_submit_cmd *cmd = (const void *)(uintptr_t)r->cmds;
 	struct sweetdrm_ib ib[SWEETDRM_MAX_IBS];
-	uint32_t n = 0, seq = 0;
+	uint32_t sids[SUBMIT_SURFACES_MAX];
+	uint32_t n = 0, seq = 0, nsids = 0;
 	int e = 0;
 
 	pthread_mutex_lock(&lock);
@@ -420,10 +437,16 @@ submit(struct drm_msm_gem_submit *r)
 			struct bo *b = find(sb[i].handle);
 			if (b) {
 				b->last_seq = seq;
+				if (b->surface_id && nsids < SUBMIT_SURFACES_MAX) {
+					sids[nsids++] = b->surface_id;
+				}
 			}
 		}
 	}
 	pthread_mutex_unlock(&lock);
+	if (nsids && hooks && hooks->submitted) {
+		hooks->submitted(sids, nsids, seq);
+	}
 	r->fence = seq;
 	r->fence_fd = -1;
 	return e;
@@ -590,6 +613,35 @@ sweetdrm_seq_retired(uint32_t seq)
 	return opened && retired(seq);
 }
 
+/*
+ * GET_FLAGS says MSM_BO_WC, so Mesa does no cache maintenance and, once its own
+ * fences say a BO is idle, maps it without GEM_CPU_PREP, so the kernel's
+ * invalidate after a wait never runs. SWEETDRM_CPUINV=0 turns this off.
+ */
+void
+sweetdrm_cpu_access(void *addr, uint64_t size)
+{
+	static int on = -1;
+	static uint64_t calls, bytes;
+	if (on < 0) {
+		const char *v = getenv("SWEETDRM_CPUINV");
+		on = !(v && v[0] == '0');
+		say("cpu access: invalidate idle BOs before Mesa maps them: %s", on ? "on" : "off (SWEETDRM_CPUINV=0)");
+	}
+	if (!on || addr == NULL || size == 0) {
+		return;
+	}
+#if defined(__APPLE__)
+	sys_dcache_flush(addr, (size_t)size);
+#endif
+	uint64_t c = __atomic_add_fetch(&calls, 1u, __ATOMIC_RELAXED);
+	uint64_t b = __atomic_add_fetch(&bytes, size, __ATOMIC_RELAXED);
+	if ((c & (c - 1)) == 0) {
+		say("cpu access: %llu idle BO maps invalidated, %llu KiB in all", (unsigned long long)c,
+		    (unsigned long long)(b >> 10));
+	}
+}
+
 int
 sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *handle, uint64_t *size)
 {
@@ -601,7 +653,7 @@ sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *hand
 	int e = be->bo_import ? be->bo_import(surface_id, &h, &va, &sz) : ENOSYS;
 	if (e == 0) {
 		pthread_mutex_lock(&lock);
-		e = add(h, va, sz, cpu);
+		e = add(h, va, sz, cpu, surface_id);
 		pthread_mutex_unlock(&lock);
 		if (e) {
 			be->bo_free(h);

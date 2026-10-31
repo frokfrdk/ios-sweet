@@ -1,0 +1,45 @@
+--- a/src/freedreno/drm/freedreno_bo.c	2026-10-31 18:22:56.661086573 +1030
++++ b/src/freedreno/drm/freedreno_bo.c	2026-10-31 18:22:56.661598837 +1030
+@@ -680,8 +680,8 @@
+ }
+ 
+ /* a bit odd to take the pipe as an arg, but it's a, umm, quirk of kgsl.. */
+-int
+-fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++static int
++bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+    enum fd_bo_state state = fd_bo_state(bo);
+ 
+@@ -749,6 +749,31 @@
+    return bo->funcs->cpu_prep(bo, pipe, op);
+ }
+ 
++/*
++ * sweet: sweetdrm's BOs are CPU-cacheable (the GPU's side is not) although
++ * GET_FLAGS says WC, and an idle BO is mapped without the kernel's wait (the
++ * invalidate), so lines the CPU fetched while the GPU wrote could be read, or
++ * merged into a partial write and cleaned over the GPU's data at the next
++ * submit. Invalidate the BO before the CPU uses it. Shared BOs (imports)
++ * always reach sweetdrm's GEM_CPU_PREP, which waits and invalidates.
++ */
++void sweetdrm_cpu_access(void *addr, uint64_t size);
++
++int
++fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++{
++   int ret = bo_cpu_prep(bo, pipe, op);
++
++   if (ret == 0 && (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)) &&
++       !(bo->alloc_flags & (FD_BO_SHARED | _FD_BO_NOSYNC | FD_BO_NOMAP))) {
++      void *map = fd_bo_map(bo);
++      if (map)
++         sweetdrm_cpu_access(map, fd_bo_size(bo));
++   }
++
++   return ret;
++}
++
+ /**
+  * Cleanup fences, dropping pipe references.  If 'expired' is true, only
+  * cleanup expired fences.

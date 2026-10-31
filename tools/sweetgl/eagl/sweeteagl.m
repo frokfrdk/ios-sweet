@@ -59,6 +59,7 @@ size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
 void IOSurfaceIncrementUseCount(IOSurfaceRef buffer);
 void IOSurfaceDecrementUseCount(IOSurfaceRef buffer);
 Boolean IOSurfaceIsInUse(IOSurfaceRef buffer);
+IOSurfaceRef IOSurfaceLookup(uint32_t csid);
 
 #define TSD_EAGL_SLOT           30      /* OpenGLES's thread-specific slot for the current priv */
 #define PNAME_MULTITHREADED     0x139
@@ -197,6 +198,8 @@ footprint_mb(void)
 	return (unsigned)(vm.phys_footprint >> 20);
 }
 
+static void use_install(void);
+
 static void
 open_display(void)
 {
@@ -213,6 +216,7 @@ open_display(void)
 		sweetdrm_say("7.5 eagl: no SweetGPU device (%d) after %u s; no GL contexts", fd, waited);
 		return;
 	}
+	use_install();
 	memlimit_props m = { 0 };
 	int r = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, getpid(), 0, &m, sizeof(m));
 	sweetdrm_say("7.7 eagl: %s pid %d uid %d: SweetGPU open after %u s; footprint %u MB, jetsam limit %d MB "
@@ -333,68 +337,191 @@ diag_start(void)
 static pthread_once_t diag_once = PTHREAD_ONCE_INIT;
 
 /*
- * ---- 7.7 IOSurface use counts (G7i) ----
+ * ---- 7.7 IOSurface use counts (G7i, per submit since G7j) ----
  * Apple's GPU driver keeps a surface "in use" while queued GPU work reads or
  * writes it, and CA's clients check that (IOSurfaceIsInUse) before they draw
- * into a backing store in place. Nothing did that here, so a client could
- * redraw a label or widget while the GPU had yet to sample it, and CA, which
- * only redraws damaged regions, kept the torn result on screen. A bound
- * surface now holds a use count until the seqno submitted by the first flush
- * after the bind has retired.
+ * into a backing store in place. Holding only from a bind to the next flush
+ * (3572fed) missed nearly all of it: CA binds a surface once (32 binds in
+ * 415 s of G7j) and then samples the texture frame after frame. sweetdrm now
+ * says which imported surfaces each submit used, and each holds a use count
+ * until the newest submit using it has retired. A bind holds too, until the
+ * first flush after it, for the time before CA's draws are submitted.
+ * SWEETEAGL_USE=0 turns all of it off.
  */
 #define USE_TRACK_MAX           512u
-#define USE_LOG_POW2            1u      /* stats at powers of two of the binds */
 
 struct use_entry {
-	IOSurfaceRef surf;
-	uint32_t seq;                   /* 0 = no flush since the bind */
-	bool flushed;                   /* a flush came; seq 0 then means nothing was ever submitted */
+	uint32_t sid;
+	IOSurfaceRef surf;              /* retained while the entry lives */
+	uint32_t seq;                   /* newest submit using it; 0 = bound, no flush yet */
+	bool held;                      /* one use count of ours on it */
+	bool pending;                   /* bound since the last flush */
 };
 static pthread_mutex_t use_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct use_entry use_track[USE_TRACK_MAX];
 static unsigned use_n;
-static unsigned use_binds, use_busy_at_bind, use_full, use_released;
+static int use_on = -1;
+static unsigned use_binds, use_submits, use_refs, use_busy_at_hold, use_holds, use_released, use_closed, use_full,
+    use_nolookup;
 
-/* use_lock held: drop the entries whose work has retired */
+static bool
+use_enabled(void)
+{
+	if (use_on < 0) {
+		const char *v = getenv("SWEETEAGL_USE");
+		use_on = !(v && v[0] == '0');
+	}
+	return use_on;
+}
+
+/* use_lock held */
+static struct use_entry *
+use_find_locked(uint32_t sid)
+{
+	for (unsigned i = 0; i < use_n; i++) {
+		if (use_track[i].sid == sid) {
+			return &use_track[i];
+		}
+	}
+	return NULL;
+}
+
+/* use_lock held; surf is retained for the entry by the caller */
+static struct use_entry *
+use_add_locked(uint32_t sid, IOSurfaceRef surf)
+{
+	if (use_n == USE_TRACK_MAX) {
+		use_full++;
+		CFRelease(surf);
+		return NULL;
+	}
+	use_track[use_n] = (struct use_entry){ sid, surf, 0, false, false };
+	return &use_track[use_n++];
+}
+
+/* use_lock held */
+static void
+use_take_locked(struct use_entry *e)
+{
+	if (!e->held) {
+		if (IOSurfaceIsInUse(e->surf)) {
+			use_busy_at_hold++;
+		}
+		IOSurfaceIncrementUseCount(e->surf);
+		e->held = true;
+		use_holds++;
+	}
+}
+
+/* use_lock held: give back the counts whose work has retired; entries stay until the handle closes */
 static void
 use_reap_locked(void)
 {
-	unsigned k = 0;
 	for (unsigned i = 0; i < use_n; i++) {
-		struct use_entry e = use_track[i];
-		if (e.flushed && (e.seq == 0 || sweetdrm_seq_retired(e.seq))) {
-			IOSurfaceDecrementUseCount(e.surf);
-			CFRelease(e.surf);
+		struct use_entry *e = &use_track[i];
+		if (e->held && !e->pending && sweetdrm_seq_retired(e->seq)) {
+			IOSurfaceDecrementUseCount(e->surf);
+			e->held = false;
 			use_released++;
-		} else {
-			use_track[k++] = e;
 		}
 	}
-	use_n = k;
+}
+
+static void
+use_log(void)
+{
+	pthread_mutex_lock(&use_lock);
+	unsigned n = use_n, held = 0;
+	for (unsigned i = 0; i < use_n; i++) {
+		held += use_track[i].held;
+	}
+	unsigned s = use_submits, refs = use_refs, b = use_binds, busy = use_busy_at_hold, holds = use_holds,
+	    rel = use_released, cl = use_closed, full = use_full, nl = use_nolookup;
+	pthread_mutex_unlock(&use_lock);
+	sweetdrm_say("7.7 eagl: use counts: %u submits with surfaces (%u refs), %u binds; %u holds, %u already in use "
+	    "then, %u released, %u held now of %u tracked, %u closed, %u untracked, %u lookups failed", s, refs, b, holds,
+	    busy, rel, held, n, cl, full, nl);
 }
 
 static void
 use_hold(IOSurfaceRef surf)
 {
+	if (!use_enabled()) {
+		return;
+	}
+	uint32_t sid = IOSurfaceGetID(surf);
 	pthread_mutex_lock(&use_lock);
 	use_binds++;
-	if (IOSurfaceIsInUse(surf)) {
-		use_busy_at_bind++;
+	use_reap_locked();
+	struct use_entry *e = use_find_locked(sid);
+	if (e == NULL) {
+		CFRetain(surf);
+		e = use_add_locked(sid, surf);
+	}
+	if (e) {
+		use_take_locked(e);
+		e->pending = true;
+	}
+	pthread_mutex_unlock(&use_lock);
+}
+
+/* sweetdrm: a submit with seqno seq used these imported surfaces */
+static void
+use_submitted(const uint32_t *sids, uint32_t count, uint32_t seq)
+{
+	pthread_mutex_lock(&use_lock);
+	unsigned s = ++use_submits;
+	use_refs += count;
+	for (uint32_t k = 0; k < count; k++) {
+		struct use_entry *e = use_find_locked(sids[k]);
+		if (e == NULL) {
+			IOSurfaceRef surf = IOSurfaceLookup(sids[k]);
+			if (surf == NULL) {
+				use_nolookup++;
+				continue;
+			}
+			e = use_add_locked(sids[k], surf);
+			if (e == NULL) {
+				continue;
+			}
+		}
+		use_take_locked(e);
+		e->seq = seq;
 	}
 	use_reap_locked();
-	if (use_n < USE_TRACK_MAX) {
-		CFRetain(surf);
-		IOSurfaceIncrementUseCount(surf);
-		use_track[use_n++] = (struct use_entry){ surf, 0, false };
-	} else {
-		use_full++;
-	}
-	unsigned b = use_binds, busy = use_busy_at_bind, full = use_full, rel = use_released, n = use_n;
 	pthread_mutex_unlock(&use_lock);
-	if ((b & (b - 1)) == 0 && b >= USE_LOG_POW2) {
-		sweetdrm_say("7.7 eagl: use counts: %u binds, %u already in use at bind, %u held now, %u released, %u untracked (full)",
-		    b, busy, n, rel, full);
+	if ((s & (s - 1)) == 0 && s >= 64u) {
+		use_log();
 	}
+}
+
+/* sweetdrm: the import's handle is gone (Mesa freed the texture) */
+static void
+use_closed_hook(uint32_t sid)
+{
+	pthread_mutex_lock(&use_lock);
+	struct use_entry *e = use_find_locked(sid);
+	if (e) {
+		if (e->held) {
+			IOSurfaceDecrementUseCount(e->surf);
+		}
+		CFRelease(e->surf);
+		*e = use_track[--use_n];
+		use_closed++;
+	}
+	pthread_mutex_unlock(&use_lock);
+}
+
+static const struct sweetdrm_surface_hooks use_hooks = { use_submitted, use_closed_hook };
+
+/* Before the first submit */
+static void
+use_install(void)
+{
+	if (use_enabled()) {
+		sweetdrm_set_surface_hooks(&use_hooks);
+	}
+	sweetdrm_say("7.7 eagl: IOSurface use counts per submit: %s", use_enabled() ? "on" : "off (SWEETEAGL_USE=0)");
 }
 
 void
@@ -403,10 +530,13 @@ sweeteagl_after_flush(void)
 	uint32_t seq = sweetdrm_last_submitted();
 	pthread_mutex_lock(&use_lock);
 	for (unsigned i = 0; i < use_n; i++) {
-		if (!use_track[i].flushed) {
+		struct use_entry *e = &use_track[i];
+		if (e->pending) {
 			/* the newest submit covers everything CA queued before this flush */
-			use_track[i].seq = seq;
-			use_track[i].flushed = true;
+			e->pending = false;
+			if ((int32_t)(seq - e->seq) > 0) {
+				e->seq = seq;
+			}
 		}
 	}
 	use_reap_locked();

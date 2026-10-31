@@ -55,6 +55,25 @@ int sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *
 uint32_t sweetdrm_last_submitted(void);
 int sweetdrm_seq_retired(uint32_t seq);
 
+/*
+ * Told after each submit which imported surfaces it used (their IOSurface ids;
+ * seq is the submit's seqno), and when an import's handle is closed. Called
+ * without sweetdrm's lock, on the thread that submitted or closed. Set before
+ * the first submit; NULL members are skipped.
+ */
+struct sweetdrm_surface_hooks {
+	void (*submitted)(const uint32_t *surface_ids, uint32_t count, uint32_t seq);
+	void (*closed)(uint32_t surface_id);
+};
+void sweetdrm_set_surface_hooks(const struct sweetdrm_surface_hooks *hooks);
+
+/*
+ * Mesa is about to touch an idle BO with the CPU without asking the kernel
+ * (patch 0003): clean and invalidate that range, so lines the CPU fetched while
+ * the GPU was writing are not used or written back over the GPU's data.
+ */
+void sweetdrm_cpu_access(void *addr, uint64_t size);
+
 /* One log line to stderr and the backend's report (the kernel log on iOS, selector 16) */
 void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
