@@ -783,7 +783,11 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		ok = e == GL_NO_ERROR;
 		if (ok) {
 			use_hold(surf);
-			diag_record_surface(surf, sid);
+			/* G7j: backboardd died in the diag thread sampling a small surface later on; those can wrap
+			 * client memory (G7a) that is freed while the surface lives. Watch only the display ones. */
+			if (width >= 512 && height >= 512) {
+				diag_record_surface(surf, sid);
+			}
 			/* G6w: icon-sized RGBA surfaces bind fine but the icons stay invisible; is there anything in them? */
 			static unsigned sampled;
 			if ((fourcc == SWEETGL_FOURCC_BGRA || fourcc == SWEETGL_FOURCC_RGBA) && width < 512 && height < 512 &&
