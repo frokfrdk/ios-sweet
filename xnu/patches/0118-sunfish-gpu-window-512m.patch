@@ -1,0 +1,116 @@
+--- a/bsd/dev/sweet_gsvc.c
++++ b/bsd/dev/sweet_gsvc.c
+@@ -53,6 +53,7 @@
+ #include "sweet_gpu_internal.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ /* a6xx registers, dword offsets from GPU_PA (a6xx.xml) */
+@@ -123,11 +124,15 @@
+  * Mesa's own BOs did not look like fitting 64 MiB and 64 BOs. 64 L3 tables
+  * (256 KiB) still fit the 0x55000 bytes of GPU-GMU-MEM left after the IB pool
+  * and the L2 table (G6o: L3s at +0xab000 of the 1 MiB blob).
++ * 0118: G7c filled those 128 MiB (7 MiB textures refused with 14 MiB free in
++ * pieces). 256 tables (1 MiB, 512 MiB of window) now come from contiguous XNU
++ * memory mapped uncached like GPU-GMU-MEM; the 64 there stay the fallback.
+  */
+-#define GS_L3_TABLES            64u
++#define GS_L3_TABLES            256u
++#define GS_L3_GMU               64u
+ #define GS_WIN_BASE             0x200000000ull  /* GPU VA 8 GiB, level-1 entry 8 */
+ #define GS_WIN_L1               8u
+-#define GS_WIN_PAGES            (GS_L3_TABLES * 512u)   /* 128 MiB */
++#define GS_WIN_PAGES            (GS_L3_TABLES * 512u)   /* 512 MiB at most; gs_win_pages is what is mapped */
+ #define GS_PTE_TABLE            3ull
+ #define GS_PTE_PAGE_RW          0xe43ull        /* page, AP read/write, outer shareable, AF, nG, MAIR attr 0 */
+ #define GS_PTE_ADDR_MASK        0x0000fffffffff000ull
+@@ -245,6 +250,7 @@
+ static bool gs_ready, gs_window, gs_latches;
+ static uint32_t gs_cur_khz = 180000u, gs_max_khz = 180000u;
+ static uint32_t gs_win_used[GS_WIN_PAGES / 32u];        /* 1 = window page in use */
++static uint32_t gs_win_pages = GS_WIN_PAGES;            /* pages with an L3 table behind them */
+ static struct gs_bo gs_bos[GS_MAX_BO];
+ 
+ /* Test buffers from 6.0, used raw in 6.3 */
+@@ -601,7 +607,12 @@
+ gs_win_alloc(uint32_t n)
+ {
+ 	uint32_t run = 0;
+-	for (uint32_t p = 0; p < GS_WIN_PAGES; ++p) {
++	for (uint32_t p = 0; p < gs_win_pages; ++p) {
++		if (p % 32u == 0 && gs_win_used[p / 32u] == 0xffffffffu) {
++			run = 0;
++			p += 31u;
++			continue;
++		}
+ 		run = gs_win_busy(p) ? 0 : run + 1u;
+ 		if (run == n) {
+ 			gs_win_mark(p + 1u - n, n, true);
+@@ -615,8 +626,8 @@
+ gs_win_count(void)
+ {
+ 	uint32_t n = 0;
+-	for (uint32_t p = 0; p < GS_WIN_PAGES; ++p) {
+-		n += gs_win_busy(p);
++	for (uint32_t w = 0; w < gs_win_pages / 32u; ++w) {
++		n += (uint32_t)__builtin_popcount(gs_win_used[w]);
+ 	}
+ 	return n;
+ }
+@@ -712,10 +723,25 @@
+ 		return false;
+ 	}
+ 	gs_l2 = (volatile uint64_t *)v;
+-	if (!gs_carve(GS_L3_TABLES * GS_PAGE, &v, &gs_l3_pa, "window L3s")) {
+-		return false;
++	/* 0118: zeroed and cleaned to PoC by gs_kalloc, then written only through the uncached mapping */
++	vm_offset_t l3k = gs_kalloc(GS_L3_TABLES * GS_PAGE, &gs_l3_pa);
++	vm_offset_t l3u = l3k ? ml_io_map_wcomb((vm_offset_t)gs_l3_pa, GS_L3_TABLES * GS_PAGE) : 0;
++	if (l3u) {
++		gs_l3 = (volatile uint64_t *)l3u;
++		printf("SWEET GSVC:   %-12s pa/iova %#llx, %#x bytes, XNU memory mapped uncached\n", "window L3s", gs_l3_pa,
++		    GS_L3_TABLES * GS_PAGE);
++	} else {
++		if (l3k) {
++			kmem_free(kernel_map, l3k, GS_L3_TABLES * GS_PAGE);
++		}
++		printf("SWEET GSVC:   no contiguous XNU memory for %u L3 tables: %u in GPU-GMU-MEM\n", GS_L3_TABLES,
++		    GS_L3_GMU);
++		if (!gs_carve(GS_L3_GMU * GS_PAGE, &v, &gs_l3_pa, "window L3s")) {
++			return false;
++		}
++		gs_l3 = (volatile uint64_t *)v;
++		gs_win_pages = GS_L3_GMU * 512u;
+ 	}
+-	gs_l3 = (volatile uint64_t *)v;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 
+ 	gs_tbuf_size = gs_round(4u * GS_PAGE);
+@@ -998,14 +1024,14 @@
+ 
+ 	/* The window */
+ 	gpu_pause("6.3 level-1 entry 8 -> the window's level-2 table, then bank 0 TLBIALL");
+-	for (unsigned t = 0; t < GS_L3_TABLES; ++t) {
++	for (unsigned t = 0; t < gs_win_pages / 512u; ++t) {
+ 		gs_l2[t] = (gs_l3_pa + (uint64_t)t * GS_PAGE) | GS_PTE_TABLE;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	gs_l1[GS_WIN_L1] = gs_l2_pa | GS_PTE_TABLE;
+ 	ok = gs_tlbi("6.3 window on");
+ 	printf("SWEET GSVC:   level-1 entry %u = 0x%016llx: GPU VA %#llx..%#llx, %u pages\n", GS_WIN_L1, gs_l1[GS_WIN_L1],
+-	    GS_WIN_BASE, gs_win_va(GS_WIN_PAGES) - 1u, GS_WIN_PAGES);
++	    GS_WIN_BASE, gs_win_va(gs_win_pages) - 1u, gs_win_pages);
+ 	gs_window = ok;
+ 
+ 	volatile uint32_t *tb = (volatile uint32_t *)gs_tbuf, *sp = (volatile uint32_t *)gs_tspare;
+@@ -1248,7 +1274,7 @@
+ 		.chip_id = GS_CHIP_ID, .gmem_size = GS_GMEM_SIZE, .gmem_base = GS_GMEM_BASE,
+ 		.cur_khz = gs_cur_khz, .max_khz = gs_max_khz, .last_retired = gs_fence ? gs_fence[0] : 0,
+ 		.flags = (gs_ready ? SWEET_GSVC_READY : 0u) | (gs_dead ? SWEET_GSVC_DEAD : 0u),
+-		.fence_pa = gs_fence_pa, .window_base = GS_WIN_BASE, .window_size = (uint64_t)GS_WIN_PAGES * GS_PAGE,
++		.fence_pa = gs_fence_pa, .window_base = GS_WIN_BASE, .window_size = (uint64_t)gs_win_pages * GS_PAGE,
+ 	};
+ }
+ 
