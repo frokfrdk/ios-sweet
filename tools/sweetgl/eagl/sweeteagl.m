@@ -654,6 +654,290 @@ stripe_drop(struct stripe_entry *e)
 	stripe_live--;
 }
 
+/*
+ * G8b: the kernel rounds an IOSurface's bytes per row up to 64 (xnu 0046), but
+ * whatever fills the small CPU-drawn ones still writes rows at width * bpe
+ * rounded up to 32 (G8a: a 19 px surface's rows land 96 bytes apart in its
+ * 128-byte stride). texImageIOSurface copies such a surface into the texture at
+ * the writer's stride instead of importing it, and copies it again on a later
+ * bind when its seed or its bytes changed. Surfaces this process renders into
+ * (attachImage) keep the real stride. SWEETEAGL_ROWFIX=0 turns this off.
+ */
+#define ROWFIX_SURFACES         64
+#define ROWFIX_MAX_BYTES        (4u << 20)
+#define ROWFIX_COMPARE          (64u << 10)     /* up to this size the bytes are compared too, not only the seed */
+#define ROWFIX_COMPARE_NS       100000000ull
+#define ROWFIX_RENDERED         64
+#define ROWFIX_LOG_MAX          40u
+
+struct rowfix_entry {
+	struct sweetgl_context *gl;     /* NULL = free */
+	unsigned tex;
+	IOSurfaceRef surf;              /* retained */
+	uint32_t sid, seed;
+	unsigned w, h, ws, bpe;
+	GLenum fmt;
+	uint8_t *copy, *fresh;          /* the bytes last uploaded; a second buffer to compare (small ones only) */
+	size_t bytes;
+	uint64_t compared_ns;
+};
+static struct rowfix_entry rowfix[ROWFIX_SURFACES];
+static unsigned rowfix_live;
+static int rowfix_on = -1;
+static uint32_t rowfix_rendered[ROWFIX_RENDERED];      /* surface ids seen in attachImage, a ring */
+static unsigned rowfix_rendered_next;
+static uint64_t rowfix_reuploads[2];                    /* seed changed, bytes changed */
+
+static bool
+rowfix_enabled(void)
+{
+	if (rowfix_on < 0) {
+		const char *v = getenv("SWEETEAGL_ROWFIX");
+		rowfix_on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 rowfix: copy texImageIOSurface surfaces whose rows the writer packs at 32 bytes: %s",
+		    rowfix_on ? "on" : "off (SWEETEAGL_ROWFIX=0)");
+	}
+	return rowfix_on;
+}
+
+static void
+rowfix_note_rendered(uint32_t sid)
+{
+	for (unsigned k = 0; k < ROWFIX_RENDERED; k++) {
+		if (rowfix_rendered[k] == sid) {
+			return;
+		}
+	}
+	rowfix_rendered[rowfix_rendered_next++ % ROWFIX_RENDERED] = sid;
+}
+
+static bool
+rowfix_is_rendered(uint32_t sid)
+{
+	for (unsigned k = 0; k < ROWFIX_RENDERED; k++) {
+		if (rowfix_rendered[k] == sid) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static struct rowfix_entry *
+rowfix_find(struct sweetgl_context *gl, unsigned tex)
+{
+	for (unsigned k = 0; k < ROWFIX_SURFACES && rowfix_live; k++) {
+		if (rowfix[k].gl == gl && rowfix[k].tex == tex && gl != NULL) {
+			return &rowfix[k];
+		}
+	}
+	return NULL;
+}
+
+static void
+rowfix_drop(struct rowfix_entry *e)
+{
+	CFRelease(e->surf);
+	free(e->copy);
+	free(e->fresh);
+	*e = (struct rowfix_entry){ 0 };
+	rowfix_live--;
+}
+
+static GLenum
+rowfix_format(uint32_t fourcc, size_t bpe)
+{
+	if ((fourcc == SWEETGL_FOURCC_BGRA || fourcc == SWEETGL_FOURCC_RGBA) && bpe == 4) {
+		return fourcc == SWEETGL_FOURCC_BGRA ? GL_BGRA_EXT : GL_RGBA;
+	}
+	if (fourcc == SWEETGL_FOURCC_LA08 && bpe == 2) {
+		return GL_LUMINANCE_ALPHA;
+	}
+	if (fourcc == SWEETGL_FOURCC_L008 && bpe == 1) {
+		return GL_LUMINANCE;
+	}
+	if (fourcc == SWEETGL_FOURCC_A008 && bpe == 1) {
+		return GL_ALPHA;
+	}
+	return 0;
+}
+
+/* small surfaces can wrap client memory freed while they live (G7j): read, never touch */
+static bool
+rowfix_read(IOSurfaceRef surf, void *dst, size_t n)
+{
+	const void *base = IOSurfaceGetBaseAddress(surf);
+	vm_size_t got = 0;
+	return base != NULL && vm_read_overwrite(mach_task_self(), (vm_address_t)base, n, (vm_address_t)dst, &got) ==
+	    KERN_SUCCESS && got == n;
+}
+
+/* into the texture bound to GL_TEXTURE_2D, with the unpack state put back */
+static GLenum
+rowfix_upload(struct rowfix_entry *e, bool sub)
+{
+	GLint align = 4, rl = 0, sr = 0, sp = 0, unpack = 0;
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rl);
+	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &sr);
+	glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &sp);
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(e->ws / e->bpe));
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+	if (sub) {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)e->w, (GLsizei)e->h, e->fmt, GL_UNSIGNED_BYTE, e->copy);
+	} else {
+		glTexImage2D(GL_TEXTURE_2D, 0, (GLint)e->fmt, (GLsizei)e->w, (GLsizei)e->h, 0, e->fmt, GL_UNSIGNED_BYTE,
+		    e->copy);
+		/* CA reuses texture objects across formats: an import's L/A swizzle must not stay */
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, rl);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, sr);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, sp);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+	return glGetError();
+}
+
+/* for the first ones: is the stride view's row padding full and the tail past the writer's rows empty? */
+static void
+rowfix_say_layout(struct rowfix_entry *e, unsigned stride, size_t sw)
+{
+	size_t all = (size_t)stride * e->h, used = sw * e->bpe, pad = 0, tail = 0;
+	uint8_t *b = malloc(all);
+	if (b == NULL || !rowfix_read(e->surf, b, all)) {
+		free(b);
+		return;
+	}
+	for (unsigned y = 0; y < e->h; y++) {
+		for (size_t x = used; x < stride; x++) {
+			pad += b[(size_t)y * stride + x] != 0;
+		}
+	}
+	for (size_t i = e->bytes; i < all; i++) {
+		tail += b[i] != 0;
+	}
+	free(b);
+	sweetdrm_say("7.7 rowfix: surface %u: nonzero bytes in the row padding at stride %u: %zu of %zu; past %u rows of %u "
+	    "bytes: %zu of %zu", e->sid, stride, pad, (stride - used) * e->h, e->h, e->ws, tail, all - e->bytes);
+}
+
+/* any import or copy into tex replaces what was there */
+static void
+rowfix_unbind(struct sweetgl_context *gl, unsigned tex)
+{
+	struct rowfix_entry *e = rowfix_find(gl, tex);
+	if (e) {
+		rowfix_drop(e);
+	}
+}
+
+/* bind_iosurface, texImageIOSurface: true when the texture now holds a copy */
+static bool
+rowfix_bind(struct sweetgl_context *gl, unsigned tex, IOSurfaceRef surf, uint32_t sid, unsigned w, unsigned h,
+    uint32_t fourcc, unsigned stride)
+{
+	rowfix_unbind(gl, tex);
+	size_t bpe = IOSurfaceGetBytesPerElement(surf), sw = IOSurfaceGetWidth(surf);
+	GLenum fmt = rowfix_format(fourcc, bpe);
+	if (!rowfix_enabled() || fmt == 0 || gl == NULL || tex == 0 || w == 0 || h == 0 || w > sw ||
+	    h > IOSurfaceGetHeight(surf) || rowfix_is_rendered(sid)) {
+		return false;
+	}
+	unsigned ws = (unsigned)((sw * bpe + 31) & ~(size_t)31);
+	size_t bytes = (size_t)ws * h;
+	if (ws >= stride || bytes > ROWFIX_MAX_BYTES) {
+		return false;
+	}
+	struct rowfix_entry *e = NULL;
+	for (unsigned k = 0; k < ROWFIX_SURFACES && e == NULL; k++) {
+		e = rowfix[k].gl == NULL ? &rowfix[k] : NULL;
+	}
+	static bool full_said;
+	if (e == NULL) {
+		if (!full_said) {
+			full_said = true;
+			sweetdrm_say("7.7 rowfix: all %u slots in use; surface %u is imported at stride %u", ROWFIX_SURFACES, sid,
+			    stride);
+		}
+		return false;
+	}
+	uint8_t *copy = malloc(bytes), *fresh = bytes <= ROWFIX_COMPARE ? malloc(bytes) : NULL;
+	if (copy == NULL || (bytes <= ROWFIX_COMPARE && fresh == NULL)) {
+		free(copy);
+		free(fresh);
+		return false;
+	}
+	CFRetain(surf);
+	*e = (struct rowfix_entry){ gl, tex, surf, sid, IOSurfaceGetSeed(surf), w, h, ws, (unsigned)bpe, fmt, copy, fresh,
+	    bytes, sweetdrm_now_ns() };
+	rowfix_live++;
+	GLenum err = GL_NO_ERROR;
+	bool read = rowfix_read(surf, copy, bytes);
+	if (read) {
+		err = rowfix_upload(e, false);
+	}
+	static unsigned logged;
+	if (logged < ROWFIX_LOG_MAX) {
+		logged++;
+		sweetdrm_say("7.7 eagl: texImageIOSurface surface %u %ux%u (surface width %zu, bpe %zu) stride %u: copied at "
+		    "writer stride %u (G8b) into tex %u: %s, err 0x%04x", sid, w, h, sw, bpe, stride, ws, tex,
+		    read ? "ok" : "read FAILED", err);
+		if (read && err == GL_NO_ERROR) {
+			rowfix_say_layout(e, stride, sw);
+		}
+	}
+	if (!read || err != GL_NO_ERROR) {
+		rowfix_drop(e);
+		return false;
+	}
+	return true;
+}
+
+/* glBindTexture: copy again what changed since */
+static void
+rowfix_check(unsigned tex)
+{
+	struct rowfix_entry *e = rowfix_find(sweetgl_get_current(), tex);
+	if (e == NULL) {
+		return;
+	}
+	uint32_t seed = IOSurfaceGetSeed(e->surf);
+	unsigned why;
+	if (seed != e->seed) {
+		why = 0;
+		if (!rowfix_read(e->surf, e->copy, e->bytes)) {
+			return;
+		}
+	} else if (e->fresh && sweetdrm_now_ns() - e->compared_ns >= ROWFIX_COMPARE_NS) {
+		e->compared_ns = sweetdrm_now_ns();
+		if (!rowfix_read(e->surf, e->fresh, e->bytes) || memcmp(e->fresh, e->copy, e->bytes) == 0) {
+			return;
+		}
+		why = 1;
+		uint8_t *t = e->copy;
+		e->copy = e->fresh;
+		e->fresh = t;
+	} else {
+		return;
+	}
+	e->seed = seed;
+	GLenum before = glGetError();
+	GLenum err = rowfix_upload(e, true);
+	uint64_t n = ++rowfix_reuploads[why];
+	if (n <= 8 || (n & (n - 1)) == 0 || err != GL_NO_ERROR) {
+		sweetdrm_say("7.7 rowfix: surface %u tex %u copied again (%s changed): err 0x%04x, before 0x%04x; so far seed "
+		    "%llu bytes %llu", e->sid, tex, why ? "bytes" : "seed", err, before,
+		    (unsigned long long)rowfix_reuploads[0], (unsigned long long)rowfix_reuploads[1]);
+	}
+}
+
 /* bind_iosurface: tex now holds surf */
 static void
 stripe_record(unsigned tex, IOSurfaceRef surf, uint32_t sid, unsigned w, unsigned h)
@@ -680,10 +964,13 @@ stripe_record(unsigned tex, IOSurfaceRef surf, uint32_t sid, unsigned w, unsigne
 void
 sweeteagl_stripe_forget(int n, const unsigned *tex)
 {
-	if (stripe_live == 0 || tex == NULL) {
+	if ((stripe_live == 0 && rowfix_live == 0) || tex == NULL) {
 		return;
 	}
 	struct sweetgl_context *gl = sweetgl_get_current();
+	for (int i = 0; i < n && rowfix_live; i++) {
+		rowfix_unbind(gl, tex[i]);
+	}
 	for (int i = 0; i < n; i++) {
 		struct stripe_entry *e = stripe_find(gl, tex[i]);
 		if (e) {
@@ -822,6 +1109,9 @@ stripe_compare(struct stripe_entry *e, double age_s)
 void
 sweeteagl_stripe_check(unsigned tex)
 {
+	if (rowfix_live) {
+		rowfix_check(tex);
+	}
 	if (stripe_live == 0) {
 		return;
 	}
@@ -1615,8 +1905,29 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 	BOOL ok = NO;
 	uint32_t sid = IOSurfaceGetID(surf);
 	unsigned stride = (unsigned)IOSurfaceGetBytesPerRow(surf);
-	struct sweetgl_image *img = sweetgl_image_from_iosurface(display, sid, IOSurfaceGetBaseAddress(surf), width,
-	    height, stride, fourcc);
+	/* G8b: a surface whose writer packs its rows tighter than the stride is copied, not imported */
+	GLint bound = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	bool copied = false;
+	if (strcmp(how, "texImageIOSurface") == 0) {
+		GLenum pending = glGetError();
+		copied = rowfix_bind(p->gl, (unsigned)bound, surf, sid, width, height, fourcc, stride);
+		if (pending != GL_NO_ERROR) {
+			sweetdrm_say("7.5 eagl: %s: GL error 0x%04x pending before it (dropped)", how, pending);
+		}
+	} else {
+		rowfix_note_rendered(sid);
+		rowfix_unbind(p->gl, (unsigned)bound);
+	}
+	if (copied) {
+		ok = YES;
+		use_hold(surf);
+		if (width >= 512 && height >= 512) {
+			diag_record_surface(surf, sid);
+		}
+	}
+	struct sweetgl_image *img = copied ? NULL : sweetgl_image_from_iosurface(display, sid,
+	    IOSurfaceGetBaseAddress(surf), width, height, stride, fourcc);
 	if (img) {
 		/* an error pending from the client's own calls would be mistaken for ours: log it, drop it */
 		GLenum before = glGetError(), e;
@@ -1671,7 +1982,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 	static unsigned logged;
 	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < BIND_LOG_MAX) {
 		sweetdrm_say("7.7 eagl: %s surface %u %ux%u stride %u fmt 0x%08x -> %s, footprint %u MB", how, sid, width,
-		    height, stride, fourcc, ok ? "ok" : "FAILED", footprint_mb());
+		    height, stride, fourcc, ok ? copied ? "ok, copied" : "ok" : "FAILED", footprint_mb());
 	}
 	return ok;
 }
