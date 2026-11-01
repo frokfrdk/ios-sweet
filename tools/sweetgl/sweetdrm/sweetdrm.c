@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -66,6 +67,7 @@ struct bo {
 	uint32_t max_pages, lo, hi;     /* G7y: most changed pages in one, lowest and highest changed page */
 	uint8_t *heap_dirty;            /* G7z: a Mesa heap block: bitmap of pages in submits' sub-BOs since its clean */
 	uint32_t unreported, first_unreported; /* G7z: sampled changed pages no sub-BO range covered */
+	uint32_t wp;                    /* G8a: 1 + its write-protect slot, or 0 */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -130,6 +132,7 @@ static struct {
 /* G7v: submit clean of own BOs, of imports, imports skipped; G7w: tracked own BOs skipped, cleaned;
  * G7z: heap blocks: cleaned (sub-BO ranges), skipped */
 static uint64_t clean_bytes[7];
+static uint64_t wp_faults;              /* G8a: writes that hit a write-protected heap page */
 
 uint64_t
 sweetdrm_now_ns(void)
@@ -227,7 +230,8 @@ top_cleaned(unsigned secs)
 			sweetdrm_say("7.7 time %us:     changed between cleans: %u samples, avg %u max %u of %llu pages, "
 			    "pages %u-%u%s unreported %u first %d", secs, b->samples, b->pages / b->samples, b->max_pages,
 			    (unsigned long long)(b->size / SAMPLE_PAGE), b->lo == UINT32_MAX ? 0 : b->lo, b->hi,
-			    b->heap_dirty ? "; heap block:" : ";", b->unreported, (int)b->first_unreported);
+			    b->wp ? "; heap block, write-protected:" : b->heap_dirty ? "; heap block:" : ";", b->unreported,
+			    (int)b->first_unreported);
 		}
 	}
 }
@@ -261,14 +265,15 @@ sweetdrm_time_report(unsigned secs)
 	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
 	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
 	sweetdrm_say("7.7 time %us: sclean KiB own %llu import %llu import skipped %llu own skipped %llu (texture) "
-	    "own texture %llu heap ranges %llu heap skipped %llu", secs,
+	    "own texture %llu heap ranges %llu heap skipped %llu heap write faults %llu", secs,
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[0], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[1], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[3], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[4], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[5], 0u, __ATOMIC_RELAXED) >> 10),
-	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[6], 0u, __ATOMIC_RELAXED) >> 10));
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[6], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)__atomic_exchange_n(&wp_faults, 0u, __ATOMIC_RELAXED));
 	top_cleaned(secs);
 	cpu_before = cpu;
 }
@@ -350,7 +355,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		b = &bos[nbos++];
 	}
 	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false, 0, 0, 0,
-	    NULL, false, 0, 0, 0, UINT32_MAX, 0, NULL, 0, UINT32_MAX };
+	    NULL, false, 0, 0, 0, UINT32_MAX, 0, NULL, 0, UINT32_MAX, 0 };
 	return 0;
 }
 
@@ -479,6 +484,127 @@ get_param(struct drm_msm_param *p)
 	}
 }
 
+/*
+ * G8a: G7z still cleaned 2-3 GB of heap-block ranges per 5 s where its samples
+ * found 0-7 of a block's 1024 pages changed. A heap block's pages are now made
+ * read-only when cleaned; the CPU's first write to one faults, wp_fault notes
+ * the page and makes it writable, and the next submit cleans only the noted
+ * pages (protecting them again). Faults that are not ours go to the handler
+ * that was there before. SWEETDRM_HEAPWP=0 (read at each new heap block) keeps
+ * G7z's sub-BO ranges.
+ */
+#define WP_BLOCKS       64u
+#define WP_MAX_PAGES    1024u
+
+struct wp_block {
+	uintptr_t start;                /* 0 = free; set last, cleared first */
+	size_t size;
+	uint8_t written[WP_MAX_PAGES / 8]; /* pages (wp_page bytes) written since they were protected */
+};
+static struct wp_block wps[WP_BLOCKS];
+static size_t wp_page;
+static int wp_state;                    /* 0 untried, 1 handlers in, -1 failed */
+static struct sigaction wp_old[2];      /* SIGSEGV, SIGBUS */
+
+static void
+wp_fault(int sig, siginfo_t *si, void *uc)
+{
+	uintptr_t a = (uintptr_t)si->si_addr;
+	for (unsigned i = 0; i < WP_BLOCKS; i++) {
+		uintptr_t s = __atomic_load_n(&wps[i].start, __ATOMIC_ACQUIRE);
+		if (s == 0 || a - s >= wps[i].size) {
+			continue;
+		}
+		size_t p = (a - s) / wp_page;
+		/* writable first, then noted: a clean in between protects it again and the write faults anew */
+		if (mprotect((void *)(s + p * wp_page), wp_page, PROT_READ | PROT_WRITE) == 0) {
+			__atomic_or_fetch(&wps[i].written[p / 8], (uint8_t)(1u << (p % 8)), __ATOMIC_SEQ_CST);
+			__atomic_add_fetch(&wp_faults, 1u, __ATOMIC_RELAXED);
+			return;
+		}
+		break;
+	}
+	const struct sigaction *old = &wp_old[sig == SIGBUS];
+	if (old->sa_flags & SA_SIGINFO) {
+		old->sa_sigaction(sig, si, uc);
+	} else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+		old->sa_handler(sig);
+	} else {
+		/* the default action again: the access faults anew and the process dies as it would have */
+		struct sigaction dfl;
+		memset(&dfl, 0, sizeof dfl);
+		dfl.sa_handler = SIG_DFL;
+		sigaction(sig, &dfl, NULL);
+	}
+}
+
+/* Lock held: track a new heap block's writes (its first clean takes all of it) */
+static void
+wp_add(struct bo *b)
+{
+	static bool said;
+	const char *v = getenv("SWEETDRM_HEAPWP");
+	bool on = !(v && v[0] == '0');
+	if (!said) {
+		said = true;
+		say("submit: write-protect Mesa heap blocks, clean only the pages written since: %s",
+		    on ? "on" : "off (SWEETDRM_HEAPWP=0)");
+	}
+	if (!on || b->cpu == NULL || wp_state < 0) {
+		return;
+	}
+	if (wp_state == 0) {
+		struct sigaction sa;
+		memset(&sa, 0, sizeof sa);
+		sa.sa_sigaction = wp_fault;
+		sa.sa_flags = SA_SIGINFO | SA_RESTART;
+		sigemptyset(&sa.sa_mask);
+		wp_page = (size_t)getpagesize();
+		if (sigaction(SIGSEGV, &sa, &wp_old[0]) != 0 || sigaction(SIGBUS, &sa, &wp_old[1]) != 0) {
+			say("heap write-protect: sigaction failed: %s", strerror(errno));
+			wp_state = -1;
+			return;
+		}
+		wp_state = 1;
+	}
+	uintptr_t s = (uintptr_t)b->cpu;
+	if (s % wp_page || b->size % wp_page || b->size / wp_page > WP_MAX_PAGES) {
+		say("heap write-protect: bo %u at %#lx size %llu does not fit %zu-byte pages; sub-BO ranges", b->handle,
+		    (unsigned long)s, (unsigned long long)b->size, wp_page);
+		return;
+	}
+	unsigned i = 0;
+	while (i < WP_BLOCKS && wps[i].start) {
+		i++;
+	}
+	if (i == WP_BLOCKS) {
+		return;
+	}
+	wps[i].size = (size_t)b->size;
+	memset(wps[i].written, 0xff, sizeof wps[i].written);
+	__atomic_store_n(&wps[i].start, s, __ATOMIC_RELEASE);
+	b->wp = i + 1;
+}
+
+/* Lock held */
+static void
+wp_remove(struct bo *b)
+{
+	if (b->wp == 0) {
+		return;
+	}
+	struct wp_block *w = &wps[b->wp - 1];
+	mprotect(b->cpu, w->size, PROT_READ | PROT_WRITE);
+	__atomic_store_n(&w->start, 0, __ATOMIC_RELEASE);
+	b->wp = 0;
+}
+
+static bool
+wp_written(const struct bo *b, size_t page)
+{
+	return __atomic_load_n(&wps[b->wp - 1].written[page / 8], __ATOMIC_SEQ_CST) & (1u << (page % 8));
+}
+
 static int
 gem_new(struct drm_msm_gem_new *r)
 {
@@ -525,6 +651,7 @@ gem_close(uint32_t handle)
 	struct bo *b = find(handle);
 	uint32_t sid = b ? b->surface_id : 0;
 	if (b) {
+		wp_remove(b);
 		b->handle = 0;
 		free(b->shadow);
 		b->shadow = NULL;
@@ -624,6 +751,9 @@ sweetdrm_heap_block(uint32_t handle)
 	struct bo *b = find(handle);
 	if (b && !b->surface_id && b->heap_dirty == NULL) {
 		b->heap_dirty = calloc(1, heap_map_bytes(b));
+		if (b->heap_dirty) {
+			wp_add(b);
+		}
 	}
 	pthread_mutex_unlock(&lock);
 }
@@ -667,6 +797,45 @@ clean_heap(struct bo *b)
 	return done;
 }
 
+/*
+ * Lock held. G8a: clean a write-protected heap block's written pages, in runs:
+ * each run's marks cleared, then protected, then cleaned, so a write before
+ * the protect is in this clean and one after it faults and is marked again.
+ */
+static uint64_t
+clean_wp(struct bo *b)
+{
+	struct wp_block *w = &wps[b->wp - 1];
+	size_t pages = w->size / wp_page;
+	uint64_t done = 0;
+	for (size_t p = 0; p < pages;) {
+		if (!wp_written(b, p)) {
+			p++;
+			continue;
+		}
+		size_t q = p;
+		while (q < pages && wp_written(b, q)) {
+			__atomic_and_fetch(&w->written[q / 8], (uint8_t)~(1u << (q % 8)), __ATOMIC_SEQ_CST);
+			q++;
+		}
+		uint8_t *at = (uint8_t *)b->cpu + p * wp_page;
+		if (mprotect(at, (q - p) * wp_page, PROT_READ) != 0) {
+			say("heap write-protect: mprotect of bo %u failed: %s; back to sub-BO ranges", b->handle, strerror(errno));
+			wp_remove(b);
+			dcache_clean_invalidate(b->cpu, b->size);
+			done = b->size;
+			break;
+		}
+		dcache_clean_invalidate(at, (uint64_t)(q - p) * wp_page);
+		done += (uint64_t)(q - p) * wp_page;
+		p = q;
+	}
+	memset(b->heap_dirty, 0, heap_map_bytes(b));
+	__atomic_add_fetch(&clean_bytes[5], done, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&clean_bytes[6], b->size - done, __ATOMIC_RELAXED);
+	return done;
+}
+
 /* Lock held. G7y: before a clean, compare with the copy; after it, maybe take one */
 static void
 sample_changes(struct bo *b, bool after)
@@ -694,7 +863,9 @@ sample_changes(struct bo *b, bool after)
 				b->hi = p > b->hi ? p : b->hi;
 				/* G7z: changed, yet in no sub-BO a submit reported (a CPU write the range clean misses,
 				 * or the GPU wrote it) */
-				if (b->heap_dirty && !(b->heap_dirty[p / 8] & (1u << (p % 8)))) {
+				bool noted = b->wp ? wp_written(b, (size_t)p * SAMPLE_PAGE / wp_page) :
+				    b->heap_dirty && (b->heap_dirty[p / 8] & (1u << (p % 8)));
+				if (b->heap_dirty && !noted) {
 					b->unreported++;
 					b->first_unreported = p < b->first_unreported ? p : b->first_unreported;
 				}
@@ -769,7 +940,9 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 		}
 		sample_changes(b, false);
 		uint64_t done = b->size;
-		if (b->heap_dirty && heapclean) {
+		if (b->wp) {
+			done = clean_wp(b);
+		} else if (b->heap_dirty && heapclean) {
 			done = clean_heap(b);
 		} else {
 			dcache_clean_invalidate(b->cpu, b->size);

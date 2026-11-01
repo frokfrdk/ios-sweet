@@ -856,6 +856,8 @@ struct probe {
 	GLint fb, vp[4], prog, count;
 	bool box;                       /* G7x: lo/hi hold attrib 0's x,y range (raw and divided by w) */
 	float lo[2], hi[2];
+	bool proj;                      /* G8a: plo/phi hold the window range of vertex_matrix * attrib 0 */
+	float plo[2], phi[2];
 };
 
 /* G7x: vertex v's index, or -1 when the indices are in a buffer */
@@ -1017,14 +1019,21 @@ probe_half(uint16_t h)
  * missing. Log what the mesh should draw: the uniforms its vertex shader uses
  * and every vertex's client-side float or half-float attribs, so the expected
  * picture can be drawn on the host and compared with the readback.
+ * G8a: G7z's boxes (raw and /w positions) covered only part of the hand. Also
+ * project every vertex as the GPU does (vertex_matrix, then the viewport), so
+ * the readback box can be placed on the window range the draw really covers.
  */
 #define PROBE_MESH_MAX          96
 
 static void
-probe_mesh(uint32_t sid, GLint prog, GLint first, GLsizei count, GLenum itype, const void *indices)
+probe_mesh(struct probe *p, GLint first, GLsizei count, GLenum itype, const void *indices)
 {
 	static const char *const names[] = { "vertex_matrix", "texmat0", "texmat1", "texmatD", "texmatW" };
-	GLint ebo = 0;
+	uint32_t sid = p->e->sid;
+	GLint prog = p->prog, ebo = 0;
+	float m[16];
+	bool have_m = false;
+	p->proj = false;
 	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
 	for (unsigned n = 0; n < sizeof names / sizeof names[0]; n++) {
 		GLint loc = glGetUniformLocation((GLuint)prog, names[n]);
@@ -1034,6 +1043,10 @@ probe_mesh(uint32_t sid, GLint prog, GLint first, GLsizei count, GLenum itype, c
 		float u[16];
 		unsigned nu = n == 0 ? 16 : 4;
 		glGetUniformfv((GLuint)prog, loc, u);
+		if (n == 0) {
+			memcpy(m, u, sizeof m);
+			have_m = true;
+		}
 		for (unsigned at = 0; at < nu; at += 8) {
 			char vals[128] = "";
 			size_t len = 0;
@@ -1051,6 +1064,8 @@ probe_mesh(uint32_t sid, GLint prog, GLint first, GLsizei count, GLenum itype, c
 		}
 		char vals[176] = "";
 		size_t len = 0;
+		float pos[4] = { 0, 0, 0, 1 };
+		bool have_pos = false;
 		for (GLuint a = 0; a < 4; a++) {
 			GLint on = 0, size = 0, type = 0, stride = 0, buf = 0;
 			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
@@ -1070,8 +1085,37 @@ probe_mesh(uint32_t sid, GLint prog, GLint first, GLsizei count, GLenum itype, c
 				float f = type == GL_FLOAT ? ((const float *)q)[c] : probe_half(((const uint16_t *)q)[c]);
 				len += (size_t)snprintf(vals + len, sizeof vals - len, " %.5g", (double)f);
 			}
+			for (GLint c = 0; a == 0 && c < size; c++) {
+				pos[c] = type == GL_FLOAT ? ((const float *)q)[c] : probe_half(((const uint16_t *)q)[c]);
+				have_pos = true;
+			}
 		}
 		sweetdrm_say("7.7 probe %u v%02u:%s", sid, v, vals);
+		if (!have_m || !have_pos) {
+			continue;
+		}
+		/* column-major, as glGetUniformfv returns it; window coordinates relative to the viewport */
+		float clip[4];
+		for (unsigned r = 0; r < 4; r++) {
+			clip[r] = m[r] * pos[0] + m[r + 4] * pos[1] + m[r + 8] * pos[2] + m[r + 12] * pos[3];
+		}
+		if (!(clip[3] > 1e-6f)) {
+			continue;
+		}
+		float wx = (clip[0] / clip[3] + 1) * 0.5f * (float)p->vp[2], wy = (clip[1] / clip[3] + 1) * 0.5f * (float)p->vp[3];
+		if (!p->proj) {
+			p->plo[0] = p->phi[0] = wx;
+			p->plo[1] = p->phi[1] = wy;
+			p->proj = true;
+		}
+		p->plo[0] = wx < p->plo[0] ? wx : p->plo[0];
+		p->phi[0] = wx > p->phi[0] ? wx : p->phi[0];
+		p->plo[1] = wy < p->plo[1] ? wy : p->plo[1];
+		p->phi[1] = wy > p->phi[1] ? wy : p->phi[1];
+	}
+	if (p->proj) {
+		sweetdrm_say("7.7 probe %u: projected window x %.1f..%.1f y %.1f..%.1f (GL, bottom up)", sid, (double)p->plo[0],
+		    (double)p->phi[0], (double)p->plo[1], (double)p->phi[1]);
 	}
 }
 
@@ -1108,6 +1152,7 @@ sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const
 	static struct probe p;
 	p.e = e;
 	p.count = count;
+	p.proj = false;
 	GLint prog = 0, sampler = 0, blend = 0, bs = 0, bd = 0, bsa = 0, bda = 0, sc = 0, box[4] = { 0 }, mask[4] = { 0 };
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &p.fb);
 	glGetIntegerv(GL_VIEWPORT, p.vp);
@@ -1144,7 +1189,7 @@ sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const
 	}
 	if (count > 6) {
 		probe_shaders(prog);
-		probe_mesh(e->sid, prog, first, count, itype, indices);
+		probe_mesh(&p, first, count, itype, indices);
 	}
 	return &p;
 }
@@ -1231,6 +1276,96 @@ probe_box(const struct probe *p, const char *tag, bool flip)
 	probe_picture(p, tag, p->vp[0] + x, p->vp[1] + y, bw, bh, (unsigned)bw, (unsigned)bh);
 }
 
+/*
+ * G8a: the projected window range plus a 2 pixel margin, read in full and,
+ * when wider or taller than PROBE_BOX, logged at PROBE_BOX cells.
+ */
+static void
+probe_proj_box(const struct probe *p)
+{
+	GLint x0 = (GLint)floorf(p->plo[0]) - 2, y0 = (GLint)floorf(p->plo[1]) - 2;
+	GLint x1 = (GLint)ceilf(p->phi[0]) + 2, y1 = (GLint)ceilf(p->phi[1]) + 2;
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > p->vp[2] ? p->vp[2] : x1;
+	y1 = y1 > p->vp[3] ? p->vp[3] : y1;
+	GLint w = x1 - x0, h = y1 - y0;
+	if (w <= 0 || h <= 0 || w > PROBE_MAX_DIM || h > PROBE_MAX_DIM) {
+		sweetdrm_say("7.7 probe %u: projected box %d,%d %dx%d not read", p->e->sid, x0, y0, w, h);
+		return;
+	}
+	probe_picture(p, "p", p->vp[0] + x0, p->vp[1] + y0, w, h, w < PROBE_BOX ? (unsigned)w : PROBE_BOX,
+	    h < PROBE_BOX ? (unsigned)h : PROBE_BOX);
+}
+
+/*
+ * G8a: the texels the mesh samples, as RGBA hex (bytes as glReadPixels gives
+ * them), bottom row (t = 0) first, PROBE_TEXELS_PER_LINE to a line, so the host
+ * can sample the texture as the GPU does. Small textures only.
+ */
+#define PROBE_TEXELS_MAX        4096u
+#define PROBE_TEXELS_PER_LINE   12u
+
+static void
+probe_texels(const struct probe *p)
+{
+	const struct stripe_entry *e = p->e;
+	unsigned w = e->w, h = e->h;
+	if ((size_t)w * h > PROBE_TEXELS_MAX) {
+		sweetdrm_say("7.7 probe %u t: texture %ux%u not dumped (over %u texels)", e->sid, w, h, PROBE_TEXELS_MAX);
+		return;
+	}
+	uint8_t *px = calloc((size_t)w * h, 4);
+	if (px == NULL) {
+		return;
+	}
+	GLint old_read = 0, old_pack = 0, align = 4, rl = 0, sr = 0, sp = 0;
+	GLenum before = glGetError();
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old_pack);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+	glGetIntegerv(GL_PACK_SKIP_ROWS, &sr);
+	glGetIntegerv(GL_PACK_SKIP_PIXELS, &sp);
+	GLuint fb = 0;
+	glGenFramebuffers(1, &fb);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->tex, 0);
+	GLenum status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	if (status == GL_FRAMEBUFFER_COMPLETE) {
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+		glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		glPixelStorei(GL_PACK_ALIGNMENT, align);
+		glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+		glPixelStorei(GL_PACK_SKIP_ROWS, sr);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, sp);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)old_pack);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read);
+	glDeleteFramebuffers(1, &fb);
+	GLenum err = glGetError();
+	sweetdrm_say("7.7 probe %u t: texture %u %ux%u fb 0x%x err 0x%x before 0x%x; RGBA hex, row 0 (t = 0) first",
+	    e->sid, e->tex, w, h, status, err, before);
+	if (status == GL_FRAMEBUFFER_COMPLETE && err == GL_NO_ERROR) {
+		for (unsigned y = 0; y < h; y++) {
+			for (unsigned x = 0; x < w; x += PROBE_TEXELS_PER_LINE) {
+				char line[PROBE_TEXELS_PER_LINE * 9 + 1];
+				size_t len = 0;
+				for (unsigned k = x; k < w && k < x + PROBE_TEXELS_PER_LINE; k++) {
+					const uint8_t *q = px + ((size_t)y * w + k) * 4;
+					len += (size_t)snprintf(line + len, sizeof line - len, " %02x%02x%02x%02x", q[0], q[1], q[2], q[3]);
+				}
+				sweetdrm_say("7.7 probe %u t%02u.%02u:%s", e->sid, y, x, line);
+			}
+		}
+	}
+	free(px);
+}
+
 void
 sweeteagl_probe_end(void *token)
 {
@@ -1244,6 +1379,10 @@ sweeteagl_probe_end(void *token)
 	} else if (w <= PROBE_MAX_DIM && h <= PROBE_MAX_DIM) {
 		probe_picture(p, "r", p->vp[0], p->vp[1], w, h, (unsigned)w < PROBE_CELLS ? (unsigned)w : PROBE_CELLS,
 		    (unsigned)h < PROBE_CELLS ? (unsigned)h : PROBE_CELLS);
+	} else if (p->proj && p->count > 6) {
+		/* G8a: the meshes (clock hands) on a full-screen target, where the GPU put them */
+		probe_proj_box(p);
+		probe_texels(p);
 	} else if (p->box && p->count > 6) {
 		/* G7x: the meshes (clock hands) on a full-screen target; which way y runs is not known */
 		probe_box(p, "b", false);

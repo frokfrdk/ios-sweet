@@ -49,7 +49,11 @@ f_bo_new(uint64_t size, uint32_t *h, uint64_t *va, void **cpu)
 	for (uint32_t i = 1; i <= FAKE_BOS; i++) {
 		if (!fbo[i].live) {
 			fbo[i].size = (size + 0x3fff) & ~0x3fffull;
-			fbo[i].cpu = calloc(1, fbo[i].size);
+			/* page aligned, as the kernel maps BOs (G8a write-protects heap blocks) */
+			fbo[i].cpu = mmap(NULL, fbo[i].size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (fbo[i].cpu == MAP_FAILED) {
+				return ENOMEM;
+			}
 			fbo[i].live = 1;
 			*h = i;
 			*va = 0x100000000ull + (uint64_t)i * 0x1000000;
@@ -84,7 +88,9 @@ f_bo_free(uint32_t h)
 	if (h == 0 || h > FAKE_BOS || !fbo[h].live) {
 		return EINVAL;
 	}
-	free(fbo[h].cpu);
+	if (fbo[h].cpu) {
+		munmap(fbo[h].cpu, fbo[h].size);
+	}
 	fbo[h] = (typeof(fbo[h])){ 0, NULL, 0 };
 	return 0;
 }
@@ -391,7 +397,9 @@ main(void)
 	sweetdrm_time_report(7);
 	CHECK(strstr(last_report, "changed between cleans: 1 samples, avg 2 max 2 of 256 pages, pages 3-10;") != NULL);
 	/* G7z: as a heap block it is cleaned only on reported sub-BO pages; a changed page outside them is counted */
+	setenv("SWEETDRM_HEAPWP", "0", 1);
 	sweetdrm_heap_block(big);
+	unsetenv("SWEETDRM_HEAPWP");
 	sweetdrm_heap_block(999);       /* unknown handle: ignored */
 	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);        /* clean 1: nothing reported, copy taken */
 	pbig[5 * 4096 + 1] = 3;
@@ -403,6 +411,32 @@ main(void)
 	CHECK(strstr(last_sclean, "own texture 0 heap ranges 4 heap skipped 2044") != NULL);
 	CHECK(strstr(last_report, "pages 5-7; heap block: unreported 1 first 7") != NULL);
 	CHECK(sweetdrm_munmap(pbig, 1u << 20) == 0);
+	/* G8a: a write-protected heap block is cleaned in full once, then only on the pages written since */
+	size_t pg = (size_t)getpagesize();
+	uint32_t hb = gem_new(fd, 1u << 20);
+	CHECK(gem_info(fd, hb, MSM_INFO_GET_OFFSET, &off) == 0);
+	uint8_t *phb = sweetdrm_mmap(NULL, 1u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off);
+	CHECK(phb != MAP_FAILED);
+	sweetdrm_heap_block(hb);
+	struct drm_msm_gem_submit_bo shb[1] = { { .handle = hb } };
+	CHECK(submit(fd, shb, 1, cmd, 1, &fence) == 0);         /* clean 1: all of it, then protected; copy taken */
+	sweetdrm_time_report(9);
+	CHECK(strstr(last_sclean, "heap ranges 1024 heap skipped 0 heap write faults 0") != NULL);
+	CHECK(submit(fd, shb, 1, cmd, 1, &fence) == 0);         /* clean 2: nothing written */
+	phb[5 * pg + 1] = 3;                                    /* faults once, then writable */
+	phb[5 * pg + 2] = 4;
+	phb[7 * pg] = 5;
+	CHECK(submit(fd, shb, 1, cmd, 1, &fence) == 0);         /* clean 3: pages 5 and 7, protected again */
+	phb[7 * pg + 9] = 6;                                    /* faults again */
+	CHECK(phb[5 * pg + 1] == 3 && phb[7 * pg + 9] == 6);
+	CHECK(submit(fd, shb, 1, cmd, 1, &fence) == 0);         /* clean 4: page 7 */
+	sweetdrm_time_report(10);
+	char want[120];
+	snprintf(want, sizeof want, "heap ranges %zu heap skipped %zu heap write faults 3", 3 * pg >> 10,
+	    ((3u << 20) - 3 * pg) >> 10);   /* cleans 2-4 */
+	CHECK(strstr(last_sclean, want) != NULL);
+	CHECK(strstr(last_report, "heap block, write-protected: unreported 0 first -1") != NULL);
+	CHECK(drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close){ .handle = hb }) == 0);
 	retire_all();
 	sweetdrm_set_surface_hooks(NULL);
 	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
