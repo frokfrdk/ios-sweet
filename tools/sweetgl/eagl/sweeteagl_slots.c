@@ -142,11 +142,11 @@ sweeteagl_blame_error(const char *fn)
  */
 #define OFFSCREEN_KEYS          96
 #define OFFSCREEN_EVERY_NS      15000000000ull
-#define OFFSCREEN_LOG_MAX       400u
+#define OFFSCREEN_LOG_MAX       1000u   /* G8e: 400 ran out before the App Library opened */
 #define OFFSCREEN_MAX_PIXELS    (2u << 20)
 #define OFFSCREEN_GRID          16
 
-static unsigned fb_draws;               /* draws into the bound draw framebuffer since it was bound */
+static unsigned os_draws;               /* draws into the bound draw framebuffer since it was bound */
 static GLuint cur_prog, fb_prog;        /* the program in use; the one of the last draw */
 
 static void
@@ -253,8 +253,8 @@ offscreen_done(GLenum target, GLuint next)
 	if ((GLuint)cur == next) {
 		return;
 	}
-	unsigned draws = fb_draws;
-	fb_draws = 0;
+	unsigned draws = os_draws;
+	os_draws = 0;
 	if (on < 0) {
 		const char *v = getenv("SWEETEAGL_OFFSCREEN");
 		on = !(v && v[0] == '0');
@@ -326,6 +326,7 @@ static struct {
 static unsigned char tc_bad[256];       /* flagged lines per texture name, modulo 256 */
 static unsigned tc_logged;
 static int texcheck_on = -1;
+static bool tc_said;                    /* this draw's texcheck lines were logged (G8e logs its state after them) */
 
 /* the 2D sampler uniforms of prog (names are not kept); NULL when the table is full */
 static struct tc_prog *
@@ -424,6 +425,7 @@ tc_unit(GLuint prog, GLint loc, char *out, size_t n, GLint *tex_out)
 static void
 texcheck_draw(void)
 {
+	tc_said = false;
 	if (texcheck_on < 0) {
 		const char *v = getenv("SWEETEAGL_TEXCHECK");
 		texcheck_on = !(v && v[0] == '0');
@@ -486,10 +488,198 @@ texcheck_draw(void)
 	GLint vp[4] = { 0 };
 	glGetIntegerv(GL_VIEWPORT, vp);
 	tc_logged++;
+	tc_said = true;
 	sweetdrm_say("7.7 texcheck fb %d viewport %dx%d prog %d: %u samplers%s (G8d)", fb, vp[2], vp[3], prog, pe->n,
 	    flagged ? ", INCOMPLETE" : "");
 	for (unsigned k = 0; k < pe->n; k++) {
 		sweetdrm_say("7.7 texcheck fb %d   %s", fb, desc[k]);
+	}
+}
+
+/*
+ * G8e: every sampler of the App Library blur passes is complete (G8d), yet
+ * G8c read them back transparent. So after each draw texcheck logs, log the
+ * state that can keep a draw from writing: scissor, colour mask, blend,
+ * depth, stencil, cull and rasterizer discard; the program's first mat4
+ * uniform; and for each enabled float attribute array, the range of every
+ * component over the vertices the draw uses (client memory or a mapped
+ * buffer). SWEETEAGL_DRAWSTATE=0 turns it off.
+ */
+#define DRAWSTATE_ATTRIBS       8u
+#define DRAWSTATE_MAX_VERTS     4096u
+#define DRAWSTATE_LOG_MAX       1500u
+
+/* maps len bytes of buffer buf at off for reading through target; *old is the binding to give back */
+static const uint8_t *
+ds_map(GLenum target, GLenum binding, GLint buf, intptr_t off, size_t len, GLint *old)
+{
+	glGetIntegerv(binding, old);
+	glBindBuffer(target, (GLuint)buf);
+	const void *p = glMapBufferRange(target, off, (GLsizeiptr)len, GL_MAP_READ_BIT);
+	if (p == NULL) {
+		glGetError();
+		glBindBuffer(target, (GLuint)*old);
+	}
+	return p;
+}
+
+static void
+ds_unmap(GLenum target, GLint old)
+{
+	glUnmapBuffer(target);
+	glBindBuffer(target, (GLuint)old);
+}
+
+static const char *
+ds_on(GLenum cap)
+{
+	return glIsEnabled(cap) ? "on" : "off";
+}
+
+static void
+drawstate(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *indices)
+{
+	static int on = -1;
+	static unsigned logged;
+	if (on < 0) {
+		const char *v = getenv("SWEETEAGL_DRAWSTATE");
+		on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 drawstate: write state and vertex ranges of the draws texcheck logs: %s",
+		    on ? "on" : "off (SWEETEAGL_DRAWSTATE=0)");
+	}
+	if (!on || !tc_said || logged >= DRAWSTATE_LOG_MAX || count <= 0) {
+		return;
+	}
+	logged++;
+	/* the queries below clear errors: hold a pending one for CA's glGetError */
+	GLenum pend = glGetError();
+	if (pend != GL_NO_ERROR && held_error == GL_NO_ERROR) {
+		held_error = pend;
+	}
+	GLint fb = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+	GLint vp[4] = { 0 }, sc[4] = { 0 }, bs = 0, bd = 0, bsa = 0, bda = 0, eq = 0, eqa = 0, df = 0, sf = 0, sref = 0,
+	    smask = 0, sfail = 0, szf = 0, szp = 0, swm = 0, cullf = 0;
+	GLboolean cm[4] = { 0 }, dw = 0;
+	glGetIntegerv(GL_VIEWPORT, vp);
+	glGetIntegerv(GL_SCISSOR_BOX, sc);
+	glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+	glGetBooleanv(GL_DEPTH_WRITEMASK, &dw);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &bs);
+	glGetIntegerv(GL_BLEND_DST_RGB, &bd);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
+	glGetIntegerv(GL_BLEND_EQUATION_RGB, &eq);
+	glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &eqa);
+	glGetIntegerv(GL_DEPTH_FUNC, &df);
+	glGetIntegerv(GL_STENCIL_FUNC, &sf);
+	glGetIntegerv(GL_STENCIL_REF, &sref);
+	glGetIntegerv(GL_STENCIL_VALUE_MASK, &smask);
+	glGetIntegerv(GL_STENCIL_FAIL, &sfail);
+	glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &szf);
+	glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &szp);
+	glGetIntegerv(GL_STENCIL_WRITEMASK, &swm);
+	glGetIntegerv(GL_CULL_FACE_MODE, &cullf);
+	sweetdrm_say("7.7 drawstate fb %d mode 0x%x first %d count %d itype 0x%x: viewport %d,%d %dx%d scissor %s %d,%d %dx%d "
+	    "mask %d%d%d%d blend %s 0x%x/0x%x 0x%x/0x%x eq 0x%x/0x%x depth %s func 0x%x write %d stencil %s func 0x%x ref %d "
+	    "mask 0x%x ops 0x%x/0x%x/0x%x wmask 0x%x cull %s 0x%x discard %s (G8e)", fb, mode, first, count, itype, vp[0],
+	    vp[1], vp[2], vp[3], ds_on(GL_SCISSOR_TEST), sc[0], sc[1], sc[2], sc[3], cm[0], cm[1], cm[2], cm[3],
+	    ds_on(GL_BLEND), bs, bd, bsa, bda, eq, eqa, ds_on(GL_DEPTH_TEST), df, dw, ds_on(GL_STENCIL_TEST), sf, sref,
+	    (unsigned)smask, sfail, szf, szp, (unsigned)swm, ds_on(GL_CULL_FACE), cullf, ds_on(GL_RASTERIZER_DISCARD));
+
+	/* the program's first mat4 uniform */
+	if (fb_prog != 0) {
+		GLint nu = 0;
+		glGetProgramiv(fb_prog, GL_ACTIVE_UNIFORMS, &nu);
+		for (GLint u = 0; u < nu; u++) {
+			char name[64];
+			GLsizei len = 0;
+			GLint size = 0;
+			GLenum type = 0;
+			glGetActiveUniform(fb_prog, (GLuint)u, sizeof(name), &len, &size, &type, name);
+			if (type != GL_FLOAT_MAT4) {
+				continue;
+			}
+			GLfloat m[16] = { 0 };
+			glGetUniformfv(fb_prog, glGetUniformLocation(fb_prog, name), m);
+			sweetdrm_say("7.7 drawstate fb %d   mat4 %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | "
+			    "%.3f %.3f %.3f %.3f", fb, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
+			    m[12], m[13], m[14], m[15]);
+			break;
+		}
+	}
+
+	/* the vertices the draw uses: [lo, hi] */
+	GLint lo = first, hi = first + count - 1;
+	if (itype != 0) {
+		size_t isz = itype == GL_UNSIGNED_BYTE ? 1 : itype == GL_UNSIGNED_SHORT ? 2 : 4;
+		GLint ebuf = 0, old = 0;
+		glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
+		const uint8_t *ix = indices;
+		if (ebuf != 0) {
+			ix = ds_map(GL_ELEMENT_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER_BINDING, ebuf, (intptr_t)indices,
+			    (size_t)count * isz, &old);
+		}
+		if (ix == NULL) {
+			sweetdrm_say("7.7 drawstate fb %d   indices not read (buffer %d)", fb, ebuf);
+			return;
+		}
+		lo = INT32_MAX;
+		hi = 0;
+		for (GLsizei i = 0; i < count; i++) {
+			GLint v = isz == 1 ? ix[i] : isz == 2 ? ((const uint16_t *)ix)[i] : (GLint)((const uint32_t *)ix)[i];
+			lo = v < lo ? v : lo;
+			hi = v > hi ? v : hi;
+		}
+		if (ebuf != 0) {
+			ds_unmap(GL_ELEMENT_ARRAY_BUFFER, old);
+		}
+	}
+	if (hi - lo + 1 > (GLint)DRAWSTATE_MAX_VERTS) {
+		sweetdrm_say("7.7 drawstate fb %d   vertices %d..%d: too many to read", fb, lo, hi);
+		return;
+	}
+	for (GLuint a = 0; a < DRAWSTATE_ATTRIBS; a++) {
+		GLint en = 0, size = 0, type = 0, stride = 0, buf = 0, old = 0;
+		void *ptr = NULL;
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+		if (glGetError() != GL_NO_ERROR || !en) {
+			continue;
+		}
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+		glGetVertexAttribPointerv(a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+		if (type != GL_FLOAT || size < 1 || size > 4) {
+			sweetdrm_say("7.7 drawstate fb %d   a%u size %d type 0x%x stride %d buf %d off %p: not float", fb, a, size,
+			    type, stride, buf, ptr);
+			continue;
+		}
+		size_t step = stride ? (size_t)stride : (size_t)size * 4;
+		size_t span = (size_t)(hi - lo) * step + (size_t)size * 4;
+		const uint8_t *base = (const uint8_t *)ptr + (size_t)lo * step;
+		if (buf != 0) {
+			base = ds_map(GL_ARRAY_BUFFER, GL_ARRAY_BUFFER_BINDING, buf, (intptr_t)base, span, &old);
+		}
+		if (base == NULL) {
+			sweetdrm_say("7.7 drawstate fb %d   a%u buf %d off %p: not read", fb, a, buf, ptr);
+			continue;
+		}
+		float mn[4] = { 0 }, mx[4] = { 0 };
+		for (GLint v = 0; v <= hi - lo; v++) {
+			const float *f = (const float *)(base + (size_t)v * step);
+			for (GLint c = 0; c < size; c++) {
+				mn[c] = v == 0 || f[c] < mn[c] ? f[c] : mn[c];
+				mx[c] = v == 0 || f[c] > mx[c] ? f[c] : mx[c];
+			}
+		}
+		if (buf != 0) {
+			ds_unmap(GL_ARRAY_BUFFER, old);
+		}
+		sweetdrm_say("7.7 drawstate fb %d   a%u size %d stride %d buf %d vertices %d..%d: %.3f..%.3f %.3f..%.3f "
+		    "%.3f..%.3f %.3f..%.3f", fb, a, size, stride, buf, lo, hi, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3],
+		    mx[3]);
 	}
 }
 
@@ -645,8 +835,9 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	SWEETEAGL_ENTER(ctx);
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
-	fb_draws++;
+	os_draws++;
 	texcheck_draw();
+	drawstate(m, f, n, 0, NULL);
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
 	glDrawArrays(m, f, n);
@@ -657,8 +848,9 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	SWEETEAGL_ENTER(ctx);
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
-	fb_draws++;
+	os_draws++;
 	texcheck_draw();
+	drawstate(m, 0, n, t, i);
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
 	glDrawElements(m, n, t, i);
