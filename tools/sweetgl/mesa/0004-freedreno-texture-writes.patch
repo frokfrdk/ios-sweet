@@ -1,0 +1,42 @@
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c	2026-11-01 21:06:15.826960115 +1030
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c	2026-11-01 21:06:15.841386260 +1030
+@@ -35,6 +35,21 @@
+ /* XXX this should go away, needed for 'struct winsys_handle' */
+ #include "frontend/drm_driver.h"
+ 
++/*
++ * sweet: sweetdrm cleans the CPU caches of the BOs a submit uses that the CPU
++ * may have written. Tell it when a texture's BO is written through a map, so
++ * it can skip textures the CPU has not written since their last clean.
++ * Buffers are not reported (persistent maps, uploads): those stay cleaned.
++ */
++void sweetdrm_bo_cpu_write(uint32_t handle, int persistent);
++
++static void
++sweet_report_write(struct fd_resource *rsc, unsigned usage)
++{
++   if ((usage & PIPE_MAP_WRITE) && rsc->b.b.target != PIPE_BUFFER && rsc->bo)
++      sweetdrm_bo_cpu_write(fd_bo_handle(rsc->bo), !!(usage & PIPE_MAP_PERSISTENT));
++}
++
+ /**
+  * Go through the entire state and see if the resource is bound
+  * anywhere. If it is, mark the relevant state as dirty. This is
+@@ -709,6 +724,9 @@
+    struct fd_resource *rsc = fd_resource(ptrans->resource);
+    struct fd_transfer *trans = fd_transfer(ptrans);
+ 
++   /* again at unmap: a submit between map and unmap cleaned it before the writes ended */
++   sweet_report_write(rsc, ptrans->usage);
++
+    if (trans->staging_prsc) {
+       if (ptrans->usage & PIPE_MAP_WRITE)
+          fd_blit_from_staging(ctx, trans);
+@@ -1037,6 +1055,7 @@
+    }
+ 
+    if (ret) {
++      sweet_report_write(rsc, usage);
+       *pptrans = ptrans;
+    } else {
+       fd_resource_transfer_unmap(pctx, ptrans);

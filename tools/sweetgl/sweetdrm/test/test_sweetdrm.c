@@ -353,6 +353,22 @@ main(void)
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
 	sweetdrm_time_report(3);
 	CHECK(strstr(last_report, "import 64 import skipped 0") != NULL);
+	/* G7w: own BO a (20 KiB, mapped) is cleaned at every submit until Mesa reports a texture write for it;
+	 * then only after a write, or always once mapped persistently */
+	struct drm_msm_gem_submit_bo sa[1] = { { .handle = a } };
+	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0);
+	sweetdrm_time_report(4);
+	CHECK(strstr(last_report, "own 40 import 0 import skipped 0 own skipped 0 (texture) own texture 0") != NULL);
+	sweetdrm_bo_cpu_write(a, 0);
+	sweetdrm_bo_cpu_write(999, 0);  /* unknown handle: ignored */
+	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0 &&
+	    submit(fd, sa, 1, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
+	sweetdrm_time_report(5);
+	CHECK(strstr(last_report, "own 20 import 0 import skipped 0 own skipped 40 (texture) own texture 20") != NULL);
+	sweetdrm_bo_cpu_write(a, 1);
+	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0);
+	sweetdrm_time_report(6);
+	CHECK(strstr(last_report, "own 40 import 0 import skipped 0 own skipped 0 (texture) own texture 40") != NULL);
 	sweetdrm_set_surface_hooks(NULL);
 	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == 0);

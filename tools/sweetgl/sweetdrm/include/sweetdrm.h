@@ -88,6 +88,13 @@ void sweetdrm_set_surface_hooks(const struct sweetdrm_surface_hooks *hooks);
 void sweetdrm_cpu_access(void *addr, uint64_t size);
 
 /*
+ * Mesa mapped (or unmapped) a texture's BO for writing (patch 0004). From then
+ * on the submit clean skips that BO unless it was written since its last
+ * clean; persistent != 0 keeps it cleaned at every submit.
+ */
+void sweetdrm_bo_cpu_write(uint32_t handle, int persistent);
+
+/*
  * G7p timing: each kind counts its calls with the time they took (monotonic),
  * the total and the longest. sweetdrm times its own kinds; the EAGL shim times
  * the GL ones. sweetdrm_time_report logs them with this process's CPU time

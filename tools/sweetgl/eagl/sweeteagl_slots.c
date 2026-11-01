@@ -231,7 +231,9 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_before_draw();
+	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
 	glDrawArrays(m, f, n);
+	sweeteagl_probe_end(probe);
 }
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
@@ -239,7 +241,9 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_before_draw();
+	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
 	glDrawElements(m, n, t, i);
+	sweeteagl_probe_end(probe);
 }
 static void s_Enable(CTX, GLenum c)
 {

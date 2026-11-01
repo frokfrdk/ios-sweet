@@ -597,12 +597,21 @@ struct stripe_entry {
 	unsigned tex;
 	IOSurfaceRef surf;              /* retained */
 	uint32_t sid;
-	unsigned w, h, checks;
+	unsigned w, h, checks, probes;
 	uint64_t bound_ns;
 };
 static struct stripe_entry stripe[STRIPE_SURFACES];
 static unsigned stripe_live;
 static int stripe_on = -1;
+
+/* G7w draw probe: the next draw after such a texture is bound */
+#define PROBE_PER_SURFACE       1u
+#define PROBE_MAX               12u
+#define PROBE_MAX_DIM           512
+#define PROBE_CELLS             64
+static struct stripe_entry *probe_next;
+static GLint probe_unit;
+static unsigned probe_total;
 
 static bool
 stripe_enabled(void)
@@ -631,6 +640,9 @@ static void
 stripe_drop(struct stripe_entry *e)
 {
 	CFRelease(e->surf);
+	if (probe_next == e) {
+		probe_next = NULL;
+	}
 	*e = (struct stripe_entry){ 0 };
 	stripe_live--;
 }
@@ -651,7 +663,7 @@ stripe_record(unsigned tex, IOSurfaceRef surf, uint32_t sid, unsigned w, unsigne
 	for (unsigned k = 0; k < STRIPE_SURFACES; k++) {
 		if (stripe[k].gl == NULL) {
 			CFRetain(surf);
-			stripe[k] = (struct stripe_entry){ gl, tex, surf, sid, w, h, 0, sweetdrm_now_ns() };
+			stripe[k] = (struct stripe_entry){ gl, tex, surf, sid, w, h, 0, 0, sweetdrm_now_ns() };
 			stripe_live++;
 			return;
 		}
@@ -810,13 +822,211 @@ sweeteagl_stripe_check(unsigned tex)
 	if (e == NULL) {
 		return;
 	}
+	if (e->probes < PROBE_PER_SURFACE && probe_total < PROBE_MAX) {
+		probe_next = e;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &probe_unit);
+	}
 	uint64_t age = sweetdrm_now_ns() - e->bound_ns;
-	if (age < (e->checks == 0 ? 3000000000ull : 30000000000ull)) {
+	if (e->checks >= STRIPE_CHECKS || age < (e->checks == 0 ? 3000000000ull : 30000000000ull)) {
 		return;
 	}
 	e->checks++;
 	stripe_compare(e, (double)age / 1e9);
-	if (e->checks >= STRIPE_CHECKS) {
+	if (e->checks >= STRIPE_CHECKS && (e->probes >= PROBE_PER_SURFACE || probe_total >= PROBE_MAX)) {
+		stripe_drop(e);
+	}
+}
+
+/*
+ * G7w: the stripe check found the clock hands' surfaces and their textures
+ * equal row for row (G7v), so the stripes come from the draw that samples
+ * them. For the first draw after such a texture is bound: log its sampler,
+ * blend, target and first vertices, then read the target back (when it is
+ * small) as a coarse picture. SWEETEAGL_STRIPE=0 turns this off too.
+ */
+struct probe {
+	struct stripe_entry *e;
+	GLint fb, vp[4];
+};
+
+static void
+probe_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *indices)
+{
+	GLint ebo = 0;
+	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+	unsigned idx[4], nidx = 0;
+	for (unsigned v = 0; v < 4 && (GLsizei)v < count; v++) {
+		if (indices == NULL && itype == 0) {
+			idx[nidx++] = (unsigned)(first + (GLint)v);
+		} else if (ebo == 0 && indices) {
+			idx[nidx++] = itype == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[v] :
+			    itype == GL_UNSIGNED_SHORT ? ((const uint16_t *)indices)[v] : ((const uint32_t *)indices)[v];
+		}
+	}
+	sweetdrm_say("7.7 probe: mode 0x%x first %d count %d itype 0x%x ebo %d", mode, first, count, itype, ebo);
+	for (GLuint a = 0; a < 4; a++) {
+		GLint on = 0, size = 0, type = 0, stride = 0, buf = 0, norm = 0;
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+		if (!on) {
+			continue;
+		}
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm);
+		void *ptr = NULL;
+		glGetVertexAttribPointerv(a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+		char vals[256] = "";
+		size_t at = 0;
+		if (buf == 0 && type == GL_FLOAT && ptr && size > 0 && size <= 4) {
+			size_t step = stride ? (size_t)stride : (size_t)size * 4;
+			for (unsigned v = 0; v < nidx && at < sizeof vals - 48; v++) {
+				const float *p = (const float *)((const uint8_t *)ptr + idx[v] * step);
+				at += (size_t)snprintf(vals + at, sizeof vals - at, " [");
+				for (GLint c = 0; c < size; c++) {
+					at += (size_t)snprintf(vals + at, sizeof vals - at, c ? " %.4g" : "%.4g", (double)p[c]);
+				}
+				at += (size_t)snprintf(vals + at, sizeof vals - at, "]");
+			}
+		}
+		sweetdrm_say("7.7 probe: attrib %u size %d type 0x%x norm %d stride %d vbo %d ptr %p:%s", a, size, type, norm,
+		    stride, buf, ptr, buf ? " (in a buffer)" : vals);
+	}
+}
+
+void *
+sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const void *indices)
+{
+	struct stripe_entry *e = probe_next;
+	if (e == NULL) {
+		return NULL;
+	}
+	probe_next = NULL;
+	if (e->gl != sweetgl_get_current() || probe_total >= PROBE_MAX) {
+		return NULL;
+	}
+	GLint active = 0, bound = 0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	glActiveTexture((GLenum)probe_unit);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	GLint minf = 0, magf = 0, ws = 0, wt = 0, base = 0, maxl = 0;
+	if ((unsigned)bound == e->tex) {
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magf);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, &base);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+	}
+	glActiveTexture((GLenum)active);
+	if ((unsigned)bound != e->tex) {
+		return NULL;    /* rebound before the draw */
+	}
+	e->probes++;
+	probe_total++;
+	static struct probe p;
+	p.e = e;
+	GLint prog = 0, sampler = 0, blend = 0, bs = 0, bd = 0, bsa = 0, bda = 0, sc = 0, box[4] = { 0 }, mask[4] = { 0 };
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &p.fb);
+	glGetIntegerv(GL_VIEWPORT, p.vp);
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+	blend = glIsEnabled(GL_BLEND);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &bs);
+	glGetIntegerv(GL_BLEND_DST_RGB, &bd);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
+	sc = glIsEnabled(GL_SCISSOR_TEST);
+	glGetIntegerv(GL_SCISSOR_BOX, box);
+	glGetIntegerv(GL_COLOR_WRITEMASK, mask);
+	GLint atype = 0, aname = 0, samples = 0;
+	if (p.fb) {
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &atype);
+		if (atype) {
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &aname);
+		}
+	}
+	glGetIntegerv(GL_SAMPLES, &samples);
+	sweetdrm_say("7.7 probe: surface %u %ux%u tex %u unit %d: min 0x%x mag 0x%x wrap 0x%x/0x%x levels %d-%d sampler %d; "
+	    "prog %d", e->sid, e->w, e->h, e->tex, probe_unit - GL_TEXTURE0, minf, magf, ws, wt, base, maxl, sampler, prog);
+	sweetdrm_say("7.7 probe: target fb %d att 0x%x %d samples %d viewport %d,%d %dx%d scissor %d %d,%d %dx%d blend %d "
+	    "0x%x/0x%x 0x%x/0x%x mask %d%d%d%d", p.fb, atype, aname, samples, p.vp[0], p.vp[1], p.vp[2], p.vp[3], sc, box[0],
+	    box[1], box[2], box[3], blend, bs, bd, bsa, bda, mask[0], mask[1], mask[2], mask[3]);
+	probe_attribs(mode, first, count, itype, indices);
+	return &p;
+}
+
+/* a cell: transparent '_', else by luminance '@' dark, '+', '-', ' ' near white */
+static char
+probe_cell(const uint8_t *px)
+{
+	if (px[3] == 0) {
+		return '_';
+	}
+	unsigned l = (px[0] * 3u + px[1] * 6u + px[2]) / 10u;
+	return l < 64 ? '@' : l < 160 ? '+' : l < 240 ? '-' : ' ';
+}
+
+void
+sweeteagl_probe_end(void *token)
+{
+	struct probe *p = token;
+	if (p == NULL) {
+		return;
+	}
+	GLint w = p->vp[2], h = p->vp[3];
+	if (p->fb == 0 || w <= 0 || h <= 0 || w > PROBE_MAX_DIM || h > PROBE_MAX_DIM) {
+		sweetdrm_say("7.7 probe %u: target not read back (fb %d %dx%d)", p->e->sid, p->fb, w, h);
+		return;
+	}
+	uint8_t *px = malloc((size_t)w * (size_t)h * 4);
+	if (px == NULL) {
+		return;
+	}
+	GLint old_read = 0, old_pack = 0, align = 4, rl = 0, sr = 0, sp = 0;
+	GLenum before = glGetError();
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old_pack);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+	glGetIntegerv(GL_PACK_SKIP_ROWS, &sr);
+	glGetIntegerv(GL_PACK_SKIP_PIXELS, &sp);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)p->fb);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+	glReadPixels(p->vp[0], p->vp[1], w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	glPixelStorei(GL_PACK_ALIGNMENT, align);
+	glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+	glPixelStorei(GL_PACK_SKIP_ROWS, sr);
+	glPixelStorei(GL_PACK_SKIP_PIXELS, sp);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)old_pack);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read);
+	GLenum err = glGetError();
+	unsigned cw = (unsigned)w < PROBE_CELLS ? (unsigned)w : PROBE_CELLS, ch = (unsigned)h < PROBE_CELLS ? (unsigned)h : PROBE_CELLS;
+	sweetdrm_say("7.7 probe %u: target %dx%d read err 0x%x before 0x%x; picture %ux%u cells, top row first", p->e->sid, w, h,
+	    err, before, cw, ch);
+	if (err == GL_NO_ERROR) {
+		char line[PROBE_CELLS + 1];
+		for (unsigned cy = 0; cy < ch; cy++) {
+			/* GL rows are bottom up; one sample per cell */
+			unsigned y = (unsigned)h - 1u - cy * (unsigned)h / ch;
+			for (unsigned cx = 0; cx < cw; cx++) {
+				unsigned x = cx * (unsigned)w / cw;
+				line[cx] = probe_cell(px + ((size_t)y * (size_t)w + x) * 4);
+			}
+			line[cw] = 0;
+			sweetdrm_say("7.7 probe %u r%02u: |%s|", p->e->sid, cy, line);
+		}
+	}
+	free(px);
+	struct stripe_entry *e = p->e;
+	if (e->gl && e->checks >= STRIPE_CHECKS && (e->probes >= PROBE_PER_SURFACE || probe_total >= PROBE_MAX)) {
 		stripe_drop(e);
 	}
 }

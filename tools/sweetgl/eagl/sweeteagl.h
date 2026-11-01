@@ -98,6 +98,12 @@ void sweeteagl_after_flush(void);
  */
 void sweeteagl_stripe_check(unsigned tex);
 void sweeteagl_stripe_forget(int n, const unsigned *tex);
+/*
+ * G7w draw probe, around a draw call: begin returns NULL unless such a texture
+ * was bound for it; end reads the target back. itype 0 = glDrawArrays.
+ */
+void *sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const void *indices);
+void sweeteagl_probe_end(void *token);
 
 /* The generated stubs (sweeteagl_stubs.S): stub i loads i and calls this, which logs once and returns 0 */
 extern const uint32_t sweeteagl_unknown_stubs[SWEETEAGL_SLOTS * 2u];

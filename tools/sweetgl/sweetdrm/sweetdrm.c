@@ -54,6 +54,9 @@ struct bo {
 	bool mapped;                    /* Mesa has mapped it (sweetdrm_mmap): cleaned before submits */
 	bool seeded;                    /* an import cleaned when its surface had seed `seed` */
 	uint32_t seed;
+	bool tracked;                   /* G7w: a texture Mesa reports its CPU writes for (sweetdrm_bo_cpu_write) */
+	bool dirty;                     /* tracked: written since its last clean */
+	bool sticky;                    /* tracked: mapped persistently, so always cleaned */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -115,7 +118,8 @@ static struct {
 	uint64_t ns, max_ns;
 } times[SWEETDRM_T_KINDS];
 
-static uint64_t clean_bytes[3];         /* G7v: submit clean of own BOs, of imports, imports skipped */
+/* G7v: submit clean of own BOs, of imports, imports skipped; G7w: tracked own BOs skipped, cleaned */
+static uint64_t clean_bytes[5];
 
 uint64_t
 sweetdrm_now_ns(void)
@@ -176,10 +180,13 @@ sweetdrm_time_report(unsigned secs)
 	    time_take(SWEETDRM_T_WAIT, b, sizeof(b)), time_take(SWEETDRM_T_BO_NEW, c, sizeof(c)),
 	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
 	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
-	sweetdrm_say("7.7 time %us: sclean KiB own %llu import %llu import skipped %llu", secs,
+	sweetdrm_say("7.7 time %us: sclean KiB own %llu import %llu import skipped %llu own skipped %llu (texture) "
+	    "own texture %llu", secs,
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[0], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[1], 0u, __ATOMIC_RELAXED) >> 10),
-	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10));
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[3], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[4], 0u, __ATOMIC_RELAXED) >> 10));
 	cpu_before = cpu;
 }
 
@@ -259,7 +266,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0 };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false };
 	return 0;
 }
 
@@ -501,15 +508,22 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
  * display surfaces only the GPU writes. An import whose IOSurface seed is
  * unchanged since its last clean has had no CPU writer, so it is skipped.
  * SWEETDRM_SEEDSKIP=0 cleans every import every time again.
+ * G7w: G7v cleaned 11-20 GB of own BOs per 5 s (~75% of submit time). A
+ * texture Mesa reports CPU writes for (patch 0004) is cleaned only when it was
+ * written since its last clean; other own BOs (buffers, rings, Mesa's own) as
+ * before. SWEETDRM_OWNSKIP=0 cleans every mapped own BO every time again.
  */
 static uint32_t
 clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 {
-	static int on = -1, seedskip;
+	static int on = -1, seedskip, ownskip;
 	if (on < 0) {
-		const char *v = getenv("SWEETDRM_CLEAN"), *s = getenv("SWEETDRM_SEEDSKIP");
+		const char *v = getenv("SWEETDRM_CLEAN"), *s = getenv("SWEETDRM_SEEDSKIP"), *o = getenv("SWEETDRM_OWNSKIP");
 		on = info.client_clean && !(v && v[0] == '0');
 		seedskip = !(s && s[0] == '0');
+		ownskip = !(o && o[0] == '0');
+		say("submit: skip textures the CPU has not written since their last clean: %s",
+		    ownskip ? "on" : "off (SWEETDRM_OWNSKIP=0)");
 		say("submit: clean (dc civac) the submit's CPU-written BOs here, not all BOs in the kernel: %s",
 		    on ? "on" : info.client_clean ? "off (SWEETDRM_CLEAN=0)" : "off (kernel ABI 1)");
 		say("submit: skip imports whose IOSurface seed is unchanged since their last clean: %s",
@@ -539,6 +553,13 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 			}
 			b->seeded = known;
 			b->seed = seed;
+		} else if (b->tracked && ownskip) {
+			if (!b->dirty && !b->sticky) {
+				__atomic_add_fetch(&clean_bytes[3], b->size, __ATOMIC_RELAXED);
+				continue;
+			}
+			b->dirty = false;
+			__atomic_add_fetch(&clean_bytes[4], b->size, __ATOMIC_RELAXED);
 		}
 		dcache_clean_invalidate(b->cpu, b->size);
 		__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
@@ -766,6 +787,19 @@ sweetdrm_munmap(void *addr, size_t length)
 	}
 	pthread_mutex_unlock(&lock);
 	return ours ? 0 : munmap(addr, length);  /* ours stays mapped until GEM_CLOSE */
+}
+
+void
+sweetdrm_bo_cpu_write(uint32_t handle, int persistent)
+{
+	pthread_mutex_lock(&lock);
+	struct bo *b = find(handle);
+	if (b && b->surface_id == 0) {
+		b->tracked = true;
+		b->dirty = true;
+		b->sticky = b->sticky || persistent;
+	}
+	pthread_mutex_unlock(&lock);
 }
 
 uint32_t
