@@ -123,7 +123,15 @@ f_wait(uint32_t seq, uint32_t ms)
 }
 
 static char last_report[200];
-static void f_report(const char *l) { snprintf(last_report, sizeof(last_report), "%s", l); }
+static char last_sclean[200];     /* G7x: the BO list now follows the sclean line */
+static void
+f_report(const char *l)
+{
+	snprintf(last_report, sizeof(last_report), "%s", l);
+	if (strstr(l, "sclean KiB")) {
+		snprintf(last_sclean, sizeof(last_sclean), "%s", l);
+	}
+}
 
 static const struct sweetdrm_backend fake = { f_open, f_bo_new, f_bo_import, f_bo_free, f_submit, f_wait, f_report };
 
@@ -348,27 +356,28 @@ main(void)
 	fake_seed = 5;
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && submit(fd, si, 2, cmd, 1, &fence) == 0);
 	sweetdrm_time_report(2);
-	CHECK(strstr(last_report, "import 64 import skipped 64") != NULL);
+	CHECK(strstr(last_sclean, "import 64 import skipped 64") != NULL);
 	fake_seed = 6;
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
 	sweetdrm_time_report(3);
-	CHECK(strstr(last_report, "import 64 import skipped 0") != NULL);
+	CHECK(strstr(last_sclean, "import 64 import skipped 0") != NULL);
 	/* G7w: own BO a (20 KiB, mapped) is cleaned at every submit until Mesa reports a texture write for it;
 	 * then only after a write, or always once mapped persistently */
 	struct drm_msm_gem_submit_bo sa[1] = { { .handle = a } };
 	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0);
 	sweetdrm_time_report(4);
-	CHECK(strstr(last_report, "own 40 import 0 import skipped 0 own skipped 0 (texture) own texture 0") != NULL);
+	CHECK(strstr(last_sclean, "own 40 import 0 import skipped 0 own skipped 0 (texture) own texture 0") != NULL);
 	sweetdrm_bo_cpu_write(a, 0);
 	sweetdrm_bo_cpu_write(999, 0);  /* unknown handle: ignored */
 	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0 &&
 	    submit(fd, sa, 1, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
 	sweetdrm_time_report(5);
-	CHECK(strstr(last_report, "own 20 import 0 import skipped 0 own skipped 40 (texture) own texture 20") != NULL);
+	CHECK(strstr(last_sclean, "own 20 import 0 import skipped 0 own skipped 40 (texture) own texture 20") != NULL);
 	sweetdrm_bo_cpu_write(a, 1);
 	CHECK(submit(fd, sa, 1, cmd, 1, &fence) == 0 && submit(fd, sa, 1, cmd, 1, &fence) == 0);
 	sweetdrm_time_report(6);
-	CHECK(strstr(last_report, "own 40 import 0 import skipped 0 own skipped 0 (texture) own texture 40") != NULL);
+	/* G7x: the report ends with the BOs cleaned most in the period; only a was, twice */
+	CHECK(strstr(last_report, "size 20 KiB flags 0x") != NULL && strstr(last_report, " texture mapped cleaned 2 times, 40 KiB") != NULL);
 	sweetdrm_set_surface_hooks(NULL);
 	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == 0);

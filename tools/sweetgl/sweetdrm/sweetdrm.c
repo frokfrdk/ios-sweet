@@ -57,6 +57,9 @@ struct bo {
 	bool tracked;                   /* G7w: a texture Mesa reports its CPU writes for (sweetdrm_bo_cpu_write) */
 	bool dirty;                     /* tracked: written since its last clean */
 	bool sticky;                    /* tracked: mapped persistently, so always cleaned */
+	uint32_t new_flags;             /* G7x: GEM_NEW's flags (own BOs) */
+	uint32_t cleans;                /* G7x: submit cleans since the last time report */
+	uint64_t cleaned;               /* G7x: bytes of those */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -152,6 +155,57 @@ time_take(enum sweetdrm_time_kind kind, char *buf, size_t len)
 	return buf;
 }
 
+/*
+ * G7x: G7w still cleaned 11-22 GB of own BOs per 5 s and none were textures.
+ * List the BOs that took most of it (the first TOP_REPORTS reports with any),
+ * then reset every BO's count for the next period.
+ */
+#define TOP_BOS         8u
+#define TOP_REPORTS     12u
+
+static void
+top_cleaned(unsigned secs)
+{
+	static unsigned reports;
+	struct bo top[TOP_BOS];
+	unsigned ntop = 0, nbo = 0;
+	uint64_t all = 0;
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < nbos; i++) {
+		struct bo *b = &bos[i];
+		if (b->handle == 0 || b->cleans == 0) {
+			continue;
+		}
+		nbo++;
+		all += b->cleaned;
+		unsigned k = ntop < TOP_BOS ? ntop++ : TOP_BOS;
+		for (; k > 0 && top[k - 1].cleaned < b->cleaned; k--) {
+			if (k < TOP_BOS) {
+				top[k] = top[k - 1];
+			}
+		}
+		if (k < TOP_BOS) {
+			top[k] = *b;
+		}
+	}
+	for (uint32_t i = 0; i < nbos; i++) {
+		bos[i].cleans = 0;
+		bos[i].cleaned = 0;
+	}
+	pthread_mutex_unlock(&lock);
+	if (nbo == 0 || reports >= TOP_REPORTS) {
+		return;
+	}
+	reports++;
+	sweetdrm_say("7.7 time %us: cleaned %u BOs, %llu KiB; largest:", secs, nbo, (unsigned long long)(all >> 10));
+	for (unsigned k = 0; k < ntop; k++) {
+		const struct bo *b = &top[k];
+		sweetdrm_say("7.7 time %us:   bo %u size %llu KiB flags 0x%x%s%s%s cleaned %u times, %llu KiB", secs, b->handle,
+		    (unsigned long long)(b->size >> 10), b->new_flags, b->surface_id ? " import" : "",
+		    b->tracked ? " texture" : "", b->mapped ? " mapped" : "", b->cleans, (unsigned long long)(b->cleaned >> 10));
+	}
+}
+
 void
 sweetdrm_time_report(unsigned secs)
 {
@@ -187,6 +241,7 @@ sweetdrm_time_report(unsigned secs)
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[3], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[4], 0u, __ATOMIC_RELAXED) >> 10));
+	top_cleaned(secs);
 	cpu_before = cpu;
 }
 
@@ -266,7 +321,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false, 0, 0, 0 };
 	return 0;
 }
 
@@ -406,6 +461,9 @@ gem_new(struct drm_msm_gem_new *r)
 	if (e == 0) {
 		pthread_mutex_lock(&lock);
 		e = add(h, va, r->size, cpu, 0);
+		if (e == 0) {
+			find(h)->new_flags = r->flags;
+		}
 		pthread_mutex_unlock(&lock);
 		if (e) {
 			be->bo_free(h);
@@ -563,6 +621,8 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 		}
 		dcache_clean_invalidate(b->cpu, b->size);
 		__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
+		b->cleans++;
+		b->cleaned += b->size;
 	}
 	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);
 	return SWEETDRM_SUBMIT_CLEAN;

@@ -606,9 +606,10 @@ static int stripe_on = -1;
 
 /* G7w draw probe: the next draw after such a texture is bound */
 #define PROBE_PER_SURFACE       1u
-#define PROBE_MAX               12u
+#define PROBE_MAX               16u
 #define PROBE_MAX_DIM           512
 #define PROBE_CELLS             64
+#define PROBE_BOX               96      /* G7x: <= the log line's room */
 static struct stripe_entry *probe_next;
 static GLint probe_unit;
 static unsigned probe_total;
@@ -846,14 +847,116 @@ sweeteagl_stripe_check(unsigned tex)
  */
 struct probe {
 	struct stripe_entry *e;
-	GLint fb, vp[4];
+	GLint fb, vp[4], prog, count;
+	bool box;                       /* G7x: lo/hi hold attrib 0's x,y range (raw and divided by w) */
+	float lo[2], hi[2];
 };
 
+/* G7x: vertex v's index, or -1 when the indices are in a buffer */
+static long
+probe_index(GLint first, GLenum itype, const void *indices, GLint ebo, unsigned v)
+{
+	if (itype == 0) {
+		return first + (long)v;
+	}
+	if (ebo || indices == NULL) {
+		return -1;
+	}
+	return itype == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[v] :
+	    itype == GL_UNSIGNED_SHORT ? ((const uint16_t *)indices)[v] : (long)((const uint32_t *)indices)[v];
+}
+
+/* G7x: the screen range of every vertex of the draw (client-side float positions only) */
 static void
-probe_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *indices)
+probe_bbox(struct probe *p, GLint first, GLsizei count, GLenum itype, const void *indices, GLint ebo)
+{
+	GLint on = 0, size = 0, type = 0, stride = 0, buf = 0;
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+	void *ptr = NULL;
+	glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+	p->box = false;
+	if (!on || buf || type != GL_FLOAT || ptr == NULL || size < 2) {
+		return;
+	}
+	size_t step = stride ? (size_t)stride : (size_t)size * 4;
+	for (unsigned v = 0; v < (unsigned)count && v < 1024; v++) {
+		long i = probe_index(first, itype, indices, ebo, v);
+		if (i < 0) {
+			return;
+		}
+		const float *q = (const float *)((const uint8_t *)ptr + (size_t)i * step);
+		float w = size == 4 && q[3] > 0.01f ? q[3] : 1.0f;
+		float xs[2] = { q[0], q[0] / w }, ys[2] = { q[1], q[1] / w };
+		for (int k = 0; k < 2; k++) {
+			if (!p->box) {
+				p->lo[0] = p->hi[0] = xs[k];
+				p->lo[1] = p->hi[1] = ys[k];
+				p->box = true;
+			}
+			p->lo[0] = xs[k] < p->lo[0] ? xs[k] : p->lo[0];
+			p->hi[0] = xs[k] > p->hi[0] ? xs[k] : p->hi[0];
+			p->lo[1] = ys[k] < p->lo[1] ? ys[k] : p->lo[1];
+			p->hi[1] = ys[k] > p->hi[1] ? ys[k] : p->hi[1];
+		}
+	}
+}
+
+/* G7x: a program's shader sources, once per program, in pieces that fit a log line (device log only) */
+static void
+probe_shaders(GLint prog)
+{
+	static GLint said[8];
+	static unsigned nsaid;
+	for (unsigned k = 0; k < nsaid; k++) {
+		if (said[k] == prog) {
+			return;
+		}
+	}
+	if (nsaid >= 8 || prog == 0) {
+		return;
+	}
+	said[nsaid++] = prog;
+	GLuint sh[4];
+	GLsizei n = 0;
+	glGetAttachedShaders((GLuint)prog, 4, &n, sh);
+	for (GLsizei s = 0; s < n; s++) {
+		GLint type = 0, len = 0;
+		glGetShaderiv(sh[s], GL_SHADER_TYPE, &type);
+		glGetShaderiv(sh[s], GL_SHADER_SOURCE_LENGTH, &len);
+		char *src = len > 0 && len < 65536 ? malloc((size_t)len) : NULL;
+		if (src == NULL) {
+			sweetdrm_say("7.7 probe prog %d: shader %u type 0x%x source length %d not logged", prog, sh[s], type, len);
+			continue;
+		}
+		glGetShaderSource(sh[s], len, NULL, src);
+		const char *what = type == GL_VERTEX_SHADER ? "vs" : type == GL_FRAGMENT_SHADER ? "fs" : "??";
+		unsigned line = 0;
+		for (char *l = src; *l; line++) {
+			char *nl = strchr(l, '\n');
+			size_t n2 = nl ? (size_t)(nl - l) : strlen(l);
+			for (size_t at = 0; at < n2 || at == 0; at += 150) {
+				sweetdrm_say("7.7 probe prog %d %s %03u%s %.*s", prog, what, line, at ? "+" : ":",
+				    (int)(n2 - at < 150 ? n2 - at : 150), l + at);
+				if (n2 == 0) {
+					break;
+				}
+			}
+			l += n2 + (nl != NULL);
+		}
+		free(src);
+	}
+}
+
+static void
+probe_attribs(struct probe *pr, GLenum mode, GLint first, GLsizei count, GLenum itype, const void *indices)
 {
 	GLint ebo = 0;
 	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+	probe_bbox(pr, first, count, itype, indices, ebo);
 	unsigned idx[4], nidx = 0;
 	for (unsigned v = 0; v < 4 && (GLsizei)v < count; v++) {
 		if (indices == NULL && itype == 0) {
@@ -927,6 +1030,7 @@ sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const
 	probe_total++;
 	static struct probe p;
 	p.e = e;
+	p.count = count;
 	GLint prog = 0, sampler = 0, blend = 0, bs = 0, bd = 0, bsa = 0, bda = 0, sc = 0, box[4] = { 0 }, mask[4] = { 0 };
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &p.fb);
 	glGetIntegerv(GL_VIEWPORT, p.vp);
@@ -955,7 +1059,15 @@ sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const
 	sweetdrm_say("7.7 probe: target fb %d att 0x%x %d samples %d viewport %d,%d %dx%d scissor %d %d,%d %dx%d blend %d "
 	    "0x%x/0x%x 0x%x/0x%x mask %d%d%d%d", p.fb, atype, aname, samples, p.vp[0], p.vp[1], p.vp[2], p.vp[3], sc, box[0],
 	    box[1], box[2], box[3], blend, bs, bd, bsa, bda, mask[0], mask[1], mask[2], mask[3]);
-	probe_attribs(mode, first, count, itype, indices);
+	p.prog = prog;
+	probe_attribs(&p, mode, first, count, itype, indices);
+	if (p.box) {
+		sweetdrm_say("7.7 probe %u: positions x %.1f..%.1f y %.1f..%.1f (raw and /w)", e->sid, (double)p.lo[0],
+		    (double)p.hi[0], (double)p.lo[1], (double)p.hi[1]);
+	}
+	if (count > 6) {
+		probe_shaders(prog);
+	}
 	return &p;
 }
 
@@ -970,18 +1082,13 @@ probe_cell(const uint8_t *px)
 	return l < 64 ? '@' : l < 160 ? '+' : l < 240 ? '-' : ' ';
 }
 
-void
-sweeteagl_probe_end(void *token)
+/*
+ * Read x,y,w,h (GL window coordinates, bottom up) of fb and log it top row
+ * first as cw x ch cells, one sample per cell. tag names the picture.
+ */
+static void
+probe_picture(const struct probe *p, const char *tag, GLint x, GLint y, GLint w, GLint h, unsigned cw, unsigned ch)
 {
-	struct probe *p = token;
-	if (p == NULL) {
-		return;
-	}
-	GLint w = p->vp[2], h = p->vp[3];
-	if (p->fb == 0 || w <= 0 || h <= 0 || w > PROBE_MAX_DIM || h > PROBE_MAX_DIM) {
-		sweetdrm_say("7.7 probe %u: target not read back (fb %d %dx%d)", p->e->sid, p->fb, w, h);
-		return;
-	}
 	uint8_t *px = malloc((size_t)w * (size_t)h * 4);
 	if (px == NULL) {
 		return;
@@ -1000,7 +1107,7 @@ sweeteagl_probe_end(void *token)
 	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 	glPixelStorei(GL_PACK_SKIP_ROWS, 0);
 	glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-	glReadPixels(p->vp[0], p->vp[1], w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
 	glPixelStorei(GL_PACK_ALIGNMENT, align);
 	glPixelStorei(GL_PACK_ROW_LENGTH, rl);
 	glPixelStorei(GL_PACK_SKIP_ROWS, sr);
@@ -1008,29 +1115,69 @@ sweeteagl_probe_end(void *token)
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)old_pack);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read);
 	GLenum err = glGetError();
-	unsigned cw = (unsigned)w < PROBE_CELLS ? (unsigned)w : PROBE_CELLS, ch = (unsigned)h < PROBE_CELLS ? (unsigned)h : PROBE_CELLS;
-	sweetdrm_say("7.7 probe %u: target %dx%d read err 0x%x before 0x%x; picture %ux%u cells, top row first", p->e->sid, w, h,
-	    err, before, cw, ch);
+	sweetdrm_say("7.7 probe %u %s: fb %d box %d,%d %dx%d read err 0x%x before 0x%x; %ux%u cells, top row first",
+	    p->e->sid, tag, p->fb, x, y, w, h, err, before, cw, ch);
 	if (err == GL_NO_ERROR) {
-		char line[PROBE_CELLS + 1];
+		char line[PROBE_BOX + 1];
 		for (unsigned cy = 0; cy < ch; cy++) {
-			/* GL rows are bottom up; one sample per cell */
-			unsigned y = (unsigned)h - 1u - cy * (unsigned)h / ch;
+			unsigned yy = (unsigned)h - 1u - cy * (unsigned)h / ch;
 			for (unsigned cx = 0; cx < cw; cx++) {
-				unsigned x = cx * (unsigned)w / cw;
-				line[cx] = probe_cell(px + ((size_t)y * (size_t)w + x) * 4);
+				unsigned xx = cx * (unsigned)w / cw;
+				line[cx] = probe_cell(px + ((size_t)yy * (size_t)w + xx) * 4);
 			}
 			line[cw] = 0;
-			sweetdrm_say("7.7 probe %u r%02u: |%s|", p->e->sid, cy, line);
+			sweetdrm_say("7.7 probe %u %s%02u: |%s|", p->e->sid, tag, cy, line);
 		}
 	}
 	free(px);
+}
+
+/* G7x: a box of at most PROBE_BOX pixels around the draw's positions, clipped to the viewport */
+static void
+probe_box(const struct probe *p, const char *tag, bool flip)
+{
+	GLint vw = p->vp[2], vh = p->vp[3];
+	float cx = (p->lo[0] + p->hi[0]) / 2, cy = (p->lo[1] + p->hi[1]) / 2;
+	GLint bw = (GLint)(p->hi[0] - p->lo[0]) + 8, bh = (GLint)(p->hi[1] - p->lo[1]) + 8;
+	bw = bw > PROBE_BOX ? PROBE_BOX : bw;
+	bh = bh > PROBE_BOX ? PROBE_BOX : bh;
+	if (flip) {
+		cy = (float)vh - cy;
+	}
+	GLint x = (GLint)cx - bw / 2, y = (GLint)cy - bh / 2;
+	x = x < 0 ? 0 : x + bw > vw ? vw - bw : x;
+	y = y < 0 ? 0 : y + bh > vh ? vh - bh : y;
+	if (bw <= 0 || bh <= 0 || x < 0 || y < 0) {
+		return;
+	}
+	probe_picture(p, tag, p->vp[0] + x, p->vp[1] + y, bw, bh, (unsigned)bw, (unsigned)bh);
+}
+
+void
+sweeteagl_probe_end(void *token)
+{
+	struct probe *p = token;
+	if (p == NULL) {
+		return;
+	}
+	GLint w = p->vp[2], h = p->vp[3];
+	if (p->fb == 0 || w <= 0 || h <= 0) {
+		sweetdrm_say("7.7 probe %u: target not read back (fb %d %dx%d)", p->e->sid, p->fb, w, h);
+	} else if (w <= PROBE_MAX_DIM && h <= PROBE_MAX_DIM) {
+		probe_picture(p, "r", p->vp[0], p->vp[1], w, h, (unsigned)w < PROBE_CELLS ? (unsigned)w : PROBE_CELLS,
+		    (unsigned)h < PROBE_CELLS ? (unsigned)h : PROBE_CELLS);
+	} else if (p->box && p->count > 6) {
+		/* G7x: the meshes (clock hands) on a full-screen target; which way y runs is not known */
+		probe_box(p, "b", false);
+		probe_box(p, "f", true);
+	} else {
+		sweetdrm_say("7.7 probe %u: target not read back (fb %d %dx%d)", p->e->sid, p->fb, w, h);
+	}
 	struct stripe_entry *e = p->e;
 	if (e->gl && e->checks >= STRIPE_CHECKS && (e->probes >= PROBE_PER_SURFACE || probe_total >= PROBE_MAX)) {
 		stripe_drop(e);
 	}
 }
-
 /* ---- EAGLContext's methods ---- */
 
 static id
