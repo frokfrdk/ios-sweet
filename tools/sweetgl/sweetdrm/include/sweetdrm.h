@@ -95,6 +95,14 @@ void sweetdrm_cpu_access(void *addr, uint64_t size);
 void sweetdrm_bo_cpu_write(uint32_t handle, int persistent);
 
 /*
+ * Mesa allocated a 4 MiB heap block (patch 0005), and a submit uses the
+ * sub-BO [offset, offset + size) of it. The submit clean then cleans a heap
+ * block only on the pages reported since its last clean.
+ */
+void sweetdrm_heap_block(uint32_t handle);
+void sweetdrm_heap_range(uint32_t handle, uint64_t offset, uint64_t size);
+
+/*
  * G7p timing: each kind counts its calls with the time they took (monotonic),
  * the total and the longest. sweetdrm times its own kinds; the EAGL shim times
  * the GL ones. sweetdrm_time_report logs them with this process's CPU time

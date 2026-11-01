@@ -64,6 +64,8 @@ struct bo {
 	bool armed;                     /* G7y: shadow is current; compare at the next clean */
 	uint32_t samples, pages;        /* G7y: compared cleans and changed pages, since the last time report */
 	uint32_t max_pages, lo, hi;     /* G7y: most changed pages in one, lowest and highest changed page */
+	uint8_t *heap_dirty;            /* G7z: a Mesa heap block: bitmap of pages in submits' sub-BOs since its clean */
+	uint32_t unreported, first_unreported; /* G7z: sampled changed pages no sub-BO range covered */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -125,8 +127,9 @@ static struct {
 	uint64_t ns, max_ns;
 } times[SWEETDRM_T_KINDS];
 
-/* G7v: submit clean of own BOs, of imports, imports skipped; G7w: tracked own BOs skipped, cleaned */
-static uint64_t clean_bytes[5];
+/* G7v: submit clean of own BOs, of imports, imports skipped; G7w: tracked own BOs skipped, cleaned;
+ * G7z: heap blocks: cleaned (sub-BO ranges), skipped */
+static uint64_t clean_bytes[7];
 
 uint64_t
 sweetdrm_now_ns(void)
@@ -206,8 +209,8 @@ top_cleaned(unsigned secs)
 	for (uint32_t i = 0; i < nbos; i++) {
 		bos[i].cleans = 0;
 		bos[i].cleaned = 0;
-		bos[i].samples = bos[i].pages = bos[i].max_pages = bos[i].hi = 0;
-		bos[i].lo = UINT32_MAX;
+		bos[i].samples = bos[i].pages = bos[i].max_pages = bos[i].hi = bos[i].unreported = 0;
+		bos[i].lo = bos[i].first_unreported = UINT32_MAX;
 	}
 	pthread_mutex_unlock(&lock);
 	if (nbo == 0 || reports >= TOP_REPORTS) {
@@ -222,8 +225,9 @@ top_cleaned(unsigned secs)
 		    b->tracked ? " texture" : "", b->mapped ? " mapped" : "", b->cleans, (unsigned long long)(b->cleaned >> 10));
 		if (b->samples) {
 			sweetdrm_say("7.7 time %us:     changed between cleans: %u samples, avg %u max %u of %llu pages, "
-			    "pages %u-%u", secs, b->samples, b->pages / b->samples, b->max_pages,
-			    (unsigned long long)(b->size / SAMPLE_PAGE), b->lo == UINT32_MAX ? 0 : b->lo, b->hi);
+			    "pages %u-%u%s unreported %u first %d", secs, b->samples, b->pages / b->samples, b->max_pages,
+			    (unsigned long long)(b->size / SAMPLE_PAGE), b->lo == UINT32_MAX ? 0 : b->lo, b->hi,
+			    b->heap_dirty ? "; heap block:" : ";", b->unreported, (int)b->first_unreported);
 		}
 	}
 }
@@ -257,12 +261,14 @@ sweetdrm_time_report(unsigned secs)
 	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
 	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
 	sweetdrm_say("7.7 time %us: sclean KiB own %llu import %llu import skipped %llu own skipped %llu (texture) "
-	    "own texture %llu", secs,
+	    "own texture %llu heap ranges %llu heap skipped %llu", secs,
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[0], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[1], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10),
 	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[3], 0u, __ATOMIC_RELAXED) >> 10),
-	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[4], 0u, __ATOMIC_RELAXED) >> 10));
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[4], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[5], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[6], 0u, __ATOMIC_RELAXED) >> 10));
 	top_cleaned(secs);
 	cpu_before = cpu;
 }
@@ -344,7 +350,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		b = &bos[nbos++];
 	}
 	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false, 0, 0, 0,
-	    NULL, false, 0, 0, 0, UINT32_MAX, 0 };
+	    NULL, false, 0, 0, 0, UINT32_MAX, 0, NULL, 0, UINT32_MAX };
 	return 0;
 }
 
@@ -522,6 +528,8 @@ gem_close(uint32_t handle)
 		b->handle = 0;
 		free(b->shadow);
 		b->shadow = NULL;
+		free(b->heap_dirty);
+		b->heap_dirty = NULL;
 	}
 	pthread_mutex_unlock(&lock);
 	if (sid && hooks && hooks->closed) {
@@ -596,6 +604,69 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
  * written since its last clean; other own BOs (buffers, rings, Mesa's own) as
  * before. SWEETDRM_OWNSKIP=0 cleans every mapped own BO every time again.
  */
+/*
+ * G7z: G7y found 1-14 of a heap block's 1024 pages change between two cleans.
+ * Mesa (patch 0005) names its heap blocks and, at each submit, the ranges of
+ * the submit's sub-BOs in them. A heap block is then cleaned only on the
+ * pages of those ranges reported since its last clean. SWEETDRM_HEAPCLEAN=0
+ * cleans whole blocks again.
+ */
+static size_t
+heap_map_bytes(const struct bo *b)
+{
+	return (size_t)((b->size / SAMPLE_PAGE + 7) / 8);
+}
+
+void
+sweetdrm_heap_block(uint32_t handle)
+{
+	pthread_mutex_lock(&lock);
+	struct bo *b = find(handle);
+	if (b && !b->surface_id && b->heap_dirty == NULL) {
+		b->heap_dirty = calloc(1, heap_map_bytes(b));
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+void
+sweetdrm_heap_range(uint32_t handle, uint64_t offset, uint64_t size)
+{
+	pthread_mutex_lock(&lock);
+	struct bo *b = find(handle);
+	if (b && b->heap_dirty && size && offset < b->size) {
+		uint64_t end = offset + size < b->size ? offset + size : b->size;
+		for (uint64_t p = offset / SAMPLE_PAGE; p < (end + SAMPLE_PAGE - 1) / SAMPLE_PAGE; p++) {
+			b->heap_dirty[p / 8] |= (uint8_t)(1u << (p % 8));
+		}
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+/* Lock held: clean the reported pages of a heap block, in runs; returns the bytes cleaned */
+static uint64_t
+clean_heap(struct bo *b)
+{
+	uint32_t pages = (uint32_t)(b->size / SAMPLE_PAGE);
+	uint64_t done = 0;
+	for (uint32_t p = 0; p < pages;) {
+		if (!(b->heap_dirty[p / 8] & (1u << (p % 8)))) {
+			p++;
+			continue;
+		}
+		uint32_t q = p;
+		while (q < pages && (b->heap_dirty[q / 8] & (1u << (q % 8)))) {
+			q++;
+		}
+		dcache_clean_invalidate((uint8_t *)b->cpu + (uint64_t)p * SAMPLE_PAGE, (uint64_t)(q - p) * SAMPLE_PAGE);
+		done += (uint64_t)(q - p) * SAMPLE_PAGE;
+		p = q;
+	}
+	memset(b->heap_dirty, 0, heap_map_bytes(b));
+	__atomic_add_fetch(&clean_bytes[5], done, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&clean_bytes[6], b->size - done, __ATOMIC_RELAXED);
+	return done;
+}
+
 /* Lock held. G7y: before a clean, compare with the copy; after it, maybe take one */
 static void
 sample_changes(struct bo *b, bool after)
@@ -621,6 +692,12 @@ sample_changes(struct bo *b, bool after)
 				changed++;
 				b->lo = p < b->lo ? p : b->lo;
 				b->hi = p > b->hi ? p : b->hi;
+				/* G7z: changed, yet in no sub-BO a submit reported (a CPU write the range clean misses,
+				 * or the GPU wrote it) */
+				if (b->heap_dirty && !(b->heap_dirty[p / 8] & (1u << (p % 8)))) {
+					b->unreported++;
+					b->first_unreported = p < b->first_unreported ? p : b->first_unreported;
+				}
 			}
 		}
 		b->samples++;
@@ -641,12 +718,16 @@ sample_changes(struct bo *b, bool after)
 static uint32_t
 clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 {
-	static int on = -1, seedskip, ownskip;
+	static int on = -1, seedskip, ownskip, heapclean;
 	if (on < 0) {
 		const char *v = getenv("SWEETDRM_CLEAN"), *s = getenv("SWEETDRM_SEEDSKIP"), *o = getenv("SWEETDRM_OWNSKIP");
+		const char *h = getenv("SWEETDRM_HEAPCLEAN");
 		on = info.client_clean && !(v && v[0] == '0');
 		seedskip = !(s && s[0] == '0');
 		ownskip = !(o && o[0] == '0');
+		heapclean = !(h && h[0] == '0');
+		say("submit: clean Mesa heap blocks only where the submits' sub-BOs lie: %s",
+		    heapclean ? "on" : "off (SWEETDRM_HEAPCLEAN=0)");
 		say("submit: skip textures the CPU has not written since their last clean: %s",
 		    ownskip ? "on" : "off (SWEETDRM_OWNSKIP=0)");
 		say("submit: clean (dc civac) the submit's CPU-written BOs here, not all BOs in the kernel: %s",
@@ -687,10 +768,18 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 			__atomic_add_fetch(&clean_bytes[4], b->size, __ATOMIC_RELAXED);
 		}
 		sample_changes(b, false);
-		dcache_clean_invalidate(b->cpu, b->size);
-		__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
+		uint64_t done = b->size;
+		if (b->heap_dirty && heapclean) {
+			done = clean_heap(b);
+		} else {
+			dcache_clean_invalidate(b->cpu, b->size);
+			__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
+			if (b->heap_dirty) {
+				memset(b->heap_dirty, 0, heap_map_bytes(b));
+			}
+		}
 		b->cleans++;
-		b->cleaned += b->size;
+		b->cleaned += done;
 		sample_changes(b, true);
 	}
 	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);

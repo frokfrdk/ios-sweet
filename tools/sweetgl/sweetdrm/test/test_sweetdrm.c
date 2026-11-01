@@ -389,7 +389,19 @@ main(void)
 	pbig[10 * 4096] = 2;
 	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);
 	sweetdrm_time_report(7);
-	CHECK(strstr(last_report, "changed between cleans: 1 samples, avg 2 max 2 of 256 pages, pages 3-10") != NULL);
+	CHECK(strstr(last_report, "changed between cleans: 1 samples, avg 2 max 2 of 256 pages, pages 3-10;") != NULL);
+	/* G7z: as a heap block it is cleaned only on reported sub-BO pages; a changed page outside them is counted */
+	sweetdrm_heap_block(big);
+	sweetdrm_heap_block(999);       /* unknown handle: ignored */
+	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);        /* clean 1: nothing reported, copy taken */
+	pbig[5 * 4096 + 1] = 3;
+	pbig[7 * 4096] = 4;
+	sweetdrm_heap_range(big, 5 * 4096 + 64, 100);
+	sweetdrm_heap_range(big, 2u << 20, 4096);               /* outside: ignored */
+	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);        /* clean 2: page 5 */
+	sweetdrm_time_report(8);
+	CHECK(strstr(last_sclean, "own texture 0 heap ranges 4 heap skipped 2044") != NULL);
+	CHECK(strstr(last_report, "pages 5-7; heap block: unreported 1 first 7") != NULL);
 	CHECK(sweetdrm_munmap(pbig, 1u << 20) == 0);
 	retire_all();
 	sweetdrm_set_surface_hooks(NULL);

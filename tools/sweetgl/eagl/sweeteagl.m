@@ -30,6 +30,7 @@
  * published SweetGPU, so the open waits for it, up to SWEETEAGL_WAIT_S.
  */
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -1003,6 +1004,77 @@ probe_attribs(struct probe *pr, GLenum mode, GLint first, GLsizei count, GLenum 
 	}
 }
 
+static float
+probe_half(uint16_t h)
+{
+	int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+	float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 0x400), e - 25);
+	return (h & 0x8000) ? -v : v;
+}
+
+/*
+ * G7z: G7y's readback of the clock hands looks like outlines with the middle
+ * missing. Log what the mesh should draw: the uniforms its vertex shader uses
+ * and every vertex's client-side float or half-float attribs, so the expected
+ * picture can be drawn on the host and compared with the readback.
+ */
+#define PROBE_MESH_MAX          96
+
+static void
+probe_mesh(uint32_t sid, GLint prog, GLint first, GLsizei count, GLenum itype, const void *indices)
+{
+	static const char *const names[] = { "vertex_matrix", "texmat0", "texmat1", "texmatD", "texmatW" };
+	GLint ebo = 0;
+	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+	for (unsigned n = 0; n < sizeof names / sizeof names[0]; n++) {
+		GLint loc = glGetUniformLocation((GLuint)prog, names[n]);
+		if (loc < 0) {
+			continue;
+		}
+		float u[16];
+		unsigned nu = n == 0 ? 16 : 4;
+		glGetUniformfv((GLuint)prog, loc, u);
+		for (unsigned at = 0; at < nu; at += 8) {
+			char vals[128] = "";
+			size_t len = 0;
+			for (unsigned k = at; k < nu && k < at + 8; k++) {
+				len += (size_t)snprintf(vals + len, sizeof vals - len, " %.6g", (double)u[k]);
+			}
+			sweetdrm_say("7.7 probe %u u %s[%u]:%s", sid, names[n], at, vals);
+		}
+	}
+	for (unsigned v = 0; v < (unsigned)count && v < PROBE_MESH_MAX; v++) {
+		long i = probe_index(first, itype, indices, ebo, v);
+		if (i < 0) {
+			sweetdrm_say("7.7 probe %u: indices in a buffer, vertices not logged", sid);
+			return;
+		}
+		char vals[176] = "";
+		size_t len = 0;
+		for (GLuint a = 0; a < 4; a++) {
+			GLint on = 0, size = 0, type = 0, stride = 0, buf = 0;
+			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+			glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+			void *ptr = NULL;
+			glGetVertexAttribPointerv(a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+			if (!on || buf || ptr == NULL || size < 1 || size > 4 || (type != GL_FLOAT && type != GL_HALF_FLOAT)) {
+				continue;
+			}
+			size_t es = type == GL_FLOAT ? 4 : 2, step = stride ? (size_t)stride : (size_t)size * es;
+			const uint8_t *q = (const uint8_t *)ptr + (size_t)i * step;
+			len += (size_t)snprintf(vals + len, sizeof vals - len, " a%u", a);
+			for (GLint c = 0; c < size && len < sizeof vals - 12; c++) {
+				float f = type == GL_FLOAT ? ((const float *)q)[c] : probe_half(((const uint16_t *)q)[c]);
+				len += (size_t)snprintf(vals + len, sizeof vals - len, " %.5g", (double)f);
+			}
+		}
+		sweetdrm_say("7.7 probe %u v%02u:%s", sid, v, vals);
+	}
+}
+
 void *
 sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const void *indices)
 {
@@ -1072,6 +1144,7 @@ sweeteagl_probe_begin(unsigned mode, int first, int count, unsigned itype, const
 	}
 	if (count > 6) {
 		probe_shaders(prog);
+		probe_mesh(e->sid, prog, first, count, itype, indices);
 	}
 	return &p;
 }

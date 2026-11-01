@@ -1,0 +1,49 @@
+--- a/src/freedreno/drm/freedreno_bo_heap.c	2026-11-01 23:28:15.938581502 +1030
++++ b/src/freedreno/drm/freedreno_bo_heap.c	2026-11-01 23:28:15.958633037 +1030
+@@ -4,6 +4,9 @@
+  */
+ 
+ #include "freedreno_drmif.h"
++
++/* sweet: sweetdrm cleans a heap block only where a submit's sub-BOs lie (0005) */
++void sweetdrm_heap_block(uint32_t handle);
+ #include "freedreno_drm_perfetto.h"
+ #include "freedreno_priv.h"
+ 
+@@ -235,6 +238,7 @@
+             "heap-%x-block-%u", heap->flags, idx);
+       if (heap->flags == RING_FLAGS)
+          fd_bo_mark_for_dump(heap->blocks[idx]);
++      sweetdrm_heap_block(heap->blocks[idx]->handle);
+    }
+    /* Take a reference to the backing obj: */
+    fd_bo_ref(heap->blocks[idx]);
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c	2026-11-01 23:28:15.942639387 +1030
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c	2026-11-01 23:28:15.958790207 +1030
+@@ -17,6 +17,13 @@
+ 
+ #include "freedreno_ringbuffer_sp.h"
+ 
++/*
++ * sweet: sweetdrm cleans the CPU caches of what a submit uses. Heap blocks are
++ * 4 MiB, of which one submit writes a few pages: report the ranges of the
++ * submit's sub-BOs so that only those are cleaned, not the whole blocks.
++ */
++void sweetdrm_heap_range(uint32_t handle, uint64_t offset, uint64_t size);
++
+ /* A "softpin" implementation of submit/ringbuffer, which lowers CPU overhead
+  * by avoiding the additional tracking necessary to build cmds/relocs tables
+  * (but still builds a bos table)
+@@ -222,6 +229,12 @@
+    }
+    simple_mtx_unlock(&fence_lock);
+ 
++   for (unsigned i = 0; i < fd_submit->nr_suballoc_bos; i++) {
++      struct fd_bo *bo = fd_submit->suballoc_bos[i];
++      struct fd_bo *block = fd_bo_heap_block(bo);
++      sweetdrm_heap_range(block->handle, bo->iova - block->iova, bo->size);
++   }
++
+    fd_submit->out_fence   = fd_fence_ref(out_fence);
+    fd_submit->in_fence_fd = (in_fence_fd == -1) ?
+          -1 : os_dupfd_cloexec(in_fence_fd);
