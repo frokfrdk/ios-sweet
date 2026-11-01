@@ -24,7 +24,8 @@
  * at run time, so the gl* names used here are always Mesa's.
  *
  * The GPU device is opened on the first context. FD_MESA_DEBUG defaults to
- * nogmem,noubwc and GALLIUM_THREAD to 0, the configuration 7.3 passed with.
+ * nogmem,noubwc and GALLIUM_THREAD to 0, the configuration 7.3 passed with
+ * (G7s added inorder), and IR3_SHADER_DEBUG to nofp16 (G7y).
  * In backboardd (7.7) that first context can come before the kernel has
  * published SweetGPU, so the open waits for it, up to SWEETEAGL_WAIT_S.
  */
@@ -212,6 +213,10 @@ open_display(void)
 	/* G7s: inorder (no batch reordering) with the client clean (G7r) ended the flashing; neither did alone */
 	setenv("FD_MESA_DEBUG", "nogmem,noubwc,inorder", 0);
 	setenv("GALLIUM_THREAD", "0", 0);
+	/* G7y: test whether fwidth() on mediump (fp16) values makes the striped Clock hands */
+	setenv("IR3_SHADER_DEBUG", "nofp16", 0);
+	sweetdrm_say("7.7 eagl: FD_MESA_DEBUG=%s IR3_SHADER_DEBUG=%s", getenv("FD_MESA_DEBUG"),
+	    getenv("IR3_SHADER_DEBUG"));
 	/* ENODEV: no SweetGPU service yet; anything else (EPERM: not allowed to open it) is final */
 	unsigned waited = 0;
 	int fd;

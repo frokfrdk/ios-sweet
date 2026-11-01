@@ -60,6 +60,10 @@ struct bo {
 	uint32_t new_flags;             /* G7x: GEM_NEW's flags (own BOs) */
 	uint32_t cleans;                /* G7x: submit cleans since the last time report */
 	uint64_t cleaned;               /* G7x: bytes of those */
+	uint8_t *shadow;                /* G7y: copy taken after a sampled clean (large own BOs) */
+	bool armed;                     /* G7y: shadow is current; compare at the next clean */
+	uint32_t samples, pages;        /* G7y: compared cleans and changed pages, since the last time report */
+	uint32_t max_pages, lo, hi;     /* G7y: most changed pages in one, lowest and highest changed page */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -163,6 +167,17 @@ time_take(enum sweetdrm_time_kind kind, char *buf, size_t len)
 #define TOP_BOS         8u
 #define TOP_REPORTS     12u
 
+/*
+ * G7y: the four 4 MiB BOs G7x listed are (by size and flags) Mesa's
+ * suballocation heap blocks, cleaned in full at each submit. For own BOs of at
+ * least SAMPLE_MIN, every SAMPLE_EVERY-th clean keeps a copy, and the next
+ * clean counts the SAMPLE_PAGE pages that differ from it: how much of the
+ * block one submit really writes. SWEETDRM_SAMPLE=0 turns it off.
+ */
+#define SAMPLE_MIN      (1u << 20)
+#define SAMPLE_EVERY    64u
+#define SAMPLE_PAGE     4096u
+
 static void
 top_cleaned(unsigned secs)
 {
@@ -191,6 +206,8 @@ top_cleaned(unsigned secs)
 	for (uint32_t i = 0; i < nbos; i++) {
 		bos[i].cleans = 0;
 		bos[i].cleaned = 0;
+		bos[i].samples = bos[i].pages = bos[i].max_pages = bos[i].hi = 0;
+		bos[i].lo = UINT32_MAX;
 	}
 	pthread_mutex_unlock(&lock);
 	if (nbo == 0 || reports >= TOP_REPORTS) {
@@ -203,6 +220,11 @@ top_cleaned(unsigned secs)
 		sweetdrm_say("7.7 time %us:   bo %u size %llu KiB flags 0x%x%s%s%s cleaned %u times, %llu KiB", secs, b->handle,
 		    (unsigned long long)(b->size >> 10), b->new_flags, b->surface_id ? " import" : "",
 		    b->tracked ? " texture" : "", b->mapped ? " mapped" : "", b->cleans, (unsigned long long)(b->cleaned >> 10));
+		if (b->samples) {
+			sweetdrm_say("7.7 time %us:     changed between cleans: %u samples, avg %u max %u of %llu pages, "
+			    "pages %u-%u", secs, b->samples, b->pages / b->samples, b->max_pages,
+			    (unsigned long long)(b->size / SAMPLE_PAGE), b->lo == UINT32_MAX ? 0 : b->lo, b->hi);
+		}
 	}
 }
 
@@ -321,7 +343,8 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false, 0, 0, 0 };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0, false, false, false, 0, 0, 0,
+	    NULL, false, 0, 0, 0, UINT32_MAX, 0 };
 	return 0;
 }
 
@@ -497,6 +520,8 @@ gem_close(uint32_t handle)
 	uint32_t sid = b ? b->surface_id : 0;
 	if (b) {
 		b->handle = 0;
+		free(b->shadow);
+		b->shadow = NULL;
 	}
 	pthread_mutex_unlock(&lock);
 	if (sid && hooks && hooks->closed) {
@@ -571,6 +596,48 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
  * written since its last clean; other own BOs (buffers, rings, Mesa's own) as
  * before. SWEETDRM_OWNSKIP=0 cleans every mapped own BO every time again.
  */
+/* Lock held. G7y: before a clean, compare with the copy; after it, maybe take one */
+static void
+sample_changes(struct bo *b, bool after)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("SWEETDRM_SAMPLE");
+		on = !(v && v[0] == '0');
+		say("submit: count pages of large own BOs changed between cleans: %s", on ? "on" : "off (SWEETDRM_SAMPLE=0)");
+	}
+	if (!on || b->surface_id || b->size < SAMPLE_MIN) {
+		return;
+	}
+	const uint8_t *cpu = b->cpu;
+	if (!after) {
+		if (!b->armed) {
+			return;
+		}
+		b->armed = false;
+		uint32_t changed = 0;
+		for (uint32_t p = 0; p < b->size / SAMPLE_PAGE; p++) {
+			if (memcmp(cpu + (uint64_t)p * SAMPLE_PAGE, b->shadow + (uint64_t)p * SAMPLE_PAGE, SAMPLE_PAGE) != 0) {
+				changed++;
+				b->lo = p < b->lo ? p : b->lo;
+				b->hi = p > b->hi ? p : b->hi;
+			}
+		}
+		b->samples++;
+		b->pages += changed;
+		b->max_pages = changed > b->max_pages ? changed : b->max_pages;
+		return;
+	}
+	if (b->cleans % SAMPLE_EVERY != 1) {
+		return;
+	}
+	if (b->shadow == NULL && (b->shadow = malloc(b->size)) == NULL) {
+		return;
+	}
+	memcpy(b->shadow, cpu, b->size);
+	b->armed = true;
+}
+
 static uint32_t
 clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 {
@@ -619,10 +686,12 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 			b->dirty = false;
 			__atomic_add_fetch(&clean_bytes[4], b->size, __ATOMIC_RELAXED);
 		}
+		sample_changes(b, false);
 		dcache_clean_invalidate(b->cpu, b->size);
 		__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
 		b->cleans++;
 		b->cleaned += b->size;
+		sample_changes(b, true);
 	}
 	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);
 	return SWEETDRM_SUBMIT_CLEAN;

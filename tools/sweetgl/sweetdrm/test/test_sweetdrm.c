@@ -378,6 +378,20 @@ main(void)
 	sweetdrm_time_report(6);
 	/* G7x: the report ends with the BOs cleaned most in the period; only a was, twice */
 	CHECK(strstr(last_report, "size 20 KiB flags 0x") != NULL && strstr(last_report, " texture mapped cleaned 2 times, 40 KiB") != NULL);
+	/* G7y: a 1 MiB own BO keeps a copy at its first clean; the next clean counts the pages written since */
+	uint32_t big = gem_new(fd, 1u << 20);
+	CHECK(gem_info(fd, big, MSM_INFO_GET_OFFSET, &off) == 0);
+	uint8_t *pbig = sweetdrm_mmap(NULL, 1u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off);
+	CHECK(pbig != MAP_FAILED);
+	struct drm_msm_gem_submit_bo sbig[1] = { { .handle = big } };
+	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);
+	pbig[3 * 4096 + 7] = 1;
+	pbig[10 * 4096] = 2;
+	CHECK(submit(fd, sbig, 1, cmd, 1, &fence) == 0);
+	sweetdrm_time_report(7);
+	CHECK(strstr(last_report, "changed between cleans: 1 samples, avg 2 max 2 of 256 pages, pages 3-10") != NULL);
+	CHECK(sweetdrm_munmap(pbig, 1u << 20) == 0);
+	retire_all();
 	sweetdrm_set_surface_hooks(NULL);
 	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == 0);
