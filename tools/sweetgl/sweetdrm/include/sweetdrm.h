@@ -74,6 +74,33 @@ void sweetdrm_set_surface_hooks(const struct sweetdrm_surface_hooks *hooks);
  */
 void sweetdrm_cpu_access(void *addr, uint64_t size);
 
+/*
+ * G7p timing: each kind counts its calls with the time they took (monotonic),
+ * the total and the longest. sweetdrm times its own kinds; the EAGL shim times
+ * the GL ones. sweetdrm_time_report logs them with this process's CPU time
+ * since the last report and starts over.
+ */
+enum sweetdrm_time_kind {
+	SWEETDRM_T_GL,                  /* inside any shim slot, GL lock held */
+	SWEETDRM_T_LOCK,                /* waiting for the GL lock */
+	SWEETDRM_T_DRAW,                /* glDraw*, with the barrier */
+	SWEETDRM_T_FBBARRIER,           /* the framebuffer-fetch barrier alone */
+	SWEETDRM_T_FLUSH,
+	SWEETDRM_T_FINISH,              /* glFinish, FinishObjectAPPLE, ClientWaitSync */
+	SWEETDRM_T_UPLOAD,              /* glTexImage2D and the like */
+	SWEETDRM_T_BIND,                /* an IOSurface bound as a texture or renderbuffer */
+	SWEETDRM_T_SUBMIT,
+	SWEETDRM_T_WAIT,                /* GEM_CPU_PREP and WAIT_FENCE */
+	SWEETDRM_T_BO_NEW,
+	SWEETDRM_T_BO_FREE,             /* GEM_CLOSE: the kernel waits for the GPU first */
+	SWEETDRM_T_IMPORT,
+	SWEETDRM_T_CPU_ACCESS,
+	SWEETDRM_T_KINDS
+};
+uint64_t sweetdrm_now_ns(void);
+void sweetdrm_time_add(enum sweetdrm_time_kind kind, uint64_t start_ns);
+void sweetdrm_time_report(unsigned secs);
+
 /* One log line to stderr and the backend's report (the kernel log on iOS, selector 16) */
 void sweetdrm_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

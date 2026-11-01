@@ -31,6 +31,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
@@ -105,6 +106,74 @@ sweetdrm_say(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsay("sweetgl", fmt, ap);
 	va_end(ap);
+}
+
+/* ---- G7p timing ---- */
+
+static struct {
+	uint32_t n;
+	uint64_t ns, max_ns;
+} times[SWEETDRM_T_KINDS];
+
+uint64_t
+sweetdrm_now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+void
+sweetdrm_time_add(enum sweetdrm_time_kind kind, uint64_t start_ns)
+{
+	uint64_t d = sweetdrm_now_ns() - start_ns, m;
+	__atomic_add_fetch(&times[kind].n, 1u, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&times[kind].ns, d, __ATOMIC_RELAXED);
+	m = __atomic_load_n(&times[kind].max_ns, __ATOMIC_RELAXED);
+	while (d > m && !__atomic_compare_exchange_n(&times[kind].max_ns, &m, d, true, __ATOMIC_RELAXED,
+	    __ATOMIC_RELAXED)) {
+	}
+}
+
+/* "calls/total ms/longest ms" of one kind, taken and cleared */
+static const char *
+time_take(enum sweetdrm_time_kind kind, char *buf, size_t len)
+{
+	uint32_t n = __atomic_exchange_n(&times[kind].n, 0u, __ATOMIC_RELAXED);
+	uint64_t ns = __atomic_exchange_n(&times[kind].ns, 0u, __ATOMIC_RELAXED);
+	uint64_t max = __atomic_exchange_n(&times[kind].max_ns, 0u, __ATOMIC_RELAXED);
+	snprintf(buf, len, "%u/%llu/%llu", n, (unsigned long long)(ns / 1000000u), (unsigned long long)(max / 1000000u));
+	return buf;
+}
+
+void
+sweetdrm_time_report(unsigned secs)
+{
+	static uint64_t cpu_before;
+	struct rusage ru;
+	uint64_t cpu = 0;
+	if (getrusage(RUSAGE_SELF, &ru) == 0) {
+		cpu = ((uint64_t)ru.ru_utime.tv_sec + (uint64_t)ru.ru_stime.tv_sec) * 1000u +
+		    ((uint64_t)ru.ru_utime.tv_usec + (uint64_t)ru.ru_stime.tv_usec) / 1000u;
+	}
+	if (__atomic_load_n(&times[SWEETDRM_T_GL].n, __ATOMIC_RELAXED) == 0 &&
+	    __atomic_load_n(&times[SWEETDRM_T_SUBMIT].n, __ATOMIC_RELAXED) == 0) {
+		cpu_before = cpu;
+		return;         /* nothing drawn: keep the log short */
+	}
+	char a[24], b[24], c[24], d[24], e[24], f[24];
+	sweetdrm_say("7.7 time %us: cpu %llu ms; gl %s lock %s draw %s fbb %s (calls/ms/max ms)", secs,
+	    (unsigned long long)(cpu - cpu_before), time_take(SWEETDRM_T_GL, a, sizeof(a)),
+	    time_take(SWEETDRM_T_LOCK, b, sizeof(b)), time_take(SWEETDRM_T_DRAW, c, sizeof(c)),
+	    time_take(SWEETDRM_T_FBBARRIER, d, sizeof(d)));
+	sweetdrm_say("7.7 time %us: flush %s finish %s upload %s bind %s", secs, time_take(SWEETDRM_T_FLUSH, a, sizeof(a)),
+	    time_take(SWEETDRM_T_FINISH, b, sizeof(b)), time_take(SWEETDRM_T_UPLOAD, c, sizeof(c)),
+	    time_take(SWEETDRM_T_BIND, d, sizeof(d)));
+	sweetdrm_say("7.7 time %us: submit %s wait %s bonew %s bofree %s import %s cpuacc %s", secs,
+	    time_take(SWEETDRM_T_SUBMIT, a, sizeof(a)), time_take(SWEETDRM_T_WAIT, b, sizeof(b)),
+	    time_take(SWEETDRM_T_BO_NEW, c, sizeof(c)), time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)),
+	    time_take(SWEETDRM_T_IMPORT, e, sizeof(e)), time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
+	cpu_before = cpu;
 }
 
 static int
@@ -476,20 +545,28 @@ queue_query(struct drm_msm_submitqueue_query *r)
 }
 
 static int
+timed(enum sweetdrm_time_kind kind, uint64_t start_ns, int e)
+{
+	sweetdrm_time_add(kind, start_ns);
+	return e;
+}
+
+static int
 command(unsigned long index, void *data, unsigned long size)
 {
 	(void)size;
+	uint64_t t0 = sweetdrm_now_ns();
 	switch (index) {
 	case DRM_MSM_GET_PARAM:         return get_param(data);
 	case DRM_MSM_SET_PARAM:         return EINVAL;  /* SYSPROF, COMM, CMDLINE */
-	case DRM_MSM_GEM_NEW:           return gem_new(data);
+	case DRM_MSM_GEM_NEW:           return timed(SWEETDRM_T_BO_NEW, t0, gem_new(data));
 	case DRM_MSM_GEM_INFO:          return gem_info(data);
-	case DRM_MSM_GEM_CPU_PREP:      return cpu_prep(data);
+	case DRM_MSM_GEM_CPU_PREP:      return timed(SWEETDRM_T_WAIT, t0, cpu_prep(data));
 	case DRM_MSM_GEM_CPU_FINI:      return 0;
-	case DRM_MSM_GEM_SUBMIT:        return submit(data);
+	case DRM_MSM_GEM_SUBMIT:        return timed(SWEETDRM_T_SUBMIT, t0, submit(data));
 	case DRM_MSM_WAIT_FENCE: {
 		struct drm_msm_wait_fence *w = data;
-		return wait_until(w->fence, &w->timeout);
+		return timed(SWEETDRM_T_WAIT, t0, wait_until(w->fence, &w->timeout));
 	}
 	case DRM_MSM_GEM_MADVISE:       return gem_madvise(data);
 	case DRM_MSM_SUBMITQUEUE_NEW: {
@@ -535,7 +612,8 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	if (nr >= DRM_COMMAND_BASE) {
 		e = command(nr - DRM_COMMAND_BASE, arg, 0);
 	} else if (request == DRM_IOCTL_GEM_CLOSE) {
-		e = gem_close(((struct drm_gem_close *)arg)->handle);
+		uint64_t t0 = sweetdrm_now_ns();
+		e = timed(SWEETDRM_T_BO_FREE, t0, gem_close(((struct drm_gem_close *)arg)->handle));
 	} else {
 		e = ENOSYS;     /* GEM_OPEN, GEM_FLINK, syncobjs: no sharing between processes */
 	}
@@ -631,9 +709,11 @@ sweetdrm_cpu_access(void *addr, uint64_t size)
 	if (!on || addr == NULL || size == 0) {
 		return;
 	}
+	uint64_t t0 = sweetdrm_now_ns();
 #if defined(__APPLE__)
 	sys_dcache_flush(addr, (size_t)size);
 #endif
+	sweetdrm_time_add(SWEETDRM_T_CPU_ACCESS, t0);
 	uint64_t c = __atomic_add_fetch(&calls, 1u, __ATOMIC_RELAXED);
 	uint64_t b = __atomic_add_fetch(&bytes, size, __ATOMIC_RELAXED);
 	if ((c & (c - 1)) == 0) {
@@ -649,8 +729,9 @@ sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *hand
 		return fail(EBADF);
 	}
 	uint32_t h = 0;
-	uint64_t va = 0, sz = 0;
+	uint64_t va = 0, sz = 0, t0 = sweetdrm_now_ns();
 	int e = be->bo_import ? be->bo_import(surface_id, &h, &va, &sz) : ENOSYS;
+	sweetdrm_time_add(SWEETDRM_T_IMPORT, t0);
 	if (e == 0) {
 		pthread_mutex_lock(&lock);
 		e = add(h, va, sz, cpu, surface_id);

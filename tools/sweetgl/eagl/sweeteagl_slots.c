@@ -37,6 +37,21 @@ count(atomic_uint *c, void *ctx)
 	atomic_fetch_add_explicit(c, 1u, memory_order_relaxed);
 }
 
+/* G7p: TIMED(kind) times the rest of the scope as one call of that kind (sweetdrm_time_report) */
+struct timed {
+	enum sweetdrm_time_kind kind;
+	uint64_t t0;
+};
+
+static void
+timed_end(struct timed *t)
+{
+	sweetdrm_time_add(t->kind, t->t0);
+}
+
+#define TIMED(k) \
+	struct timed timed_ __attribute__((cleanup(timed_end), unused)) = { (k), sweetdrm_now_ns() }
+
 static int
 fail_logged(void)
 {
@@ -117,6 +132,7 @@ static void s_ClearColor(CTX, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { SWEE
 static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_UPLOAD);
 	drain("CopyTexSubImage2D");
 	upload_logged("CopyTexSubImage2D", t, l, 0, w, h, 0, 0);
 	glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h);
@@ -187,6 +203,7 @@ fb_before_draw(void)
 		return;
 	}
 	if (fb_barrier_enabled()) {
+		TIMED(SWEETDRM_T_FBBARRIER);
 		_mesa_FramebufferFetchBarrierEXT();
 		fb_barriers++;
 	}
@@ -203,6 +220,7 @@ fb_before_draw(void)
 static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_before_draw();
 	glDrawArrays(m, f, n);
@@ -210,6 +228,7 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_before_draw();
 	glDrawElements(m, n, t, i);
@@ -221,8 +240,22 @@ static void s_Enable(CTX, GLenum c)
 	glEnable(c);
 	checked("Enable", c, 0, 0, 0, 0, 0);
 }
-static void s_Finish(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.finishes, ctx); glFinish(); sweeteagl_after_flush(); }
-static void s_Flush(CTX) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.flushes, ctx); glFlush(); sweeteagl_after_flush(); }
+static void s_Finish(CTX)
+{
+	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_FINISH);
+	count(&sweeteagl_diag.finishes, ctx);
+	glFinish();
+	sweeteagl_after_flush();
+}
+static void s_Flush(CTX)
+{
+	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_FLUSH);
+	count(&sweeteagl_diag.flushes, ctx);
+	glFlush();
+	sweeteagl_after_flush();
+}
 static void s_GenTextures(CTX, GLsizei n, GLuint *t) { SWEETEAGL_ENTER(ctx); glGenTextures(n, t); }
 static GLenum s_GetError(CTX)
 {
@@ -252,6 +285,7 @@ static void s_TexImage2D(CTX, GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei 
     const void *p)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_UPLOAD);
 	drain("TexImage2D");
 	upload_logged("TexImage2D", t, l, ifmt, w, h, f, ty);
 	glTexImage2D(t, l, ifmt, w, h, b, f, ty, p);
@@ -275,6 +309,7 @@ static void s_TexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLsizei 
     const void *p)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_UPLOAD);
 	drain("TexSubImage2D");
 	upload_logged("TexSubImage2D", t, l, 0, w, h, f, ty);
 	glTexSubImage2D(t, l, xo, yo, w, h, f, ty, p);
@@ -288,6 +323,7 @@ static void s_CompressedTexImage2D(CTX, GLenum t, GLint l, GLenum ifmt, GLsizei 
     const void *d)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_UPLOAD);
 	drain("CompressedTexImage2D");
 	upload_logged("CompressedTexImage2D", t, l, (GLint)ifmt, w, h, 0, (GLenum)n);
 	glCompressedTexImage2D(t, l, ifmt, w, h, b, n, d);
@@ -297,6 +333,7 @@ static void s_CompressedTexImage2D(CTX, GLenum t, GLint l, GLenum ifmt, GLsizei 
 static void s_FinishObjectAPPLE(CTX, GLenum o, GLint n)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_FINISH);
 	(void)o;
 	(void)n;
 	count(&sweeteagl_diag.finishes, ctx);
@@ -405,6 +442,7 @@ static void s_DeleteSync(CTX, GLsync s) { SWEETEAGL_ENTER(ctx); glDeleteSync(s);
 static GLenum s_ClientWaitSync(CTX, GLsync s, GLbitfield f, GLuint64 t)
 {
 	SWEETEAGL_ENTER(ctx);
+	TIMED(SWEETDRM_T_FINISH);
 	GLenum r = glClientWaitSync(s, f, t);
 	if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
 		atomic_fetch_add_explicit(&sweeteagl_diag.wait_fails, 1u, memory_order_relaxed);

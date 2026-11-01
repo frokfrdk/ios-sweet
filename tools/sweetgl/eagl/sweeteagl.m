@@ -147,12 +147,14 @@ static pthread_mutex_t gl_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 #define TRACE_CALLS             60u     /* calls logged after each traced bind */
 #define TRACE_BINDS             3u      /* icon-sized binds that start a trace */
 static unsigned trace_left;
+static uint64_t gl_since;       /* G7p: when the holder took gl_lock */
 
 int
 sweeteagl_enter(void *p, const char *fn)
 {
 	if (pthread_mutex_trylock(&gl_lock) != 0) {
 		static unsigned logged;
+		uint64_t t0 = sweetdrm_now_ns();
 		atomic_fetch_add_explicit(&sweeteagl_diag.contended, 1u, memory_order_relaxed);
 		if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < CONTENTION_LOG_MAX) {
 			uint64_t tid = 0;
@@ -161,7 +163,9 @@ sweeteagl_enter(void *p, const char *fn)
 			    (unsigned long long)tid);
 		}
 		pthread_mutex_lock(&gl_lock);
+		sweetdrm_time_add(SWEETDRM_T_LOCK, t0);
 	}
+	gl_since = sweetdrm_now_ns();
 	sweeteagl_ensure_current(p);
 	if (trace_left > 0) {
 		trace_left--;
@@ -180,6 +184,7 @@ void
 sweeteagl_leave(int *entered)
 {
 	(void)entered;
+	sweetdrm_time_add(SWEETDRM_T_GL, gl_since);
 	pthread_mutex_unlock(&gl_lock);
 }
 
@@ -295,6 +300,7 @@ diag_thread(void *arg)
 	for (unsigned r = 1; r <= DIAG_REPORTS; r++) {
 		sleep(DIAG_PERIOD_S);
 		use_reap();     /* in case CA stops flushing: release what has retired */
+		sweetdrm_time_report(r * DIAG_PERIOD_S);
 		unsigned now[16] = { LOAD(draws), LOAD(clears), LOAD(fb_binds), LOAD(programs), LOAD(flushes),
 		    LOAD(finishes), LOAD(not_current), LOAD(compiles), LOAD(compile_fails), LOAD(links), LOAD(link_fails),
 		    LOAD(fb_incomplete), LOAD(gl_errors), LOAD(wait_fails), LOAD(gen_calls), LOAD(unknown_calls) };
@@ -763,6 +769,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 	}
 	/* Mesa's own current context decides, not the TSD slot: CA can set that one alone (G6r) */
 	SWEETEAGL_ENTER(NULL);
+	uint64_t t0 = sweetdrm_now_ns();
 	struct sweetgl_context *old = sweetgl_get_current();
 	if (old != p->gl) {
 		sweetgl_make_current(p->gl);
@@ -816,6 +823,7 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 	if (old != p->gl) {
 		sweetgl_make_current(old);
 	}
+	sweetdrm_time_add(SWEETDRM_T_BIND, t0);
 	/* 7.7: which surfaces CA hands us, without a line per frame */
 	static unsigned logged;
 	if (__atomic_fetch_add(&logged, 1u, __ATOMIC_RELAXED) < BIND_LOG_MAX) {
