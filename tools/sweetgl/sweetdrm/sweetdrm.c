@@ -33,9 +33,6 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#if defined(__APPLE__)
-#include <libkern/OSCacheControl.h>
-#endif
 
 #include "xf86drm.h"
 #include "sweetdrm.h"
@@ -176,6 +173,28 @@ sweetdrm_time_report(unsigned secs)
 	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
 	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
 	cpu_before = cpu;
+}
+
+/*
+ * Clean and invalidate [addr, addr + size) to PoC by this task's mapping.
+ * Not sys_dcache_flush: on iOS arm64 that is only a barrier (Apple's devices
+ * are coherent; observed in G7q, where the GPU then ran a stale IB). XNU lets
+ * EL0 run DC CIVAC (SCTLR_EL1.UCI; libplatform runs IC IVAU at EL0). 64 bytes
+ * is the data cache line of the sunfish cores (Cortex-A76 and A55).
+ */
+static void
+dcache_clean_invalidate(const void *addr, uint64_t size)
+{
+#if defined(__aarch64__)
+	uintptr_t p = (uintptr_t)addr & ~(uintptr_t)63, end = (uintptr_t)addr + (uintptr_t)size;
+	for (; p < end; p += 64) {
+		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+#else
+	(void)addr;
+	(void)size;
+#endif
 }
 
 static int
@@ -478,7 +497,7 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 	if (on < 0) {
 		const char *v = getenv("SWEETDRM_CLEAN");
 		on = info.client_clean && !(v && v[0] == '0');
-		say("submit: clean the submit's CPU-written BOs here, not all BOs in the kernel: %s",
+		say("submit: clean (dc civac) the submit's CPU-written BOs here, not all BOs in the kernel: %s",
 		    on ? "on" : info.client_clean ? "off (SWEETDRM_CLEAN=0)" : "off (kernel ABI 1)");
 	}
 	if (!on) {
@@ -494,9 +513,7 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 	for (uint32_t i = 0; i < n; i++) {
 		const struct bo *b = find(sb[i].handle);
 		if (b->cpu && (b->mapped || b->surface_id)) {
-#if defined(__APPLE__)
-			sys_dcache_flush(b->cpu, (size_t)b->size);
-#endif
+			dcache_clean_invalidate(b->cpu, b->size);
 		}
 	}
 	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);
@@ -752,15 +769,13 @@ sweetdrm_cpu_access(void *addr, uint64_t size)
 	if (on < 0) {
 		const char *v = getenv("SWEETDRM_CPUINV");
 		on = !(v && v[0] == '0');
-		say("cpu access: invalidate idle BOs before Mesa maps them: %s", on ? "on" : "off (SWEETDRM_CPUINV=0)");
+		say("cpu access: invalidate idle BOs (dc civac) before Mesa maps them: %s", on ? "on" : "off (SWEETDRM_CPUINV=0)");
 	}
 	if (!on || addr == NULL || size == 0) {
 		return;
 	}
 	uint64_t t0 = sweetdrm_now_ns();
-#if defined(__APPLE__)
-	sys_dcache_flush(addr, (size_t)size);
-#endif
+	dcache_clean_invalidate(addr, size);
 	sweetdrm_time_add(SWEETDRM_T_CPU_ACCESS, t0);
 	uint64_t c = __atomic_add_fetch(&calls, 1u, __ATOMIC_RELAXED);
 	uint64_t b = __atomic_add_fetch(&bytes, size, __ATOMIC_RELAXED);
