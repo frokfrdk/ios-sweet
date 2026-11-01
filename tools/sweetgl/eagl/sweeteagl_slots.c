@@ -139,8 +139,10 @@ static void s_Disable(CTX, GLenum c)
  * CCU and flush and invalidate the caches. Shader and program names are small
  * integers; one bit each, under the GL lock every slot holds.
  * SWEETEAGL_FBBARRIER=0 turns the barrier off (the draws are still counted).
+ * Mesa's GLES public entry points leave glFramebufferFetchBarrierEXT out, so
+ * this calls its implementation (main/barrier.c, on the current context).
  */
-void GL_APIENTRY glFramebufferFetchBarrierEXT(void);
+void GL_APIENTRY _mesa_FramebufferFetchBarrierEXT(void);
 
 #define FB_NAMES        8192u
 
@@ -185,7 +187,7 @@ fb_before_draw(void)
 		return;
 	}
 	if (fb_barrier_enabled()) {
-		glFramebufferFetchBarrierEXT();
+		_mesa_FramebufferFetchBarrierEXT();
 		fb_barriers++;
 	}
 	if (++fb_draws >= 64u && (fb_draws & (fb_draws - 1u)) == 0) {
