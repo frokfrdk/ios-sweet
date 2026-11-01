@@ -91,6 +91,14 @@ extern struct sweeteagl_diag sweeteagl_diag;
 void sweeteagl_after_flush(void);
 #endif
 
+/*
+ * G7v stripe check (sweeteagl.m), GL lock held: after glBindTexture of a 2D
+ * texture, and before glDeleteTextures. A small IOSurface bound a while ago
+ * is compared row by row as the CPU reads it and as the GPU does.
+ */
+void sweeteagl_stripe_check(unsigned tex);
+void sweeteagl_stripe_forget(int n, const unsigned *tex);
+
 /* The generated stubs (sweeteagl_stubs.S): stub i loads i and calls this, which logs once and returns 0 */
 extern const uint32_t sweeteagl_unknown_stubs[SWEETEAGL_SLOTS * 2u];
 long sweeteagl_unknown_slot(unsigned slot);

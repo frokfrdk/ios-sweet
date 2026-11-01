@@ -68,10 +68,15 @@ int sweetdrm_seq_retired(uint32_t seq);
  * seq is the submit's seqno), and when an import's handle is closed. Called
  * without sweetdrm's lock, on the thread that submitted or closed. Set before
  * the first submit; NULL members are skipped.
+ * seed (G7v): the surface's IOSurface seed, which changes when a CPU writer
+ * unlocks it; 0 if unknown. Called WITH sweetdrm's lock held, before a submit's
+ * clean, so it must not call into sweetdrm. An import whose seed is the one it
+ * had at its last clean is not cleaned again.
  */
 struct sweetdrm_surface_hooks {
 	void (*submitted)(const uint32_t *surface_ids, uint32_t count, uint32_t seq);
 	void (*closed)(uint32_t surface_id);
+	int (*seed)(uint32_t surface_id, uint32_t *seed);
 };
 void sweetdrm_set_surface_hooks(const struct sweetdrm_surface_hooks *hooks);
 

@@ -125,6 +125,9 @@ static void s_BindTexture(CTX, GLenum t, GLuint n)
 	drain("BindTexture");
 	glBindTexture(t, n);
 	checked("BindTexture", t, n, 0, 0, 0, 0);
+	if (t == GL_TEXTURE_2D && n) {
+		sweeteagl_stripe_check(n);
+	}
 }
 static void s_BlendFunc(CTX, GLenum s, GLenum d) { SWEETEAGL_ENTER(ctx); glBlendFunc(s, d); }
 static void s_Clear(CTX, GLbitfield m) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.clears, ctx); glClear(m); }
@@ -138,7 +141,12 @@ static void s_CopyTexSubImage2D(CTX, GLenum t, GLint l, GLint xo, GLint yo, GLin
 	glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h);
 	checked("CopyTexSubImage2D", t, l, xo, yo, w, h);
 }
-static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t) { SWEETEAGL_ENTER(ctx); glDeleteTextures(n, t); }
+static void s_DeleteTextures(CTX, GLsizei n, const GLuint *t)
+{
+	SWEETEAGL_ENTER(ctx);
+	sweeteagl_stripe_forget(n, t);
+	glDeleteTextures(n, t);
+}
 static void s_Disable(CTX, GLenum c)
 {
 	SWEETEAGL_ENTER(ctx);

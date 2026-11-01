@@ -127,6 +127,14 @@ static void f_report(const char *l) { snprintf(last_report, sizeof(last_report),
 
 static const struct sweetdrm_backend fake = { f_open, f_bo_new, f_bo_import, f_bo_free, f_submit, f_wait, f_report };
 
+static uint32_t fake_seed;
+static int
+fake_seed_hook(uint32_t sid, uint32_t *seed)
+{
+	*seed = fake_seed;
+	return sid == 77;
+}
+
 static struct drm_msm_timespec
 in_ms(int64_t ms)
 {
@@ -333,6 +341,19 @@ main(void)
 	cmd[0] = (struct drm_msm_gem_submit_cmd){ .type = MSM_SUBMIT_CMD_BUF, .submit_idx = 0, .size = 8 };
 	struct drm_msm_gem_submit_bo si[2] = { { .handle = b }, { .handle = s2 } };
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
+	/* G7v: an import whose seed is unchanged since its last clean is skipped */
+	static const struct sweetdrm_surface_hooks seeds = { NULL, NULL, fake_seed_hook };
+	sweetdrm_set_surface_hooks(&seeds);
+	sweetdrm_time_report(1);        /* take the counts so far */
+	fake_seed = 5;
+	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && submit(fd, si, 2, cmd, 1, &fence) == 0);
+	sweetdrm_time_report(2);
+	CHECK(strstr(last_report, "import 64 import skipped 64") != NULL);
+	fake_seed = 6;
+	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
+	sweetdrm_time_report(3);
+	CHECK(strstr(last_report, "import 64 import skipped 0") != NULL);
+	sweetdrm_set_surface_hooks(NULL);
 	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
 	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == 0);
 	retire_all();

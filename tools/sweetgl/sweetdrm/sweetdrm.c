@@ -52,6 +52,8 @@ struct bo {
 	void *cpu;                      /* an import's is the surface's own mapping, or NULL */
 	uint32_t surface_id;            /* imports only */
 	bool mapped;                    /* Mesa has mapped it (sweetdrm_mmap): cleaned before submits */
+	bool seeded;                    /* an import cleaned when its surface had seed `seed` */
+	uint32_t seed;
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -113,6 +115,8 @@ static struct {
 	uint64_t ns, max_ns;
 } times[SWEETDRM_T_KINDS];
 
+static uint64_t clean_bytes[3];         /* G7v: submit clean of own BOs, of imports, imports skipped */
+
 uint64_t
 sweetdrm_now_ns(void)
 {
@@ -172,6 +176,10 @@ sweetdrm_time_report(unsigned secs)
 	    time_take(SWEETDRM_T_WAIT, b, sizeof(b)), time_take(SWEETDRM_T_BO_NEW, c, sizeof(c)),
 	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
 	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
+	sweetdrm_say("7.7 time %us: sclean KiB own %llu import %llu import skipped %llu", secs,
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[0], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[1], 0u, __ATOMIC_RELAXED) >> 10),
+	    (unsigned long long)(__atomic_exchange_n(&clean_bytes[2], 0u, __ATOMIC_RELAXED) >> 10));
 	cpu_before = cpu;
 }
 
@@ -251,7 +259,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false, false, 0 };
 	return 0;
 }
 
@@ -489,16 +497,23 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
  * own mappings: BOs Mesa mapped, and imports (other tasks write surfaces too).
  * An import with no mapping here leaves the clean to the kernel.
  * SWEETDRM_CLEAN=0 always leaves it to the kernel.
+ * G7v: G7r spent ~85% of each submit here, most of it (guess) on the 6 MB
+ * display surfaces only the GPU writes. An import whose IOSurface seed is
+ * unchanged since its last clean has had no CPU writer, so it is skipped.
+ * SWEETDRM_SEEDSKIP=0 cleans every import every time again.
  */
 static uint32_t
 clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 {
-	static int on = -1;
+	static int on = -1, seedskip;
 	if (on < 0) {
-		const char *v = getenv("SWEETDRM_CLEAN");
+		const char *v = getenv("SWEETDRM_CLEAN"), *s = getenv("SWEETDRM_SEEDSKIP");
 		on = info.client_clean && !(v && v[0] == '0');
+		seedskip = !(s && s[0] == '0');
 		say("submit: clean (dc civac) the submit's CPU-written BOs here, not all BOs in the kernel: %s",
 		    on ? "on" : info.client_clean ? "off (SWEETDRM_CLEAN=0)" : "off (kernel ABI 1)");
+		say("submit: skip imports whose IOSurface seed is unchanged since their last clean: %s",
+		    !seedskip ? "off (SWEETDRM_SEEDSKIP=0)" : hooks && hooks->seed ? "on" : "off (no seed hook)");
 	}
 	if (!on) {
 		return 0;
@@ -511,10 +526,22 @@ clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
 	}
 	uint64_t t0 = sweetdrm_now_ns();
 	for (uint32_t i = 0; i < n; i++) {
-		const struct bo *b = find(sb[i].handle);
-		if (b->cpu && (b->mapped || b->surface_id)) {
-			dcache_clean_invalidate(b->cpu, b->size);
+		struct bo *b = find(sb[i].handle);
+		if (b->cpu == NULL || !(b->mapped || b->surface_id)) {
+			continue;
 		}
+		if (b->surface_id) {
+			uint32_t seed = 0;
+			bool known = seedskip && hooks && hooks->seed && hooks->seed(b->surface_id, &seed);
+			if (known && b->seeded && b->seed == seed) {
+				__atomic_add_fetch(&clean_bytes[2], b->size, __ATOMIC_RELAXED);
+				continue;
+			}
+			b->seeded = known;
+			b->seed = seed;
+		}
+		dcache_clean_invalidate(b->cpu, b->size);
+		__atomic_add_fetch(&clean_bytes[b->surface_id ? 1 : 0], b->size, __ATOMIC_RELAXED);
 	}
 	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);
 	return SWEETDRM_SUBMIT_CLEAN;

@@ -60,6 +60,7 @@ void IOSurfaceIncrementUseCount(IOSurfaceRef buffer);
 void IOSurfaceDecrementUseCount(IOSurfaceRef buffer);
 Boolean IOSurfaceIsInUse(IOSurfaceRef buffer);
 IOSurfaceRef IOSurfaceLookup(uint32_t csid);
+uint32_t IOSurfaceGetSeed(IOSurfaceRef buffer);
 
 #define TSD_EAGL_SLOT           30      /* OpenGLES's thread-specific slot for the current priv */
 #define PNAME_MULTITHREADED     0x139
@@ -208,7 +209,8 @@ static void use_install(void);
 static void
 open_display(void)
 {
-	setenv("FD_MESA_DEBUG", "nogmem,noubwc", 0);
+	/* G7s: inorder (no batch reordering) with the client clean (G7r) ended the flashing; neither did alone */
+	setenv("FD_MESA_DEBUG", "nogmem,noubwc,inorder", 0);
 	setenv("GALLIUM_THREAD", "0", 0);
 	/* ENODEV: no SweetGPU service yet; anything else (EPERM: not allowed to open it) is final */
 	unsigned waited = 0;
@@ -518,7 +520,24 @@ use_closed_hook(uint32_t sid)
 	pthread_mutex_unlock(&use_lock);
 }
 
-static const struct sweetdrm_surface_hooks use_hooks = { use_submitted, use_closed_hook };
+/*
+ * sweetdrm, its lock held, before a submit's clean (G7v): the seed of a
+ * tracked surface. Only use_lock is taken here, and nothing under use_lock
+ * takes sweetdrm's lock (sweetdrm_seq_retired takes none).
+ */
+static int
+use_seed_hook(uint32_t sid, uint32_t *seed)
+{
+	pthread_mutex_lock(&use_lock);
+	struct use_entry *e = use_find_locked(sid);
+	if (e) {
+		*seed = IOSurfaceGetSeed(e->surf);
+	}
+	pthread_mutex_unlock(&use_lock);
+	return e != NULL;
+}
+
+static const struct sweetdrm_surface_hooks use_hooks = { use_submitted, use_closed_hook, use_seed_hook };
 
 /* Before the first submit */
 static void
@@ -555,6 +574,251 @@ use_reap(void)
 	pthread_mutex_lock(&use_lock);
 	use_reap_locked();
 	pthread_mutex_unlock(&use_lock);
+}
+
+/*
+ * ---- G7v stripe check ----
+ * Small details (the Clock icon's hands: 19x46 and 19x67 RGBA surfaces with
+ * 128-byte rows, two cache lines each) show as hatched stripes. Are the stripes
+ * in memory, or only in what the GPU reads? Some seconds after a small surface
+ * is bound, at CA's next glBindTexture of that texture, its rows are read by
+ * the CPU (vm_read_overwrite: these can wrap client memory that goes away, G7j)
+ * and by the GPU (glReadPixels through a read framebuffer), and compared.
+ * Twice per surface (>= 3 s and >= 30 s after the bind). Everything here runs
+ * under the GL lock. SWEETEAGL_STRIPE=0 turns it off.
+ */
+#define STRIPE_SURFACES         16u
+#define STRIPE_MAX_DIM          256u
+#define STRIPE_CHECKS           2u
+#define STRIPE_ROWS_PER_LINE    96u
+
+struct stripe_entry {
+	struct sweetgl_context *gl;     /* NULL = free */
+	unsigned tex;
+	IOSurfaceRef surf;              /* retained */
+	uint32_t sid;
+	unsigned w, h, checks;
+	uint64_t bound_ns;
+};
+static struct stripe_entry stripe[STRIPE_SURFACES];
+static unsigned stripe_live;
+static int stripe_on = -1;
+
+static bool
+stripe_enabled(void)
+{
+	if (stripe_on < 0) {
+		const char *v = getenv("SWEETEAGL_STRIPE");
+		stripe_on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 stripe: compare small surfaces as CPU and GPU read them: %s",
+		    stripe_on ? "on" : "off (SWEETEAGL_STRIPE=0)");
+	}
+	return stripe_on;
+}
+
+static struct stripe_entry *
+stripe_find(struct sweetgl_context *gl, unsigned tex)
+{
+	for (unsigned k = 0; k < STRIPE_SURFACES; k++) {
+		if (stripe[k].gl == gl && stripe[k].tex == tex && gl != NULL) {
+			return &stripe[k];
+		}
+	}
+	return NULL;
+}
+
+static void
+stripe_drop(struct stripe_entry *e)
+{
+	CFRelease(e->surf);
+	*e = (struct stripe_entry){ 0 };
+	stripe_live--;
+}
+
+/* bind_iosurface: tex now holds surf */
+static void
+stripe_record(unsigned tex, IOSurfaceRef surf, uint32_t sid, unsigned w, unsigned h)
+{
+	if (!stripe_enabled() || w > STRIPE_MAX_DIM || h > STRIPE_MAX_DIM || w == 0 || h == 0 ||
+	    w > IOSurfaceGetWidth(surf) || h > IOSurfaceGetHeight(surf)) {
+		return;
+	}
+	struct sweetgl_context *gl = sweetgl_get_current();
+	struct stripe_entry *e = stripe_find(gl, tex);
+	if (e) {
+		stripe_drop(e);
+	}
+	for (unsigned k = 0; k < STRIPE_SURFACES; k++) {
+		if (stripe[k].gl == NULL) {
+			CFRetain(surf);
+			stripe[k] = (struct stripe_entry){ gl, tex, surf, sid, w, h, 0, sweetdrm_now_ns() };
+			stripe_live++;
+			return;
+		}
+	}
+}
+
+void
+sweeteagl_stripe_forget(int n, const unsigned *tex)
+{
+	if (stripe_live == 0 || tex == NULL) {
+		return;
+	}
+	struct sweetgl_context *gl = sweetgl_get_current();
+	for (int i = 0; i < n; i++) {
+		struct stripe_entry *e = stripe_find(gl, tex[i]);
+		if (e) {
+			stripe_drop(e);
+		}
+	}
+}
+
+static bool
+row_zero(const uint8_t *p, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (p[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* equal as stored, or with R and B swapped (BGRA surfaces read back as RGBA) */
+static bool
+row_same(const uint8_t *a, const uint8_t *b, unsigned w)
+{
+	if (memcmp(a, b, (size_t)w * 4) == 0) {
+		return true;
+	}
+	for (unsigned x = 0; x < w; x++) {
+		const uint8_t *p = a + x * 4, *q = b + x * 4;
+		if (p[0] != q[2] || p[1] != q[1] || p[2] != q[0] || p[3] != q[3]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+stripe_say_rows(uint32_t sid, const char *what, const char *marks, unsigned h)
+{
+	for (unsigned y = 0; y < h; y += STRIPE_ROWS_PER_LINE) {
+		unsigned n = h - y < STRIPE_ROWS_PER_LINE ? h - y : STRIPE_ROWS_PER_LINE;
+		sweetdrm_say("7.7 stripe %u %s r%u: %.*s", sid, what, y, (int)n, marks + y);
+	}
+}
+
+static void
+stripe_compare(struct stripe_entry *e, double age_s)
+{
+	unsigned w = e->w, h = e->h;
+	size_t row = (size_t)w * 4, bpr = IOSurfaceGetBytesPerRow(e->surf);
+	const uint8_t *base = IOSurfaceGetBaseAddress(e->surf);
+	uint8_t *cpu = calloc(h, row), *gpu = calloc(h, row);
+	char *mc = calloc(3, h + 1u);
+	if (cpu == NULL || gpu == NULL || mc == NULL || base == NULL) {
+		free(cpu);
+		free(gpu);
+		free(mc);
+		return;
+	}
+	char *mg = mc + h + 1, *md = mg + h + 1;
+	/* the CPU's view; a row that cannot be read is '?' */
+	for (unsigned y = 0; y < h; y++) {
+		vm_size_t got = 0;
+		kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)(base + (size_t)y * bpr), row,
+		    (vm_address_t)(cpu + (size_t)y * row), &got);
+		mc[y] = kr != KERN_SUCCESS || got != row ? '?' : row_zero(cpu + (size_t)y * row, row) ? '.' : '#';
+	}
+	/* the GPU's view, with every piece of state we touch put back */
+	GLint old_read = 0, old_pack = 0, align = 4, rl = 0, sr = 0, sp = 0;
+	GLenum before = glGetError();
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old_pack);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+	glGetIntegerv(GL_PACK_SKIP_ROWS, &sr);
+	glGetIntegerv(GL_PACK_SKIP_PIXELS, &sp);
+	GLuint fb = 0;
+	glGenFramebuffers(1, &fb);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->tex, 0);
+	GLenum status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	bool read = status == GL_FRAMEBUFFER_COMPLETE;
+	if (read) {
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+		glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, gpu);
+		glPixelStorei(GL_PACK_ALIGNMENT, align);
+		glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+		glPixelStorei(GL_PACK_SKIP_ROWS, sr);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, sp);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)old_pack);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read);
+	glDeleteFramebuffers(1, &fb);
+	GLenum err = glGetError();
+	read = read && err == GL_NO_ERROR;
+	unsigned differ = 0, cpu_rows = 0, gpu_rows = 0, first = h;
+	for (unsigned y = 0; y < h; y++) {
+		const uint8_t *c = cpu + (size_t)y * row, *g = gpu + (size_t)y * row;
+		mg[y] = !read ? '!' : row_zero(g, row) ? '.' : '#';
+		cpu_rows += mc[y] == '#';
+		gpu_rows += mg[y] == '#';
+		bool same = read && mc[y] != '?' && row_same(c, g, w);
+		md[y] = mc[y] == '?' || !read ? '?' : same ? '=' : 'x';
+		if (md[y] == 'x') {
+			differ++;
+			first = first < y ? first : y;
+		}
+	}
+	sweetdrm_say("7.7 stripe: surface %u %ux%u stride %zu tex %u check %u at %.1f s: %u/%u rows differ; nonzero rows "
+	    "cpu %u gpu %u; fb 0x%x err 0x%x before 0x%x", e->sid, w, h, bpr, e->tex, e->checks, age_s, differ, h, cpu_rows,
+	    gpu_rows, status, err, before);
+	if (first < h) {
+		const uint8_t *c = cpu + (size_t)first * row, *g = gpu + (size_t)first * row;
+		unsigned x = 0;
+		while (x + 1 < w && row_same(c + x * 4, g + x * 4, 1)) {
+			x++;
+		}
+		uint32_t cv, gv;
+		memcpy(&cv, c + x * 4, 4);
+		memcpy(&gv, g + x * 4, 4);
+		sweetdrm_say("7.7 stripe %u: first differing row %u, pixel %u: cpu 0x%08x gpu 0x%08x", e->sid, first, x, cv, gv);
+	}
+	if (e->checks == 1 || differ) {
+		stripe_say_rows(e->sid, "cpu ", mc, h);
+		stripe_say_rows(e->sid, "gpu ", mg, h);
+		stripe_say_rows(e->sid, "diff", md, h);
+	}
+	free(cpu);
+	free(gpu);
+	free(mc);
+}
+
+void
+sweeteagl_stripe_check(unsigned tex)
+{
+	if (stripe_live == 0) {
+		return;
+	}
+	struct stripe_entry *e = stripe_find(sweetgl_get_current(), tex);
+	if (e == NULL) {
+		return;
+	}
+	uint64_t age = sweetdrm_now_ns() - e->bound_ns;
+	if (age < (e->checks == 0 ? 3000000000ull : 30000000000ull)) {
+		return;
+	}
+	e->checks++;
+	stripe_compare(e, (double)age / 1e9);
+	if (e->checks >= STRIPE_CHECKS) {
+		stripe_drop(e);
+	}
 }
 
 /* ---- EAGLContext's methods ---- */
@@ -790,6 +1054,11 @@ bind_iosurface(id self, GLenum target, IOSurfaceRef surf, unsigned width, unsign
 		ok = e == GL_NO_ERROR;
 		if (ok) {
 			use_hold(surf);
+			if (fourcc == SWEETGL_FOURCC_BGRA || fourcc == SWEETGL_FOURCC_RGBA) {
+				GLint tex = 0;
+				glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+				stripe_record((unsigned)tex, surf, sid, width, height);
+			}
 			/* G7j: backboardd died in the diag thread sampling a small surface later on; those can wrap
 			 * client memory (G7a) that is freed while the surface lives. Watch only the display ones. */
 			if (width >= 512 && height >= 512) {
