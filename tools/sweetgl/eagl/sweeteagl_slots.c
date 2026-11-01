@@ -7,6 +7,8 @@
  * a stub that logs its number once.
  */
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -128,11 +130,86 @@ static void s_Disable(CTX, GLenum c)
 	glDisable(c);
 	checked("Disable", c, 0, 0, 0, 0, 0);
 }
-static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.draws, ctx); glDrawArrays(m, f, n); }
+/*
+ * G7n: with GL_EXT_shader_framebuffer_fetch hidden the small flashing chunks
+ * went, so they come from CA's shaders that read gl_LastFragData. Mesa keeps
+ * those reads coherent only through the overlap flush of the draw itself, and
+ * G7l (GMEM) made it worse. So before every draw whose program reads the
+ * framebuffer, glFramebufferFetchBarrierEXT has freedreno wait for idle, flush
+ * CCU and flush and invalidate the caches. Shader and program names are small
+ * integers; one bit each, under the GL lock every slot holds.
+ * SWEETEAGL_FBBARRIER=0 turns the barrier off (the draws are still counted).
+ */
+void GL_APIENTRY glFramebufferFetchBarrierEXT(void);
+
+#define FB_NAMES        8192u
+
+static uint64_t fb_shaders[FB_NAMES / 64u], fb_programs[FB_NAMES / 64u];
+static unsigned fb_draws, fb_barriers, fb_untracked;
+
+static int
+fb_bit(const uint64_t *set, GLuint n)
+{
+	return n < FB_NAMES && (set[n / 64u] >> (n % 64u)) & 1u;
+}
+
+static void
+fb_set(uint64_t *set, GLuint n, int on)
+{
+	if (n >= FB_NAMES) {
+		fb_untracked += on;
+		return;
+	}
+	uint64_t bit = 1ull << (n % 64u);
+	set[n / 64u] = on ? set[n / 64u] | bit : set[n / 64u] & ~bit;
+}
+
+static int
+fb_barrier_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("SWEETEAGL_FBBARRIER");
+		enabled = !(e && e[0] == '0');
+		sweetdrm_say("7.7 eagl: framebuffer-fetch barrier before each such draw: %s", enabled ? "on" : "off");
+	}
+	return enabled;
+}
+
+static void
+fb_before_draw(void)
+{
+	GLint p = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &p);
+	if (!fb_bit(fb_programs, (GLuint)p)) {
+		return;
+	}
+	if (fb_barrier_enabled()) {
+		glFramebufferFetchBarrierEXT();
+		fb_barriers++;
+	}
+	if (++fb_draws >= 64u && (fb_draws & (fb_draws - 1u)) == 0) {
+		unsigned progs = 0;
+		for (unsigned k = 0; k < FB_NAMES / 64u; k++) {
+			progs += (unsigned)__builtin_popcountll(fb_programs[k]);
+		}
+		sweetdrm_say("7.7 eagl: framebuffer-fetch draws: %u, %u barriers; %u programs read the framebuffer, "
+		    "%u names untracked", fb_draws, fb_barriers, progs, fb_untracked);
+	}
+}
+
+static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
+{
+	SWEETEAGL_ENTER(ctx);
+	count(&sweeteagl_diag.draws, ctx);
+	fb_before_draw();
+	glDrawArrays(m, f, n);
+}
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
 	SWEETEAGL_ENTER(ctx);
 	count(&sweeteagl_diag.draws, ctx);
+	fb_before_draw();
 	glDrawElements(m, n, t, i);
 }
 static void s_Enable(CTX, GLenum c)
@@ -246,6 +323,15 @@ static void s_ShaderSource(CTX, GLuint s, GLsizei n, const GLchar *const *str, c
 {
 	SWEETEAGL_ENTER(ctx);
 	glShaderSource(s, n, str, len);
+	int reads_fb = 0;
+	for (GLsizei k = 0; k < n && str && !reads_fb; k++) {
+		if (!str[k]) {
+			continue;
+		}
+		size_t l = len && len[k] >= 0 ? (size_t)len[k] : strlen(str[k]);
+		reads_fb = memmem(str[k], l, "gl_LastFragData", 15) || memmem(str[k], l, "framebuffer_fetch", 17);
+	}
+	fb_set(fb_shaders, s, reads_fb);
 }
 static void s_CompileShader(CTX, GLuint s)
 {
@@ -272,6 +358,14 @@ static void s_LinkProgram(CTX, GLuint p)
 	GLint ok = GL_FALSE;
 	glGetProgramiv(p, GL_LINK_STATUS, &ok);
 	atomic_fetch_add_explicit(ok ? &sweeteagl_diag.links : &sweeteagl_diag.link_fails, 1u, memory_order_relaxed);
+	GLuint sh[8];
+	GLsizei nsh = 0;
+	int reads_fb = 0;
+	glGetAttachedShaders(p, 8, &nsh, sh);
+	for (GLsizei k = 0; k < nsh; k++) {
+		reads_fb |= fb_bit(fb_shaders, sh[k]);
+	}
+	fb_set(fb_programs, p, ok && reads_fb);
 	if (!ok && fail_logged()) {
 		char log[INFO_LOG_CHARS + 1] = "";
 		glGetProgramInfoLog(p, sizeof(log), NULL, log);
