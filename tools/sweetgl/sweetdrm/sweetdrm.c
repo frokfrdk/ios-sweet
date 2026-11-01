@@ -54,6 +54,7 @@ struct bo {
 	uint64_t gpu_va, size;
 	void *cpu;                      /* an import's is the surface's own mapping, or NULL */
 	uint32_t surface_id;            /* imports only */
+	bool mapped;                    /* Mesa has mapped it (sweetdrm_mmap): cleaned before submits */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -161,7 +162,7 @@ sweetdrm_time_report(unsigned secs)
 		cpu_before = cpu;
 		return;         /* nothing drawn: keep the log short */
 	}
-	char a[24], b[24], c[24], d[24], e[24], f[24];
+	char a[24], b[24], c[24], d[24], e[24], f[24], g[24];
 	sweetdrm_say("7.7 time %us: cpu %llu ms; gl %s lock %s draw %s fbb %s (calls/ms/max ms)", secs,
 	    (unsigned long long)(cpu - cpu_before), time_take(SWEETDRM_T_GL, a, sizeof(a)),
 	    time_take(SWEETDRM_T_LOCK, b, sizeof(b)), time_take(SWEETDRM_T_DRAW, c, sizeof(c)),
@@ -169,10 +170,11 @@ sweetdrm_time_report(unsigned secs)
 	sweetdrm_say("7.7 time %us: flush %s finish %s upload %s bind %s", secs, time_take(SWEETDRM_T_FLUSH, a, sizeof(a)),
 	    time_take(SWEETDRM_T_FINISH, b, sizeof(b)), time_take(SWEETDRM_T_UPLOAD, c, sizeof(c)),
 	    time_take(SWEETDRM_T_BIND, d, sizeof(d)));
-	sweetdrm_say("7.7 time %us: submit %s wait %s bonew %s bofree %s import %s cpuacc %s", secs,
-	    time_take(SWEETDRM_T_SUBMIT, a, sizeof(a)), time_take(SWEETDRM_T_WAIT, b, sizeof(b)),
-	    time_take(SWEETDRM_T_BO_NEW, c, sizeof(c)), time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)),
-	    time_take(SWEETDRM_T_IMPORT, e, sizeof(e)), time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
+	sweetdrm_say("7.7 time %us: submit %s sclean %s wait %s bonew %s bofree %s import %s cpuacc %s", secs,
+	    time_take(SWEETDRM_T_SUBMIT, a, sizeof(a)), time_take(SWEETDRM_T_SUBMIT_CLEAN, g, sizeof(g)),
+	    time_take(SWEETDRM_T_WAIT, b, sizeof(b)), time_take(SWEETDRM_T_BO_NEW, c, sizeof(c)),
+	    time_take(SWEETDRM_T_BO_FREE, d, sizeof(d)), time_take(SWEETDRM_T_IMPORT, e, sizeof(e)),
+	    time_take(SWEETDRM_T_CPU_ACCESS, f, sizeof(f)));
 	cpu_before = cpu;
 }
 
@@ -230,7 +232,7 @@ add(uint32_t handle, uint64_t gpu_va, uint64_t size, void *cpu, uint32_t surface
 		}
 		b = &bos[nbos++];
 	}
-	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id };
+	*b = (struct bo){ handle, 0, gpu_va, size, cpu, surface_id, false };
 	return 0;
 }
 
@@ -461,6 +463,46 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
 	return wait_until(seq, &r->timeout);
 }
 
+/*
+ * Lock held; the BOs are known to exist. G7q (patch 0121): the kernel cleaned
+ * every page of every BO of ours before each submit, 7-10 ms each in
+ * backboardd (G7p). Clean only what the CPU may have written instead, by our
+ * own mappings: BOs Mesa mapped, and imports (other tasks write surfaces too).
+ * An import with no mapping here leaves the clean to the kernel.
+ * SWEETDRM_CLEAN=0 always leaves it to the kernel.
+ */
+static uint32_t
+clean_submit(const struct drm_msm_gem_submit_bo *sb, uint32_t n)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("SWEETDRM_CLEAN");
+		on = info.client_clean && !(v && v[0] == '0');
+		say("submit: clean the submit's CPU-written BOs here, not all BOs in the kernel: %s",
+		    on ? "on" : info.client_clean ? "off (SWEETDRM_CLEAN=0)" : "off (kernel ABI 1)");
+	}
+	if (!on) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		const struct bo *b = find(sb[i].handle);
+		if (b->surface_id && b->cpu == NULL) {
+			return 0;
+		}
+	}
+	uint64_t t0 = sweetdrm_now_ns();
+	for (uint32_t i = 0; i < n; i++) {
+		const struct bo *b = find(sb[i].handle);
+		if (b->cpu && (b->mapped || b->surface_id)) {
+#if defined(__APPLE__)
+			sys_dcache_flush(b->cpu, (size_t)b->size);
+#endif
+		}
+	}
+	sweetdrm_time_add(SWEETDRM_T_SUBMIT_CLEAN, t0);
+	return SWEETDRM_SUBMIT_CLEAN;
+}
+
 static int
 submit(struct drm_msm_gem_submit *r)
 {
@@ -473,12 +515,15 @@ submit(struct drm_msm_gem_submit *r)
 	const struct drm_msm_gem_submit_cmd *cmd = (const void *)(uintptr_t)r->cmds;
 	struct sweetdrm_ib ib[SWEETDRM_MAX_IBS];
 	uint32_t sids[SUBMIT_SURFACES_MAX];
-	uint32_t n = 0, seq = 0, nsids = 0;
+	uint32_t n = 0, seq = 0, nsids = 0, flags = 0;
 	int e = 0;
 
 	pthread_mutex_lock(&lock);
 	for (uint32_t i = 0; i < r->nr_bos && e == 0; i++) {
 		e = find(sb[i].handle) ? 0 : EINVAL;
+	}
+	if (e == 0) {
+		flags = clean_submit(sb, r->nr_bos);
 	}
 	for (uint32_t i = 0; i < r->nr_cmds && e == 0; i++) {
 		if (cmd[i].type != MSM_SUBMIT_CMD_BUF) {
@@ -492,12 +537,12 @@ submit(struct drm_msm_gem_submit *r)
 		ib[n++] = (struct sweetdrm_ib){ sb[cmd[i].submit_idx].handle, cmd[i].submit_offset, cmd[i].size / 4 };
 		if (n == SWEETDRM_MAX_IBS || i + 1 == r->nr_cmds) {
 			/* the kernel checks each IB lies inside its BO */
-			e = be->submit(ib, n, &seq);
+			e = be->submit(ib, n, flags, &seq);
 			n = 0;
 		}
 	}
 	if (e == 0 && n) {
-		e = be->submit(ib, n, &seq);
+		e = be->submit(ib, n, flags, &seq);
 	}
 	if (seq) {
 		last_submitted = seq;
@@ -654,6 +699,9 @@ sweetdrm_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offs
 		pthread_mutex_lock(&lock);
 		struct bo *b = find(h);
 		void *cpu = b && length <= b->size + 0x4000u ? b->cpu : NULL;
+		if (cpu) {
+			b->mapped = true;
+		}
 		pthread_mutex_unlock(&lock);
 		if (cpu == NULL) {
 			errno = EINVAL;

@@ -28,7 +28,7 @@ static uint32_t fence_page[1024];
 static uint32_t submitted;      /* last seqno handed out */
 static uint32_t n_submits, n_waits, last_wait_ms;
 static struct sweetdrm_ib last_ib[SWEETDRM_MAX_IBS];
-static uint32_t last_count, total_ibs;
+static uint32_t last_count, total_ibs, last_flags;
 static int dead;
 
 static void retire_all(void) { fence_page[0] = submitted; }
@@ -36,7 +36,7 @@ static void retire_all(void) { fence_page[0] = submitted; }
 static int
 f_open(struct sweetdrm_info *i)
 {
-	*i = (struct sweetdrm_info){ 0x06010800, 0x80000, 0x100000, 710000, 0x100000000ull, 0x100000000ull, fence_page };
+	*i = (struct sweetdrm_info){ 0x06010800, 0x80000, 0x100000, 710000, 0x100000000ull, 0x100000000ull, fence_page, 1 };
 	return 0;
 }
 
@@ -90,7 +90,7 @@ f_bo_free(uint32_t h)
 }
 
 static int
-f_submit(const struct sweetdrm_ib *ib, uint32_t count, uint32_t *seq)
+f_submit(const struct sweetdrm_ib *ib, uint32_t count, uint32_t flags, uint32_t *seq)
 {
 	if (count == 0 || count > SWEETDRM_MAX_IBS) {
 		return EINVAL;
@@ -103,6 +103,7 @@ f_submit(const struct sweetdrm_ib *ib, uint32_t count, uint32_t *seq)
 	}
 	memcpy(last_ib, ib, count * sizeof(*ib));
 	last_count = count;
+	last_flags = flags;
 	total_ibs += count;
 	n_submits++;
 	*seq = ++submitted;
@@ -259,6 +260,8 @@ main(void)
 	uint32_t fence = 0;
 	CHECK(submit(fd, sb, 2, cmd, 1, &fence) == 0 && fence == 1);
 	CHECK(last_count == 1 && last_ib[0].handle == a && last_ib[0].offset == 0x100 && last_ib[0].size_dw == 16);
+	/* G7q: a (mapped) and b (never mapped) are ours, so sweetdrm cleaned them itself */
+	CHECK(last_flags == SWEETDRM_SUBMIT_CLEAN);
 
 	/* busy: NOSYNC says EBUSY; a short prep times out; WAIT_FENCE too */
 	CHECK(cpu_prep(fd, b, MSM_PREP_READ | MSM_PREP_NOSYNC, 0) == -EBUSY);
@@ -325,6 +328,14 @@ main(void)
 	CHECK(gem_info(fd, s2, MSM_INFO_GET_OFFSET, &off) == 0 &&
 	    sweetdrm_mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off) == (void *)surface_pages);
 	CHECK(sweetdrm_munmap(surface_pages, 0x10000) == 0);
+	/* G7q: a submit with the mapped import is cleaned here; with the unmapped one, by the kernel */
+	retire_all();
+	cmd[0] = (struct drm_msm_gem_submit_cmd){ .type = MSM_SUBMIT_CMD_BUF, .submit_idx = 0, .size = 8 };
+	struct drm_msm_gem_submit_bo si[2] = { { .handle = b }, { .handle = s2 } };
+	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == SWEETDRM_SUBMIT_CLEAN);
+	CHECK(sweetdrm_import_iosurface(fd, 77, NULL, &si[1].handle, &ssize) == 0);   /* s was zeroed by the failed import */
+	CHECK(submit(fd, si, 2, cmd, 1, &fence) == 0 && last_flags == 0);
+	retire_all();
 
 	/* drmIoctl: errno convention, msm ioctls through it, GEM_CLOSE */
 	struct drm_msm_param pp = { .pipe = MSM_PIPE_3D0, .param = MSM_PARAM_GPU_ID };

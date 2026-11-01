@@ -23,7 +23,14 @@ struct sweetdrm_info {
 	uint32_t chip_id, gmem_size, gmem_base, max_khz;
 	uint64_t window_base, window_size;
 	volatile const uint32_t *fence;         /* word 0 = last retired seqno */
+	int client_clean;                       /* the backend takes SWEETDRM_SUBMIT_CLEAN (patch 0121) */
 };
+
+/*
+ * Submit flag: sweetdrm cleaned to PoC, by this task's mappings, every BO of
+ * the submit the CPU may have written, so the kernel need not clean all of them.
+ */
+#define SWEETDRM_SUBMIT_CLEAN   1u
 
 /* Every call returns 0 or a positive errno */
 struct sweetdrm_backend {
@@ -31,7 +38,7 @@ struct sweetdrm_backend {
 	int (*bo_new)(uint64_t size, uint32_t *handle, uint64_t *gpu_va, void **cpu);
 	int (*bo_import)(uint32_t surface_id, uint32_t *handle, uint64_t *gpu_va, uint64_t *size);
 	int (*bo_free)(uint32_t handle);
-	int (*submit)(const struct sweetdrm_ib *ib, uint32_t count, uint32_t *seqno);
+	int (*submit)(const struct sweetdrm_ib *ib, uint32_t count, uint32_t flags, uint32_t *seqno);
 	int (*wait)(uint32_t seqno, uint32_t timeout_ms);   /* ETIMEDOUT, or EIO once the GPU is dead */
 	void (*report)(const char *line);                    /* one log line; may be NULL */
 };
@@ -45,8 +52,9 @@ void sweetdrm_set_backend(const struct sweetdrm_backend *backend);
 /*
  * Import an IOSurface as a GEM handle on the sweetdrm fd, for fd_bo_from_handle().
  * cpu is the surface's base address in this task (IOSurfaceGetBaseAddress), which
- * Mesa then maps the BO to, or NULL for a BO Mesa must never map. The kernel keeps
- * the CPU caches in step around submits and waits, as for its own BOs.
+ * Mesa then maps the BO to, or NULL for a BO Mesa must never map. Before submits
+ * sweetdrm cleans it by cpu (or, with no cpu, has the kernel clean all BOs); the
+ * kernel invalidates after waits, as for its own BOs.
  * Returns 0 or -errno.
  */
 int sweetdrm_import_iosurface(int fd, uint32_t surface_id, void *cpu, uint32_t *handle, uint64_t *size);
@@ -95,6 +103,7 @@ enum sweetdrm_time_kind {
 	SWEETDRM_T_BO_FREE,             /* GEM_CLOSE: the kernel waits for the GPU first */
 	SWEETDRM_T_IMPORT,
 	SWEETDRM_T_CPU_ACCESS,
+	SWEETDRM_T_SUBMIT_CLEAN,        /* G7q: the clean of a submit's BOs, inside SUBMIT */
 	SWEETDRM_T_KINDS
 };
 uint64_t sweetdrm_now_ns(void);

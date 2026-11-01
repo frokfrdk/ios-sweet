@@ -1,0 +1,70 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -18,7 +18,10 @@
+  *           invalidated to PoC before each submit and after each successful
+  *           wait of this client
+  *   sel 13  submit: struct sweet_gpu_submit -> scalar [seqno]; each IB
+- *           must lie inside a BO of this client
++ *           must lie inside a BO of this client. flags (ABI 2, 0121):
++ *           SWEET_GPU_SUBMIT_CLEAN says the client itself cleaned to PoC
++ *           every BO of the submit the CPU may have written, so the kernel
++ *           skips its clean of all the client's BOs; other bits are refused
+  *   sel 14  wait: scalar [seqno, timeout_ms]; kIOReturnTimeout, or
+  *           kIOReturnNotResponding once the service is dead
+  *   sel 15  info: struct sweet_gpu_info out; the fence page is mapped
+@@ -71,10 +74,11 @@ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ }
+ 
+ /* The user ABI; tools/sweetgpu/sweetgpu-test.c has the same layouts */
+-#define SWEET_GPU_ABI           1u
++#define SWEET_GPU_ABI           2u      /* 0121: submit flags */
+ #define SWEET_GPU_MAX_IBS       16u
++#define SWEET_GPU_SUBMIT_CLEAN  1u
+ struct sweet_gpu_submit {
+-	uint32_t count, reserved;
++	uint32_t count, flags;
+ 	struct sweet_gsvc_ib ib[SWEET_GPU_MAX_IBS];
+ };
+ struct sweet_gpu_info {
+@@ -214,6 +218,7 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOMemoryMap *fFenceMap;
+ 	uint64_t fLogged;                       /* unsupported selectors already logged */
+ 	uint32_t fReports;                      /* report lines logged */
++	bool fCleanLogged;                      /* first SWEET_GPU_SUBMIT_CLEAN submit logged */
+ 
+ 	struct sweet_gpu_bo *slot(uint32_t handle);
+ 	void release(struct sweet_gpu_bo *bo);
+@@ -480,10 +485,17 @@ SweetGPUUserClient::submit(IOExternalMethodArguments *args)
+ 	}
+ 	bzero(&in, sizeof(in));
+ 	memcpy(&in, args->structureInput, len);
+-	if (in.count == 0 || in.count > SWEET_GPU_MAX_IBS || len < 8 + in.count * sizeof(struct sweet_gsvc_ib)) {
++	if (in.count == 0 || in.count > SWEET_GPU_MAX_IBS || len < 8 + in.count * sizeof(struct sweet_gsvc_ib) ||
++	    (in.flags & ~SWEET_GPU_SUBMIT_CLEAN) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	uc_next("submit %u IBs: syncImports, then sweet_gsvc_submit", in.count);
++	/*
++	 * 0121: cleaning every page of every BO took 7-10 ms per submit in
++	 * backboardd (G7p), most of its CPU time. A client that cleaned the
++	 * submit's CPU-written BOs itself (by its own mappings) skips it.
++	 */
++	bool clean = (in.flags & SWEET_GPU_SUBMIT_CLEAN) != 0;
++	uc_next("submit %u IBs: %s, then sweet_gsvc_submit", in.count, clean ? "cleaned by the client" : "syncImports");
+ 	IOLockLock(fLock);
+ 	for (uint32_t i = 0; i < in.count; i++) {
+ 		/* the service checks the IB against its BO; this checks the BO is ours */
+@@ -492,7 +504,12 @@ SweetGPUUserClient::submit(IOExternalMethodArguments *args)
+ 			return kIOReturnBadArgument;
+ 		}
+ 	}
+-	syncImports();
++	if (!clean) {
++		syncImports();
++	} else if (!fCleanLogged) {
++		fCleanLogged = true;
++		IOLog("SWEET GPUUC: client cleans its own BOs before submits (0121); no kernel clean at submit\n");
++	}
+ 	uint32_t seq = 0;
+ 	IOReturn ret = sweet_gpu_ret(sweet_gsvc_submit(in.ib, in.count, &seq));
+ 	if (ret == kIOReturnSuccess) {

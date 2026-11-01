@@ -52,7 +52,7 @@ void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
 size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
 
 /* The ABI in iokit/Kernel/arm/SweetGPU.cpp */
-#define SWEET_GPU_ABI           1u
+#define SWEET_GPU_ABI           2u      /* 1 also works: this test never sets submit flags (0121) */
 #define SWEET_GPU_MAX_IBS       16u
 enum { SEL_BO_NEW = 10, SEL_BO_FREE, SEL_BO_IMPORT, SEL_SUBMIT, SEL_WAIT, SEL_INFO, SEL_REPORT };
 #define REPORT_MAX              192u
@@ -60,7 +60,7 @@ struct sweet_gpu_ib {
 	uint32_t handle, offset, size_dw;
 };
 struct sweet_gpu_submit {
-	uint32_t count, reserved;
+	uint32_t count, flags;   /* 0 */
 	struct sweet_gpu_ib ib[SWEET_GPU_MAX_IBS];
 };
 struct sweet_gpu_info {
@@ -430,7 +430,7 @@ main(void)
 	    "fence page 0x%llx (word 0 %u), window 0x%llx + 0x%llx\n", kr, in.abi, in.chip_id, in.gmem_size, in.gmem_base,
 	    in.cur_khz, in.max_khz, in.flags, in.last_retired, in.fence_user_va, fence ? fence[0] : 0, in.window_base,
 	    in.window_size);
-	int ok = kr == KERN_SUCCESS && in.abi == SWEET_GPU_ABI && fence != NULL;
+	int ok = kr == KERN_SUCCESS && (in.abi == 1 || in.abi == SWEET_GPU_ABI) && fence != NULL;
 	uint32_t bad_bo = ok ? test_bos() : UINT32_MAX;
 	uint32_t bad_surf = ok ? test_surface() : UINT32_MAX;
 	int refused = ok && test_bad();

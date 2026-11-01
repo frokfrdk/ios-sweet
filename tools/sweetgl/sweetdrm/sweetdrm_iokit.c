@@ -25,11 +25,12 @@ kern_return_t IOConnectCallMethod(mach_port_t connection, uint32_t selector, con
     size_t *outputStructCnt);
 
 /* The ABI in iokit/Kernel/arm/SweetGPU.cpp */
-#define SWEET_GPU_ABI           1u
+#define SWEET_GPU_ABI           2u      /* 0121: submit flags; ABI 1 kernels take none */
+#define SWEET_GPU_SUBMIT_CLEAN  1u
 enum { SEL_BO_NEW = 10, SEL_BO_FREE, SEL_BO_IMPORT, SEL_SUBMIT, SEL_WAIT, SEL_INFO, SEL_REPORT };
 #define REPORT_MAX              192u
 struct sweet_gpu_submit {
-	uint32_t count, reserved;
+	uint32_t count, flags;
 	struct sweetdrm_ib ib[SWEETDRM_MAX_IBS];
 };
 struct sweet_gpu_info {
@@ -82,12 +83,12 @@ k_open(struct sweetdrm_info *out)
 	size_t n = sizeof(in);
 	memset(&in, 0, sizeof(in));
 	kr = IOConnectCallMethod(conn, SEL_INFO, NULL, 0, NULL, 0, NULL, NULL, &in, &n);
-	if (kr || in.abi != SWEET_GPU_ABI || in.fence_user_va == 0) {
+	if (kr || (in.abi != 1 && in.abi != SWEET_GPU_ABI) || in.fence_user_va == 0) {
 		return kr ? err(kr) : ENODEV;
 	}
 	*out = (struct sweetdrm_info){
 		in.chip_id, in.gmem_size, in.gmem_base, in.max_khz, in.window_base, in.window_size,
-		(volatile const uint32_t *)(uintptr_t)in.fence_user_va,
+		(volatile const uint32_t *)(uintptr_t)in.fence_user_va, in.abi >= 2,
 	};
 	return 0;
 }
@@ -128,15 +129,16 @@ k_bo_free(uint32_t handle)
 }
 
 static int
-k_submit(const struct sweetdrm_ib *ib, uint32_t count, uint32_t *seqno)
+k_submit(const struct sweetdrm_ib *ib, uint32_t count, uint32_t flags, uint32_t *seqno)
 {
 	struct sweet_gpu_submit s;
 	memset(&s, 0, sizeof(s));
 	s.count = count;
+	s.flags = flags & SWEETDRM_SUBMIT_CLEAN ? SWEET_GPU_SUBMIT_CLEAN : 0;   /* only set when info.abi >= 2 */
 	memcpy(s.ib, ib, count * sizeof(*ib));
 	uint64_t o = 0;
 	uint32_t on = 1;
-	__asm__ volatile("dsb sy" ::: "memory");        /* CPU writes done; the kernel cleans the BOs to PoC */
+	__asm__ volatile("dsb sy" ::: "memory");        /* CPU writes and cleans done; else the kernel cleans to PoC */
 	kern_return_t kr = IOConnectCallMethod(conn, SEL_SUBMIT, NULL, 0, &s, 8 + count * sizeof(*ib), &o, &on, NULL, NULL);
 	*seqno = kr ? 0 : (uint32_t)o;
 	return err(kr);
