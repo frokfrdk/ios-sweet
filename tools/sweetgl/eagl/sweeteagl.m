@@ -151,6 +151,8 @@ static pthread_mutex_t gl_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 #define TRACE_BINDS             3u      /* icon-sized binds that start a trace */
 static unsigned trace_left;
 static uint64_t gl_since;       /* G7p: when the holder took gl_lock */
+static unsigned gl_depth;       /* G8c: SWEETEAGL_ENTER scopes open on the holder's thread */
+static const char *gl_fn;       /* G8c: the outermost one's function */
 
 int
 sweeteagl_enter(void *p, const char *fn)
@@ -169,6 +171,9 @@ sweeteagl_enter(void *p, const char *fn)
 		sweetdrm_time_add(SWEETDRM_T_LOCK, t0);
 	}
 	gl_since = sweetdrm_now_ns();
+	if (gl_depth++ == 0) {
+		gl_fn = fn;
+	}
 	sweeteagl_ensure_current(p);
 	if (trace_left > 0) {
 		trace_left--;
@@ -187,6 +192,9 @@ void
 sweeteagl_leave(int *entered)
 {
 	(void)entered;
+	if (--gl_depth == 0 && gl_fn != NULL && sweetgl_get_current() != NULL) {
+		sweeteagl_blame_error(gl_fn);
+	}
 	sweetdrm_time_add(SWEETDRM_T_GL, gl_since);
 	pthread_mutex_unlock(&gl_lock);
 }

@@ -78,6 +78,220 @@ under(atomic_uint *n, unsigned max)
 	return atomic_fetch_add_explicit(n, 1u, memory_order_relaxed) < max;
 }
 
+/*
+ * G8c: G8b still had a GL_INVALID_ENUM from an unchecked call, and the App
+ * Library's title band draws black. Every outermost slot or shim method now
+ * ends with glGetError (sweeteagl_leave); an error is held for CA and logged
+ * the first time per function and error, then at powers of two.
+ * SWEETEAGL_ERRBLAME=0 turns this off.
+ */
+#define BLAME_NAMES     48
+#define BLAME_LOG_MAX   96u
+
+void
+sweeteagl_blame_error(const char *fn)
+{
+	static int on = -1;
+	static struct {
+		const char *fn;
+		GLenum err;
+		unsigned n;
+	} seen[BLAME_NAMES];
+	static unsigned logged;
+	if (on < 0) {
+		const char *v = getenv("SWEETEAGL_ERRBLAME");
+		on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 eagl: GL errors named by the call that raised them: %s", on ? "on" : "off (SWEETEAGL_ERRBLAME=0)");
+	}
+	if (!on || strcmp(fn, "s_GetError") == 0) {
+		return;
+	}
+	GLenum err = glGetError();
+	if (err == GL_NO_ERROR) {
+		return;
+	}
+	if (held_error == GL_NO_ERROR) {
+		held_error = err;
+	}
+	unsigned k = 0;
+	while (k < BLAME_NAMES && seen[k].fn != NULL && !(seen[k].err == err && strcmp(seen[k].fn, fn) == 0)) {
+		k++;
+	}
+	unsigned n = 1;
+	if (k < BLAME_NAMES) {
+		if (seen[k].fn == NULL) {
+			seen[k].fn = fn;
+			seen[k].err = err;
+		}
+		n = ++seen[k].n;
+	}
+	if ((n & (n - 1)) == 0 && logged < BLAME_LOG_MAX) {
+		logged++;
+		sweetdrm_say("7.7 eagl: GL error 0x%04x raised in %s (G8c), %u times", err, fn, n);
+	}
+}
+
+/*
+ * G8c: where do the black band and the missing glyphs come from? When CA
+ * leaves a framebuffer it drew into, read its viewport back (at most every
+ * OFFSCREEN_EVERY_NS per texture and size) and log how much of it is
+ * transparent, opaque black, dark or other, with a 16x16 picture of the
+ * majority class per cell (top row first). SWEETEAGL_OFFSCREEN=0 turns it off.
+ */
+#define OFFSCREEN_KEYS          96
+#define OFFSCREEN_EVERY_NS      15000000000ull
+#define OFFSCREEN_LOG_MAX       400u
+#define OFFSCREEN_MAX_PIXELS    (2u << 20)
+#define OFFSCREEN_GRID          16
+
+static unsigned fb_draws;               /* draws into the bound draw framebuffer since it was bound */
+static GLuint cur_prog, fb_prog;        /* the program in use; the one of the last draw */
+
+static void
+offscreen_read(GLint fbo, GLint tex, const GLint vp[4], unsigned draws)
+{
+	static uint64_t t_start;
+	uint64_t now = sweetdrm_now_ns();
+	if (t_start == 0) {
+		t_start = now;
+	}
+	size_t w = (size_t)vp[2], h = (size_t)vp[3];
+	uint8_t *px = w * h <= OFFSCREEN_MAX_PIXELS ? malloc(w * h * 4) : NULL;
+	if (px == NULL) {
+		sweetdrm_say("7.7 offscreen fb %d tex %d viewport %zux%zu: not read", fbo, tex, w, h);
+		return;
+	}
+	GLint old_read = 0, old_pack = 0, align = 4, rl = 0, sr = 0, sp = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old_pack);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+	glGetIntegerv(GL_PACK_SKIP_ROWS, &sr);
+	glGetIntegerv(GL_PACK_SKIP_PIXELS, &sp);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fbo);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+	glReadPixels(vp[0], vp[1], (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	GLenum err = glGetError();
+	glPixelStorei(GL_PACK_ALIGNMENT, align);
+	glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+	glPixelStorei(GL_PACK_SKIP_ROWS, sr);
+	glPixelStorei(GL_PACK_SKIP_PIXELS, sp);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)old_pack);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read);
+	double at = (double)(now - t_start) / 1e9;
+	if (err != GL_NO_ERROR) {
+		sweetdrm_say("7.7 offscreen fb %d tex %d viewport %zux%zu at %.1f s: read error 0x%04x", fbo, tex, w, h, at, err);
+		free(px);
+		return;
+	}
+	/* classes: 0 transparent, 1 opaque black, 2 dark, 3 other */
+	static const char mark[4] = { '.', '#', '+', 'o' };
+	unsigned cells[OFFSCREEN_GRID * OFFSCREEN_GRID][4];
+	uint64_t total[4] = { 0 }, sum[4] = { 0 };
+	memset(cells, 0, sizeof(cells));
+	for (size_t y = 0; y < h; y++) {
+		for (size_t x = 0; x < w; x++) {
+			const uint8_t *p = px + (y * w + x) * 4;
+			unsigned m = p[0] > p[1] ? p[0] : p[1];
+			m = m > p[2] ? m : p[2];
+			unsigned c = p[3] < 8 ? 0 : p[3] >= 248 && m < 16 ? 1 : m < 64 ? 2 : 3;
+			total[c]++;
+			for (unsigned i = 0; i < 4; i++) {
+				sum[i] += p[i];
+			}
+			/* GL row 0 is the bottom; the picture's row 0 is the top */
+			size_t cy = (OFFSCREEN_GRID - 1) - y * OFFSCREEN_GRID / h, cx = x * OFFSCREEN_GRID / w;
+			cells[cy * OFFSCREEN_GRID + cx][c]++;
+		}
+	}
+	free(px);
+	uint64_t n = (uint64_t)w * h;
+	sweetdrm_say("7.7 offscreen fb %d tex %d viewport %zux%zu at %d,%d after %u draws, prog %u, at %.1f s: transparent %u%% "
+	    "black %u%% dark %u%% other %u%%; mean rgba %u %u %u %u (G8c)", fbo, tex, w, h, vp[0], vp[1], draws, fb_prog, at,
+	    (unsigned)(total[0] * 100 / n), (unsigned)(total[1] * 100 / n), (unsigned)(total[2] * 100 / n),
+	    (unsigned)(total[3] * 100 / n), (unsigned)(sum[0] / n), (unsigned)(sum[1] / n), (unsigned)(sum[2] / n),
+	    (unsigned)(sum[3] / n));
+	char line[4 * (OFFSCREEN_GRID + 1)];
+	for (unsigned r0 = 0; r0 < OFFSCREEN_GRID; r0 += 4) {
+		char *o = line;
+		for (unsigned r = r0; r < r0 + 4; r++) {
+			for (unsigned cx = 0; cx < OFFSCREEN_GRID; cx++) {
+				const unsigned *k = cells[r * OFFSCREEN_GRID + cx];
+				unsigned best = 0;
+				for (unsigned c = 1; c < 4; c++) {
+					best = k[c] > k[best] ? c : best;
+				}
+				*o++ = k[0] + k[1] + k[2] + k[3] == 0 ? ' ' : mark[best];
+			}
+			*o++ = r + 1 < r0 + 4 ? '|' : '\0';
+		}
+		sweetdrm_say("7.7 offscreen fb %d pic r%02u: %s", fbo, r0, line);
+	}
+}
+
+/* glBindFramebuffer: the draw framebuffer CA leaves, when it drew into it */
+static void
+offscreen_done(GLenum target, GLuint next)
+{
+	static int on = -1;
+	static struct {
+		GLint tex, w, h;
+		uint64_t last_ns;
+	} seen[OFFSCREEN_KEYS];
+	static unsigned logged;
+	if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER) {
+		return;
+	}
+	GLint cur = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &cur);
+	if ((GLuint)cur == next) {
+		return;
+	}
+	unsigned draws = fb_draws;
+	fb_draws = 0;
+	if (on < 0) {
+		const char *v = getenv("SWEETEAGL_OFFSCREEN");
+		on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 offscreen: read back framebuffers CA drew into, every %llu s per texture and size: %s",
+		    OFFSCREEN_EVERY_NS / 1000000000ull, on ? "on" : "off (SWEETEAGL_OFFSCREEN=0)");
+	}
+	if (!on || cur == 0 || draws == 0 || logged >= OFFSCREEN_LOG_MAX) {
+		return;
+	}
+	GLint type = 0, tex = 0, vp[4] = { 0 };
+	glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	if (type == GL_TEXTURE) {
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &tex);
+	}
+	glGetIntegerv(GL_VIEWPORT, vp);
+	if (vp[2] <= 0 || vp[3] <= 0) {
+		return;
+	}
+	uint64_t now = sweetdrm_now_ns();
+	unsigned k = 0;
+	while (k < OFFSCREEN_KEYS && seen[k].w != 0 && !(seen[k].tex == tex && seen[k].w == vp[2] && seen[k].h == vp[3])) {
+		k++;
+	}
+	if (k == OFFSCREEN_KEYS) {
+		return;
+	}
+	if (seen[k].w != 0 && now - seen[k].last_ns < OFFSCREEN_EVERY_NS) {
+		return;
+	}
+	seen[k].tex = tex;
+	seen[k].w = vp[2];
+	seen[k].h = vp[3];
+	seen[k].last_ns = now;
+	logged++;
+	offscreen_read(cur, tex, vp, draws);
+}
+
 /* before a checked call: hold an unchecked call's error, so it is not blamed on this one */
 static void
 drain(const char *call)
@@ -230,6 +444,8 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	SWEETEAGL_ENTER(ctx);
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
+	fb_draws++;
+	fb_prog = cur_prog;
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
 	glDrawArrays(m, f, n);
@@ -240,6 +456,8 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	SWEETEAGL_ENTER(ctx);
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
+	fb_draws++;
+	fb_prog = cur_prog;
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
 	glDrawElements(m, n, t, i);
@@ -423,7 +641,7 @@ static void s_LinkProgram(CTX, GLuint p)
 		sweetdrm_say("7.7 eagl: program %u does not link: %s", p, log);
 	}
 }
-static void s_UseProgram(CTX, GLuint p) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.programs, ctx); glUseProgram(p); }
+static void s_UseProgram(CTX, GLuint p) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.programs, ctx); cur_prog = p; glUseProgram(p); }
 static void s_Uniform1f(CTX, GLint l, GLfloat a) { SWEETEAGL_ENTER(ctx); glUniform1f(l, a); }
 static void s_Uniform4f(CTX, GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) { SWEETEAGL_ENTER(ctx); glUniform4f(l, a, b, c, d); }
 static void s_Uniform1i(CTX, GLint l, GLint a) { SWEETEAGL_ENTER(ctx); glUniform1i(l, a); }
@@ -433,7 +651,13 @@ static void s_UniformMatrix3fv(CTX, GLint l, GLsizei n, GLboolean t, const GLflo
 static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { SWEETEAGL_ENTER(ctx); glUniformMatrix4fv(l, n, t, v); }
 static GLint s_GetUniformLocation(CTX, GLuint p, const GLchar *n) { SWEETEAGL_ENTER(ctx); return glGetUniformLocation(p, n); }
 static void s_BindAttribLocation(CTX, GLuint p, GLuint i, const GLchar *n) { SWEETEAGL_ENTER(ctx); glBindAttribLocation(p, i, n); }
-static void s_BindFramebuffer(CTX, GLenum t, GLuint f) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.fb_binds, ctx); glBindFramebuffer(t, f); }
+static void s_BindFramebuffer(CTX, GLenum t, GLuint f)
+{
+	SWEETEAGL_ENTER(ctx);
+	count(&sweeteagl_diag.fb_binds, ctx);
+	offscreen_done(t, f);
+	glBindFramebuffer(t, f);
+}
 static void s_DeleteFramebuffers(CTX, GLsizei n, const GLuint *f) { SWEETEAGL_ENTER(ctx); glDeleteFramebuffers(n, f); }
 static void s_GenFramebuffers(CTX, GLsizei n, GLuint *f) { SWEETEAGL_ENTER(ctx); glGenFramebuffers(n, f); }
 static void s_FramebufferTexture2D(CTX, GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l)

@@ -96,6 +96,13 @@ void sweeteagl_after_flush(void);
  * texture, and before glDeleteTextures. A small IOSurface bound a while ago
  * is compared row by row as the CPU reads it and as the GPU does.
  */
+/*
+ * G8c (sweeteagl_slots.c): when the outermost SWEETEAGL_ENTER scope ends with a
+ * context current, take its pending GL error, hold it for CA's glGetError and
+ * log the first ones with fn, the slot or method that raised them.
+ */
+void sweeteagl_blame_error(const char *fn);
+
 void sweeteagl_stripe_check(unsigned tex);
 void sweeteagl_stripe_forget(int n, const unsigned *tex);
 /*
