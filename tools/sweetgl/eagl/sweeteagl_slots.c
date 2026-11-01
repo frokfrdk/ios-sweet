@@ -7,10 +7,12 @@
  * a stub that logs its number once.
  */
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <GLES3/gl3.h>
+#include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
 
 #include "sweeteagl.h"
@@ -292,6 +294,205 @@ offscreen_done(GLenum target, GLuint next)
 	offscreen_read(cur, tex, vp, draws);
 }
 
+/*
+ * G8d: G8c's App Library header blur read back transparent after its passes
+ * and the screen black where it lands; an incomplete texture samples as
+ * (0,0,0,1). Before a draw, look at what each 2D sampler of the program Mesa
+ * really has bound sees: texture, size and format of its base level, filters,
+ * wrap, levels and sampler object, and flag the ones GLES calls incomplete.
+ * Logged for the first TEXCHECK_PER_FB draws into each framebuffer every
+ * TEXCHECK_EVERY_NS, and for every draw with a flagged texture (a few per
+ * texture). SWEETEAGL_TEXCHECK=0 turns this off.
+ */
+#define TEXCHECK_PROGS          128
+#define TEXCHECK_UNITS          4
+#define TEXCHECK_FBS            256
+#define TEXCHECK_PER_FB         8u
+#define TEXCHECK_EVERY_NS       15000000000ull
+#define TEXCHECK_LOG_MAX        1200u
+#define TEXCHECK_BAD_PER_TEX    4u
+#define TEXCHECK_LINE           200
+
+struct tc_prog {
+	GLuint prog;                    /* 0 = free */
+	unsigned n;
+	GLint loc[TEXCHECK_UNITS];
+};
+static struct tc_prog tc_progs[TEXCHECK_PROGS];
+static struct {
+	uint64_t since;
+	unsigned n;
+} tc_fb[TEXCHECK_FBS];
+static unsigned char tc_bad[256];       /* flagged lines per texture name, modulo 256 */
+static unsigned tc_logged;
+static int texcheck_on = -1;
+
+/* the 2D sampler uniforms of prog (names are not kept); NULL when the table is full */
+static struct tc_prog *
+tc_samplers(GLuint prog)
+{
+	unsigned h = prog % TEXCHECK_PROGS;
+	for (unsigned i = 0; i < TEXCHECK_PROGS; i++) {
+		struct tc_prog *e = &tc_progs[(h + i) % TEXCHECK_PROGS];
+		if (e->prog == prog) {
+			return e;
+		}
+		if (e->prog != 0) {
+			continue;
+		}
+		e->prog = prog;
+		e->n = 0;
+		GLint count = 0;
+		glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+		for (GLint u = 0; u < count && e->n < TEXCHECK_UNITS; u++) {
+			char name[64];
+			GLsizei len = 0;
+			GLint size = 0;
+			GLenum type = 0;
+			glGetActiveUniform(prog, (GLuint)u, sizeof(name), &len, &size, &type, name);
+			if (type == GL_SAMPLER_2D) {
+				e->loc[e->n++] = glGetUniformLocation(prog, name);
+			}
+		}
+		return e;
+	}
+	return NULL;
+}
+
+static bool
+tc_mipmap(GLint f)
+{
+	return f == GL_NEAREST_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_NEAREST || f == GL_NEAREST_MIPMAP_LINEAR ||
+	    f == GL_LINEAR_MIPMAP_LINEAR;
+}
+
+static bool
+tc_linear(GLint minf, GLint magf)
+{
+	return magf == GL_LINEAR || minf == GL_LINEAR || minf == GL_LINEAR_MIPMAP_NEAREST ||
+	    minf == GL_NEAREST_MIPMAP_LINEAR || minf == GL_LINEAR_MIPMAP_LINEAR;
+}
+
+/* one sampler: its description in out; the reason it is incomplete, or NULL */
+static const char *
+tc_unit(GLuint prog, GLint loc, char *out, size_t n, GLint *tex_out)
+{
+	GLint unit = 0, tex = 0, smp = 0, minf = 0, magf = 0, ws = 0, wt = 0, base = 0, maxl = 0, w0 = 0, h0 = 0, f0 = 0,
+	    w1 = 0;
+	glGetUniformiv(prog, loc, &unit);
+	glActiveTexture(GL_TEXTURE0 + (GLenum)unit);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+	glGetIntegerv(GL_SAMPLER_BINDING, &smp);
+	if (smp) {
+		glGetSamplerParameteriv((GLuint)smp, GL_TEXTURE_MIN_FILTER, &minf);
+		glGetSamplerParameteriv((GLuint)smp, GL_TEXTURE_MAG_FILTER, &magf);
+		glGetSamplerParameteriv((GLuint)smp, GL_TEXTURE_WRAP_S, &ws);
+		glGetSamplerParameteriv((GLuint)smp, GL_TEXTURE_WRAP_T, &wt);
+	} else {
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magf);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+	}
+	glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, &base);
+	glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, base, GL_TEXTURE_WIDTH, &w0);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, base, GL_TEXTURE_HEIGHT, &h0);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, base, GL_TEXTURE_INTERNAL_FORMAT, &f0);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, base + 1, GL_TEXTURE_WIDTH, &w1);
+	GLenum err = glGetError();
+	const char *bad = NULL;
+	if (tex == 0) {
+		bad = "no texture bound";
+	} else if (err != GL_NO_ERROR) {
+		bad = NULL;     /* levels unknown: said in the line */
+	} else if (w0 == 0 || h0 == 0) {
+		bad = "no image at the base level";
+	} else if (tc_mipmap(minf) && maxl > base && (w0 > 1 || h0 > 1) && w1 == 0) {
+		bad = "mipmap filter, no level base+1";
+	} else if ((f0 == GL_RGBA32F || f0 == GL_RGB32F || f0 == GL_RG32F || f0 == GL_R32F) && tc_linear(minf, magf)) {
+		bad = "32-bit float with linear filtering";
+	}
+	snprintf(out, n, "u%d tex %d %dx%d fmt 0x%x min 0x%x mag 0x%x wrap 0x%x/0x%x levels %d..%d next w %d smp %d "
+	    "err 0x%x%s%s", unit, tex, w0, h0, f0, minf, magf, ws, wt, base, maxl, w1, smp, err, bad ? ": INCOMPLETE, " : "",
+	    bad ? bad : "");
+	*tex_out = tex;
+	return bad;
+}
+
+/* before a draw (GL lock held): sets fb_prog to the program Mesa has bound */
+static void
+texcheck_draw(void)
+{
+	if (texcheck_on < 0) {
+		const char *v = getenv("SWEETEAGL_TEXCHECK");
+		texcheck_on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 texcheck: sampled texture state before draws: %s", texcheck_on ? "on" :
+		    "off (SWEETEAGL_TEXCHECK=0)");
+	}
+	if (!texcheck_on) {
+		fb_prog = cur_prog;
+		return;
+	}
+	GLint prog = 0, fb = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	fb_prog = (GLuint)prog;
+	if (tc_logged >= TEXCHECK_LOG_MAX) {
+		return;
+	}
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+	static unsigned no_prog;
+	if (prog == 0) {
+		if (no_prog++ < 8) {
+			tc_logged++;
+			sweetdrm_say("7.7 texcheck fb %d: draw with no program bound (cur_prog %u) (G8d)", fb, cur_prog);
+		}
+		return;
+	}
+	struct tc_prog *pe = tc_samplers((GLuint)prog);
+	if (pe == NULL) {
+		return;
+	}
+	uint64_t now = sweetdrm_now_ns();
+	bool window = false;
+	if (fb >= 0 && fb < TEXCHECK_FBS) {
+		if (now - tc_fb[fb].since >= TEXCHECK_EVERY_NS) {
+			tc_fb[fb].since = now;
+			tc_fb[fb].n = 0;
+		}
+		window = tc_fb[fb].n < TEXCHECK_PER_FB;
+	}
+	GLint active = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	char desc[TEXCHECK_UNITS][TEXCHECK_LINE];
+	bool flagged = false, wanted = window;
+	for (unsigned k = 0; k < pe->n; k++) {
+		GLint tex = 0;
+		if (tc_unit((GLuint)prog, pe->loc[k], desc[k], sizeof(desc[k]), &tex) != NULL) {
+			flagged = true;
+			if (tc_bad[(unsigned)tex & 255u] < TEXCHECK_BAD_PER_TEX) {
+				tc_bad[(unsigned)tex & 255u]++;
+				wanted = true;
+			}
+		}
+	}
+	glActiveTexture((GLenum)active);
+	if (!wanted) {
+		return;
+	}
+	if (window) {
+		tc_fb[fb].n++;
+	}
+	GLint vp[4] = { 0 };
+	glGetIntegerv(GL_VIEWPORT, vp);
+	tc_logged++;
+	sweetdrm_say("7.7 texcheck fb %d viewport %dx%d prog %d: %u samplers%s (G8d)", fb, vp[2], vp[3], prog, pe->n,
+	    flagged ? ", INCOMPLETE" : "");
+	for (unsigned k = 0; k < pe->n; k++) {
+		sweetdrm_say("7.7 texcheck fb %d   %s", fb, desc[k]);
+	}
+}
+
 /* before a checked call: hold an unchecked call's error, so it is not blamed on this one */
 static void
 drain(const char *call)
@@ -445,7 +646,7 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_draws++;
-	fb_prog = cur_prog;
+	texcheck_draw();
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
 	glDrawArrays(m, f, n);
@@ -457,7 +658,7 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	fb_draws++;
-	fb_prog = cur_prog;
+	texcheck_draw();
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
 	glDrawElements(m, n, t, i);
