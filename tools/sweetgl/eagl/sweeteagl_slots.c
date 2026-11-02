@@ -148,6 +148,8 @@ sweeteagl_blame_error(const char *fn)
 
 static unsigned os_draws;               /* draws into the bound draw framebuffer since it was bound */
 static GLuint cur_prog, fb_prog;        /* the program in use; the one of the last draw */
+static void *use_ctx;                   /* G8f: the slot context of the last glUseProgram */
+static struct sweetgl_context *use_gl;  /* and the Mesa context it ran on */
 
 static void
 offscreen_read(GLint fbo, GLint tex, const GLint vp[4], unsigned draws)
@@ -422,8 +424,40 @@ tc_unit(GLuint prog, GLint loc, char *out, size_t n, GLint *tex_out)
 }
 
 /* before a draw (GL lock held): sets fb_prog to the program Mesa has bound */
+/*
+ * G8f: G8e's App Library blur passes (512x176, 497x164) ended with draws that
+ * had no program bound in Mesa, and read back fully transparent, while CA had
+ * called glUseProgram and every link succeeded. For each such draw (the first
+ * NOPROG_LOG_MAX, then at powers of two) say what CA's last glUseProgram was:
+ * its program, whether that name is a linked program here, and whether it ran
+ * on this slot context and this Mesa context. The draw's state follows (G8e).
+ */
+#define NOPROG_LOG_MAX          300u
+
 static void
-texcheck_draw(void)
+noprog_draw(void *ctx, GLint fb)
+{
+	static unsigned n, logged;
+	n++;
+	if (logged >= NOPROG_LOG_MAX && (n & (n - 1)) != 0) {
+		return;
+	}
+	logged++;
+	GLint vp[4] = { 0 }, linked = -1;
+	glGetIntegerv(GL_VIEWPORT, vp);
+	GLboolean is = cur_prog ? glIsProgram(cur_prog) : GL_FALSE;
+	if (is) {
+		glGetProgramiv(cur_prog, GL_LINK_STATUS, &linked);
+	}
+	sweetdrm_say("7.7 noprog fb %d viewport %dx%d: draw %u with no program; last UseProgram %u (%s, linked %d) "
+	    "on %s slot context, %s Mesa context (G8f)", fb, vp[2], vp[3], n, cur_prog, is ? "a program here" :
+	    "not a program here", linked, use_ctx == ctx ? "this" : "another", use_gl == sweetgl_get_current() ? "this" :
+	    "another");
+	tc_said = true;
+}
+
+static void
+texcheck_draw(void *ctx)
 {
 	tc_said = false;
 	if (texcheck_on < 0) {
@@ -439,18 +473,15 @@ texcheck_draw(void)
 	GLint prog = 0, fb = 0;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
 	fb_prog = (GLuint)prog;
+	if (prog == 0) {
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+		noprog_draw(ctx, fb);
+		return;
+	}
 	if (tc_logged >= TEXCHECK_LOG_MAX) {
 		return;
 	}
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
-	static unsigned no_prog;
-	if (prog == 0) {
-		if (no_prog++ < 8) {
-			tc_logged++;
-			sweetdrm_say("7.7 texcheck fb %d: draw with no program bound (cur_prog %u) (G8d)", fb, cur_prog);
-		}
-		return;
-	}
 	struct tc_prog *pe = tc_samplers((GLuint)prog);
 	if (pe == NULL) {
 		return;
@@ -836,7 +867,7 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	os_draws++;
-	texcheck_draw();
+	texcheck_draw(ctx);
 	drawstate(m, f, n, 0, NULL);
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
@@ -849,7 +880,7 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	TIMED(SWEETDRM_T_DRAW);
 	count(&sweeteagl_diag.draws, ctx);
 	os_draws++;
-	texcheck_draw();
+	texcheck_draw(ctx);
 	drawstate(m, 0, n, t, i);
 	fb_before_draw();
 	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
@@ -1034,7 +1065,15 @@ static void s_LinkProgram(CTX, GLuint p)
 		sweetdrm_say("7.7 eagl: program %u does not link: %s", p, log);
 	}
 }
-static void s_UseProgram(CTX, GLuint p) { SWEETEAGL_ENTER(ctx); count(&sweeteagl_diag.programs, ctx); cur_prog = p; glUseProgram(p); }
+static void s_UseProgram(CTX, GLuint p)
+{
+	SWEETEAGL_ENTER(ctx);
+	count(&sweeteagl_diag.programs, ctx);
+	cur_prog = p;
+	use_ctx = ctx;
+	use_gl = sweetgl_get_current();
+	glUseProgram(p);
+}
 static void s_Uniform1f(CTX, GLint l, GLfloat a) { SWEETEAGL_ENTER(ctx); glUniform1f(l, a); }
 static void s_Uniform4f(CTX, GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) { SWEETEAGL_ENTER(ctx); glUniform4f(l, a, b, c, d); }
 static void s_Uniform1i(CTX, GLint l, GLint a) { SWEETEAGL_ENTER(ctx); glUniform1i(l, a); }
