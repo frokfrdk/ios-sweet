@@ -153,6 +153,32 @@ static unsigned trace_left;
 static uint64_t gl_since;       /* G7p: when the holder took gl_lock */
 static unsigned gl_depth;       /* G8c: SWEETEAGL_ENTER scopes open on the holder's thread */
 static const char *gl_fn;       /* G8c: the outermost one's function */
+#define RECENT_CALLS            40u
+static const char *recent[RECENT_CALLS];        /* G8g: the last outermost calls, under gl_lock */
+static unsigned recent_n;
+
+/* G8g: log the last RECENT_CALLS slots and methods CA called, oldest first (GL lock held) */
+void
+sweeteagl_recent_calls(const char *why)
+{
+	unsigned n = recent_n < RECENT_CALLS ? recent_n : RECENT_CALLS;
+	char line[240];
+	size_t o = 0;
+	unsigned part = 0;
+	for (unsigned i = 0; i < n; i++) {
+		const char *f = recent[(recent_n - n + i) % RECENT_CALLS];
+		f = f != NULL && f[0] == 's' && f[1] == '_' ? f + 2 : f;    /* s_UseProgram -> UseProgram */
+		int w = snprintf(line + o, sizeof(line) - o, "%s%s", o ? " " : "", f ? f : "?");
+		if (w < 0 || o + (size_t)w >= sizeof(line) - 1) {
+			line[o] = '\0';         /* drop the cut-off name; it starts the next part */
+			sweetdrm_say("7.7 recent %s %u: %s", why, part++, line);
+			o = 0;
+			w = snprintf(line, sizeof(line), "%s", f ? f : "?");
+		}
+		o += w > 0 ? (size_t)w : 0;
+	}
+	sweetdrm_say("7.7 recent %s %u: %s (G8g)", why, part, o ? line : "(none)");
+}
 
 int
 sweeteagl_enter(void *p, const char *fn)
@@ -173,6 +199,7 @@ sweeteagl_enter(void *p, const char *fn)
 	gl_since = sweetdrm_now_ns();
 	if (gl_depth++ == 0) {
 		gl_fn = fn;
+		recent[recent_n++ % RECENT_CALLS] = fn;
 	}
 	sweeteagl_ensure_current(p);
 	if (trace_left > 0) {

@@ -103,6 +103,9 @@ void sweeteagl_after_flush(void);
  */
 void sweeteagl_blame_error(const char *fn);
 
+/* G8g (sweeteagl.m), GL lock held: log the last outermost slots and methods called, oldest first */
+void sweeteagl_recent_calls(const char *why);
+
 void sweeteagl_stripe_check(unsigned tex);
 void sweeteagl_stripe_forget(int n, const unsigned *tex);
 /*

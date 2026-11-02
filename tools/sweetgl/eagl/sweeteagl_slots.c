@@ -433,6 +433,8 @@ tc_unit(GLuint prog, GLint loc, char *out, size_t n, GLint *tex_out)
  * on this slot context and this Mesa context. The draw's state follows (G8e).
  */
 #define NOPROG_LOG_MAX          300u
+#define NOPROG_TRACE_FULL       6u      /* G8g: full-screen no-program draws whose recent calls are logged */
+#define NOPROG_TRACE_SMALL      40u     /* and smaller ones (the blur passes) */
 
 static void
 noprog_draw(void *ctx, GLint fb)
@@ -454,6 +456,12 @@ noprog_draw(void *ctx, GLint fb)
 	    "not a program here", linked, use_ctx == ctx ? "this" : "another", use_gl == sweetgl_get_current() ? "this" :
 	    "another");
 	tc_said = true;
+	/* G8f found CA itself passed 0 to its last glUseProgram: G8g says what it called since */
+	static unsigned traced_small, traced_full;
+	bool full = vp[2] == 828 && vp[3] == 1792;
+	if (full ? traced_full++ < NOPROG_TRACE_FULL : traced_small++ < NOPROG_TRACE_SMALL) {
+		sweeteagl_recent_calls("noprog");
+	}
 }
 
 static void
