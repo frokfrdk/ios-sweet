@@ -870,6 +870,212 @@ fb_before_draw(void)
 	}
 }
 
+/*
+ * G9a: G8i found the draws with no program are CA asking its GL renderer for
+ * shaders it has no GL source for (ids 61 and 66, and 28/38/45 in the
+ * filter range), so they drew nothing. Such a draw now runs our fallback
+ * program instead: texture unit 0 times the vertex colour when the shader CA
+ * wanted samples a 2D texture, the vertex colour when it samples none. The
+ * shader key is the last one shader_note saw at the builder's failing site.
+ * Ids 26-45 are filter shaders written for rectangle textures, whose
+ * texcoords are in texels. Positions go through the last pixel-to-clip
+ * matrix CA uploaded while that framebuffer was bound (its matrices are
+ * ortho with a per-target offset), or one made from the viewport.
+ * SWEETEAGL_FALLBACK=0 turns it off.
+ */
+#define FALLBACK_FBS            32u
+#define FALLBACK_CTXS           4u
+#define FALLBACK_LOG_MAX        80u
+
+static int want_valid;                  /* set by shader_note: the shader key at the builder's failing site */
+static unsigned want_id, want_target;
+
+static struct {
+	GLint fb;
+	GLfloat m[16];
+} fallback_mat[FALLBACK_FBS];
+static unsigned fallback_mats;
+
+static struct {
+	struct sweetgl_context *gl;
+	GLuint prog;
+	GLint mvp, tex, textured, rect, usecol;
+} fallback_prog[FALLBACK_CTXS];
+
+static const char fallback_vs[] =
+    "#version 300 es\n"
+    "layout(location = 0) in highp vec4 pos;\n"
+    "layout(location = 1) in mediump vec4 col;\n"
+    "layout(location = 2) in highp vec2 tc;\n"
+    "uniform highp mat4 mvp;\n"
+    "out mediump vec4 vcol;\n"
+    "out highp vec2 vtc;\n"
+    "void main() { gl_Position = mvp * pos; vcol = col; vtc = tc; }\n";
+static const char fallback_fs[] =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform lowp sampler2D tex;\n"
+    "uniform int textured, rect, usecol;\n"
+    "in mediump vec4 vcol;\n"
+    "in highp vec2 vtc;\n"
+    "out vec4 o;\n"
+    "void main() {\n"
+    "  vec4 c = usecol != 0 ? vcol : vec4(1.0);\n"
+    "  highp vec2 uv = rect != 0 ? vtc / vec2(textureSize(tex, 0)) : vtc;\n"
+    "  o = textured != 0 ? texture(tex, uv) * c : c;\n"
+    "}\n";
+
+static int
+fallback_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("SWEETEAGL_FALLBACK");
+		on = !(v && v[0] == '0');
+		sweetdrm_say("7.7 fallback: draws CA's GL renderer has no shader for use ours: %s",
+		    on ? "on" : "off (SWEETEAGL_FALLBACK=0)");
+	}
+	return on;
+}
+
+/* from s_UniformMatrix4fv: remember a pixel-to-clip matrix per framebuffer */
+static void
+fallback_note_matrix(GLsizei n, GLboolean t, const GLfloat *v)
+{
+	if (n < 1 || t || v == NULL || v[0] == 0.0f || v[5] == 0.0f || v[1] != 0.0f || v[4] != 0.0f || v[15] != 1.0f) {
+		return;
+	}
+	GLint fb = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+	unsigned i = 0;
+	while (i < fallback_mats && fallback_mat[i].fb != fb) {
+		i++;
+	}
+	if (i == fallback_mats) {
+		i = fallback_mats < FALLBACK_FBS ? fallback_mats++ : (unsigned)fb % FALLBACK_FBS;
+	}
+	fallback_mat[i].fb = fb;
+	memcpy(fallback_mat[i].m, v, sizeof(fallback_mat[i].m));
+}
+
+static GLuint
+fallback_shader(GLenum type, const char *src)
+{
+	GLuint s = glCreateShader(type);
+	glShaderSource(s, 1, &src, NULL);
+	glCompileShader(s);
+	GLint ok = 0;
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[INFO_LOG_CHARS] = "";
+		glGetShaderInfoLog(s, sizeof(log), NULL, log);
+		sweetdrm_say("7.7 fallback: shader 0x%x does not compile: %s (G9a)", type, log);
+	}
+	return s;
+}
+
+/* our program on the current Mesa context, made on first use; NULL if it does not build */
+static const void *
+fallback_program(void)
+{
+	struct sweetgl_context *gl = sweetgl_get_current();
+	unsigned i = 0;
+	while (i < FALLBACK_CTXS && fallback_prog[i].gl != NULL && fallback_prog[i].gl != gl) {
+		i++;
+	}
+	if (i == FALLBACK_CTXS) {
+		return NULL;
+	}
+	if (fallback_prog[i].gl == gl) {
+		return fallback_prog[i].prog ? &fallback_prog[i] : NULL;
+	}
+	fallback_prog[i].gl = gl;
+	GLuint vs = fallback_shader(GL_VERTEX_SHADER, fallback_vs), fs = fallback_shader(GL_FRAGMENT_SHADER, fallback_fs);
+	GLuint p = glCreateProgram();
+	glAttachShader(p, vs);
+	glAttachShader(p, fs);
+	glLinkProgram(p);
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+	GLint ok = 0;
+	glGetProgramiv(p, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char log[INFO_LOG_CHARS] = "";
+		glGetProgramInfoLog(p, sizeof(log), NULL, log);
+		sweetdrm_say("7.7 fallback: program does not link: %s (G9a)", log);
+		glDeleteProgram(p);
+		return NULL;
+	}
+	fallback_prog[i].prog = p;
+	fallback_prog[i].mvp = glGetUniformLocation(p, "mvp");
+	fallback_prog[i].tex = glGetUniformLocation(p, "tex");
+	fallback_prog[i].textured = glGetUniformLocation(p, "textured");
+	fallback_prog[i].rect = glGetUniformLocation(p, "rect");
+	fallback_prog[i].usecol = glGetUniformLocation(p, "usecol");
+	sweetdrm_say("7.7 fallback: program %u on Mesa context %p (G9a)", p, (void *)gl);
+	return &fallback_prog[i];
+}
+
+/* before a draw (GL lock held): if no program is bound, bind ours; returns whether it did */
+static bool
+fallback_begin(void)
+{
+	if (fb_prog != 0 || !want_valid || !fallback_on()) {
+		return false;
+	}
+	/* the queries and our calls below must not raise errors CA sees: hold a pending one */
+	GLenum pend = glGetError();
+	if (pend != GL_NO_ERROR && held_error == GL_NO_ERROR) {
+		held_error = pend;
+	}
+	const typeof(fallback_prog[0]) *fp = fallback_program();
+	if (fp == NULL) {
+		return false;
+	}
+	GLint fb = 0, vp[4] = { 0 }, colon = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+	glGetIntegerv(GL_VIEWPORT, vp);
+	glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &colon);
+	GLfloat vm[16] = { 0 };
+	const GLfloat *m = NULL;
+	for (unsigned i = 0; i < fallback_mats && m == NULL; i++) {
+		m = fallback_mat[i].fb == fb ? fallback_mat[i].m : NULL;
+	}
+	if (m == NULL && vp[2] > 0 && vp[3] > 0) {
+		vm[0] = 2.0f / (GLfloat)vp[2];
+		vm[5] = 2.0f / (GLfloat)vp[3];
+		vm[12] = -1.0f - 2.0f * (GLfloat)vp[0] / (GLfloat)vp[2];
+		vm[13] = -1.0f - 2.0f * (GLfloat)vp[1] / (GLfloat)vp[3];
+		vm[15] = 1.0f;
+	}
+	bool textured = want_target == GL_TEXTURE_2D, rect = want_id >= 26u && want_id <= 45u;
+	glUseProgram(fp->prog);
+	glUniformMatrix4fv(fp->mvp, 1, GL_FALSE, m ? m : vm);
+	glUniform1i(fp->tex, 0);
+	glUniform1i(fp->textured, textured);
+	glUniform1i(fp->rect, rect);
+	glUniform1i(fp->usecol, colon != 0);
+	GLenum err = glGetError();
+	static unsigned logged, total;
+	total++;
+	if (logged < FALLBACK_LOG_MAX || (total & (total - 1)) == 0 || err != GL_NO_ERROR) {
+		logged++;
+		sweetdrm_say("7.7 fallback %u: fb %d viewport %dx%d shader id %u target 0x%x: %s%s, %s colour, %s matrix%s "
+		    "(G9a)", total, fb, vp[2], vp[3], want_id, want_target, textured ? "texture" : "colour only",
+		    rect ? " in texels" : "", colon ? "vertex" : "white", m ? "CA's" : "viewport",
+		    err != GL_NO_ERROR ? ", GL ERROR" : "");
+	}
+	return true;
+}
+
+static void
+fallback_end(bool bound)
+{
+	if (bound) {
+		glUseProgram(0);        /* CA's view: no program */
+	}
+}
+
 static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 {
 	SWEETEAGL_ENTER(ctx);
@@ -879,9 +1085,11 @@ static void s_DrawArrays(CTX, GLenum m, GLint f, GLsizei n)
 	texcheck_draw(ctx);
 	drawstate(m, f, n, 0, NULL);
 	fb_before_draw();
+	bool fall = fallback_begin();
 	void *probe = sweeteagl_probe_begin(m, f, n, 0, NULL);
 	glDrawArrays(m, f, n);
 	sweeteagl_probe_end(probe);
+	fallback_end(fall);
 }
 static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 {
@@ -892,9 +1100,11 @@ static void s_DrawElements(CTX, GLenum m, GLsizei n, GLenum t, const void *i)
 	texcheck_draw(ctx);
 	drawstate(m, 0, n, t, i);
 	fb_before_draw();
+	bool fall = fallback_begin();
 	void *probe = sweeteagl_probe_begin(m, 0, n, t, i);
 	glDrawElements(m, n, t, i);
 	sweeteagl_probe_end(probe);
+	fallback_end(fall);
 }
 static void s_Enable(CTX, GLenum c)
 {
@@ -1127,13 +1337,20 @@ shader_note(const void *ra)
 	static uint32_t seen[SHADER_KEYS];
 	const unsigned char *sh = (const unsigned char *)sweeteagl_use_x21;
 	Dl_info di;
-	if (keys >= SHADER_KEYS || ra == NULL || sh == NULL || !dladdr(ra, &di) || di.dli_fname == NULL ||
+	if (ra == NULL || sh == NULL || !dladdr(ra, &di) || di.dli_fname == NULL ||
 	    strstr(di.dli_fname, "/QuartzCore") == NULL ||
 	    (uintptr_t)ra - (uintptr_t)di.dli_fbase != CREATE_SHADER_USE0) {
 		return;
 	}
 	uint16_t target;
 	memcpy(&target, sh + 8, sizeof(target));
+	/* G9a: the fallback draws by the last key; the builder skips this site while no program is bound, so it may be stale */
+	want_valid = 1;
+	want_id = sh[0];
+	want_target = target;
+	if (keys >= SHADER_KEYS) {
+		return;
+	}
 	uint32_t key = (uint32_t)sh[0] | (uint32_t)target << 8 | (uint32_t)sh[0x5e] << 24;
 	for (unsigned i = 0; i < keys; i++) {
 		if (seen[i] == key) {
@@ -1205,7 +1422,12 @@ static void s_Uniform1i(CTX, GLint l, GLint a) { SWEETEAGL_ENTER(ctx); glUniform
 static void s_Uniform3fv(CTX, GLint l, GLsizei n, const GLfloat *v) { SWEETEAGL_ENTER(ctx); glUniform3fv(l, n, v); }
 static void s_Uniform4fv(CTX, GLint l, GLsizei n, const GLfloat *v) { SWEETEAGL_ENTER(ctx); glUniform4fv(l, n, v); }
 static void s_UniformMatrix3fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { SWEETEAGL_ENTER(ctx); glUniformMatrix3fv(l, n, t, v); }
-static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { SWEETEAGL_ENTER(ctx); glUniformMatrix4fv(l, n, t, v); }
+static void s_UniformMatrix4fv(CTX, GLint l, GLsizei n, GLboolean t, const GLfloat *v)
+{
+	SWEETEAGL_ENTER(ctx);
+	glUniformMatrix4fv(l, n, t, v);
+	fallback_note_matrix(n, t, v);
+}
 static GLint s_GetUniformLocation(CTX, GLuint p, const GLchar *n) { SWEETEAGL_ENTER(ctx); return glGetUniformLocation(p, n); }
 static void s_BindAttribLocation(CTX, GLuint p, GLuint i, const GLchar *n) { SWEETEAGL_ENTER(ctx); glBindAttribLocation(p, i, n); }
 static void s_BindFramebuffer(CTX, GLenum t, GLuint f)
