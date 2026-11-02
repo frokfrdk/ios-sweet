@@ -6,6 +6,7 @@
  * the ones docs/EAGL_NOTES.md lists as used by CA::OGL; every other slot gets
  * a stub that logs its number once.
  */
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -934,7 +935,16 @@ static GLenum s_GetError(CTX)
 	return e;
 }
 static void s_GetIntegerv(CTX, GLenum p, GLint *v) { SWEETEAGL_ENTER(ctx); glGetIntegerv(p, v); }
-static const GLubyte *s_GetString(CTX, GLenum n) { SWEETEAGL_ENTER(ctx); return glGetString(n); }
+static const GLubyte *s_GetString(CTX, GLenum n)
+{
+	SWEETEAGL_ENTER(ctx);
+	const GLubyte *s = glGetString(n);
+	static unsigned said;
+	if (s == NULL && said++ < 4) {
+		sweetdrm_say("7.7 eagl: glGetString(0x%04x) returned NULL (G8h)", n);      /* the 0x0500 G8c blamed */
+	}
+	return s;
+}
 static void s_PixelStorei(CTX, GLenum p, GLint v)
 {
 	SWEETEAGL_ENTER(ctx);
@@ -1073,10 +1083,63 @@ static void s_LinkProgram(CTX, GLuint p)
 		sweetdrm_say("7.7 eagl: program %u does not link: %s", p, log);
 	}
 }
+/* G8h: an address as image+offset (nearest symbol+offset), for matching against the local binaries */
+static void
+say_frame(char *out, size_t n, const void *pc)
+{
+	Dl_info di;
+	if (pc != NULL && dladdr(pc, &di) && di.dli_fname != NULL) {
+		const char *img = strrchr(di.dli_fname, '/');
+		snprintf(out, n, "%s+0x%lx (%s+0x%lx)", img ? img + 1 : di.dli_fname,
+		    (unsigned long)((const char *)pc - (const char *)di.dli_fbase), di.dli_sname ? di.dli_sname : "?",
+		    di.dli_saddr ? (unsigned long)((const char *)pc - (const char *)di.dli_saddr) : 0ul);
+	} else {
+		snprintf(out, n, "%p", pc);
+	}
+}
+
+/*
+ * G8g showed every no-program draw follows CA's glUseProgram(0) with no
+ * program creation in between, from the very first draw. G8h logs the first
+ * USE0_SITES distinct call chains (3 frames, by frame pointer) of those calls.
+ */
+#define USE0_SITES      12u
+#define USE0_FRAMES     3u
+static const void *use0_site[USE0_SITES][USE0_FRAMES];
+static unsigned use0_sites, use0_calls;
+
+static void
+use0_note(void **fp)            /* s_UseProgram's frame record: { caller's record, return address } */
+{
+	const void *pc[USE0_FRAMES] = { NULL };
+	for (unsigned i = 0; i < USE0_FRAMES && fp != NULL; i++) {
+		pc[i] = __builtin_extract_return_addr(fp[1]);
+		fp = fp[0];
+	}
+	use0_calls++;
+	for (unsigned i = 0; i < use0_sites; i++) {
+		if (memcmp(use0_site[i], pc, sizeof(pc)) == 0) {
+			return;
+		}
+	}
+	if (use0_sites >= USE0_SITES) {
+		return;
+	}
+	memcpy(use0_site[use0_sites], pc, sizeof(pc));
+	char f[USE0_FRAMES][160];
+	for (unsigned i = 0; i < USE0_FRAMES; i++) {
+		say_frame(f[i], sizeof(f[i]), pc[i]);
+	}
+	sweetdrm_say("7.7 useprog0 site %u (call %u): %s <- %s <- %s (G8h)", use0_sites++, use0_calls, f[0], f[1], f[2]);
+}
+
 static void s_UseProgram(CTX, GLuint p)
 {
 	SWEETEAGL_ENTER(ctx);
 	count(&sweeteagl_diag.programs, ctx);
+	if (p == 0) {
+		use0_note(__builtin_frame_address(0));
+	}
 	cur_prog = p;
 	use_ctx = ctx;
 	use_gl = sweetgl_get_current();
