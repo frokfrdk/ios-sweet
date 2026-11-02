@@ -1108,6 +1108,47 @@ say_frame(char *out, size_t n, const void *pc)
 static const void *use0_site[USE0_SITES][USE0_FRAMES];
 static unsigned use0_sites, use0_calls;
 
+/*
+ * G8h placed both sites in CA's GL shader builder: one binds 0 after a
+ * program is built, the other binds 0 first and is followed by no GL call,
+ * the path that returns no program when CA's GL renderer has no fragment
+ * source for the shader asked for. G8i logs that shader's key: the builder
+ * keeps its argument (CA's shader description) in x21, which slot 600's entry
+ * stub below stashes. The site offset is of the iOS 16 QuartzCore on the phone.
+ */
+#define CREATE_SHADER_USE0      0x22f134ul
+#define SHADER_KEYS             32u
+uint64_t sweeteagl_use_x21;
+
+static void
+shader_note(const void *ra)
+{
+	static unsigned keys;
+	static uint32_t seen[SHADER_KEYS];
+	const unsigned char *sh = (const unsigned char *)sweeteagl_use_x21;
+	Dl_info di;
+	if (keys >= SHADER_KEYS || ra == NULL || sh == NULL || !dladdr(ra, &di) || di.dli_fname == NULL ||
+	    strstr(di.dli_fname, "/QuartzCore") == NULL ||
+	    (uintptr_t)ra - (uintptr_t)di.dli_fbase != CREATE_SHADER_USE0) {
+		return;
+	}
+	uint16_t target;
+	memcpy(&target, sh + 8, sizeof(target));
+	uint32_t key = (uint32_t)sh[0] | (uint32_t)target << 8 | (uint32_t)sh[0x5e] << 24;
+	for (unsigned i = 0; i < keys; i++) {
+		if (seen[i] == key) {
+			return;
+		}
+	}
+	seen[keys++] = key;
+	char hex[2 * 0x30 + 1];
+	for (unsigned i = 0; i < 0x30; i++) {
+		snprintf(hex + 2 * i, 3, "%02x", sh[i]);
+	}
+	sweetdrm_say("7.7 shader key %u: id %u target 0x%04x byte5e %u; first 0x30 bytes %s (G8i)", keys - 1, sh[0],
+	    target, sh[0x5e], hex);
+}
+
 static void
 use0_note(void **fp)            /* s_UseProgram's frame record: { caller's record, return address } */
 {
@@ -1116,6 +1157,7 @@ use0_note(void **fp)            /* s_UseProgram's frame record: { caller's recor
 		pc[i] = __builtin_extract_return_addr(fp[1]);
 		fp = fp[0];
 	}
+	shader_note(pc[0]);
 	use0_calls++;
 	for (unsigned i = 0; i < use0_sites; i++) {
 		if (memcmp(use0_site[i], pc, sizeof(pc)) == 0) {
@@ -1131,6 +1173,18 @@ use0_note(void **fp)            /* s_UseProgram's frame record: { caller's recor
 		say_frame(f[i], sizeof(f[i]), pc[i]);
 	}
 	sweetdrm_say("7.7 useprog0 site %u (call %u): %s <- %s <- %s (G8h)", use0_sites++, use0_calls, f[0], f[1], f[2]);
+}
+
+static void s_UseProgram(CTX, GLuint p) __asm__("_sweeteagl_s_UseProgram") __attribute__((used));
+
+/* G8i: slot 600's entry: stash the caller's x21 (callee-saved, so still CA's here), then run s_UseProgram */
+__attribute__((naked)) static void
+s_UseProgram_entry(void)
+{
+	__asm__ volatile(
+	    "adrp x16, _sweeteagl_use_x21@PAGE\n\t"
+	    "str x21, [x16, _sweeteagl_use_x21@PAGEOFF]\n\t"
+	    "b _sweeteagl_s_UseProgram");
 }
 
 static void s_UseProgram(CTX, GLuint p)
@@ -1210,7 +1264,7 @@ static const struct {
 	{ 513, s_DisableVertexAttribArray },                            { 591, s_DeleteShaderOrProgram },
 	{ 594, s_CreateShader },        { 595, s_ShaderSource },        { 596, s_CompileShader },
 	{ 597, s_CreateProgram },       { 598, s_AttachShader },        { 599, s_LinkProgram },
-	{ 600, s_UseProgram },          { 602, s_Uniform1f },           { 605, s_Uniform4f },
+	{ 600, s_UseProgram_entry },        { 602, s_Uniform1f },           { 605, s_Uniform4f },
 	{ 606, s_Uniform1i },           { 612, s_Uniform3fv },          { 613, s_Uniform4fv },
 	{ 619, s_UniformMatrix3fv },    { 620, s_UniformMatrix4fv },    { 625, s_GetUniformLocation },
 	{ 630, s_BindAttribLocation },  { 672, s_BindFramebuffer },     { 673, s_DeleteFramebuffers },
