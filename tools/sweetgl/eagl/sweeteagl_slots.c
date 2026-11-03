@@ -7,6 +7,7 @@
  * a stub that logs its number once.
  */
 #include <dlfcn.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -436,6 +437,53 @@ tc_unit(GLuint prog, GLint loc, char *out, size_t n, GLint *tex_out)
 #define NOPROG_LOG_MAX          300u
 #define NOPROG_TRACE_FULL       6u      /* G8g: full-screen no-program draws whose recent calls are logged */
 #define NOPROG_TRACE_SMALL      40u     /* and smaller ones (the blur passes) */
+#define NOPROG_TEX_LOG          60u     /* G9b: no-program draws whose textures and target are logged */
+#define NOPROG_TEX_UNITS        4u
+
+/*
+ * G9b: G9a drew the no-program draws with a program of ours and the screen
+ * went white: 83 of its 84 draws were full-screen quads on the display
+ * framebuffers with blend off, after a normal small draw. To learn what CA
+ * wanted from them, log for the first NOPROG_TEX_LOG the 2D textures bound on
+ * units 0-3 (size and format) and what the draw framebuffer renders into;
+ * drawstate now also decodes half-float attributes (CA's vertex colour).
+ */
+static void
+noprog_textures(GLint fb)
+{
+	GLenum pend = glGetError();
+	if (pend != GL_NO_ERROR && held_error == GL_NO_ERROR) {
+		held_error = pend;
+	}
+	GLint act = 0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+	char line[NOPROG_TEX_UNITS * 64] = "";
+	int o = 0;
+	for (GLuint u = 0; u < NOPROG_TEX_UNITS; u++) {
+		GLint t = 0, w = 0, h = 0, f = 0;
+		glActiveTexture(GL_TEXTURE0 + u);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+		if (t != 0) {
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
+		}
+		o += snprintf(line + o, sizeof(line) - (size_t)o, " u%u tex %d %dx%d fmt 0x%x;", u, t, w, h, f);
+	}
+	glActiveTexture((GLenum)act);
+	GLint type = 0, name = 0;
+	if (fb != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+		if (type != GL_NONE) {
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+		}
+	}
+	GLenum err = glGetError();      /* ours: CA must not see it */
+	sweetdrm_say("7.7 noprog fb %d textures:%s target attachment type 0x%x name %d; query error 0x%x (G9b)", fb, line,
+	    type, name, err);
+}
 
 static void
 noprog_draw(void *ctx, GLint fb)
@@ -457,6 +505,9 @@ noprog_draw(void *ctx, GLint fb)
 	    "not a program here", linked, use_ctx == ctx ? "this" : "another", use_gl == sweetgl_get_current() ? "this" :
 	    "another");
 	tc_said = true;
+	if (logged <= NOPROG_TEX_LOG) {
+		noprog_textures(fb);
+	}
 	/* G8f found CA itself passed 0 to its last glUseProgram: G8g says what it called since */
 	static unsigned traced_small, traced_full;
 	bool full = vp[2] == 828 && vp[3] == 1792;
@@ -568,6 +619,15 @@ ds_unmap(GLenum target, GLint old)
 {
 	glUnmapBuffer(target);
 	glBindBuffer(target, (GLuint)old);
+}
+
+/* G9b: IEEE half to float, for CA's half-float vertex colour */
+static float
+half_to_float(uint16_t h)
+{
+	unsigned e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+	float f = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 0x400u), (int)e - 25);
+	return h & 0x8000u ? -f : f;
 }
 
 static const char *
@@ -691,13 +751,15 @@ drawstate(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
 		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
 		glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
 		glGetVertexAttribPointerv(a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
-		if (type != GL_FLOAT || size < 1 || size > 4) {
+		bool half = type == GL_HALF_FLOAT;
+		if ((type != GL_FLOAT && !half) || size < 1 || size > 4) {
 			sweetdrm_say("7.7 drawstate fb %d   a%u size %d type 0x%x stride %d buf %d off %p: not float", fb, a, size,
 			    type, stride, buf, ptr);
 			continue;
 		}
-		size_t step = stride ? (size_t)stride : (size_t)size * 4;
-		size_t span = (size_t)(hi - lo) * step + (size_t)size * 4;
+		size_t esz = half ? 2 : 4;
+		size_t step = stride ? (size_t)stride : (size_t)size * esz;
+		size_t span = (size_t)(hi - lo) * step + (size_t)size * esz;
 		const uint8_t *base = (const uint8_t *)ptr + (size_t)lo * step;
 		if (buf != 0) {
 			base = ds_map(GL_ARRAY_BUFFER, GL_ARRAY_BUFFER_BINDING, buf, (intptr_t)base, span, &old);
@@ -708,18 +770,26 @@ drawstate(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
 		}
 		float mn[4] = { 0 }, mx[4] = { 0 };
 		for (GLint v = 0; v <= hi - lo; v++) {
-			const float *f = (const float *)(base + (size_t)v * step);
+			const uint8_t *p = base + (size_t)v * step;
 			for (GLint c = 0; c < size; c++) {
-				mn[c] = v == 0 || f[c] < mn[c] ? f[c] : mn[c];
-				mx[c] = v == 0 || f[c] > mx[c] ? f[c] : mx[c];
+				uint16_t h16;
+				float x;
+				if (half) {
+					memcpy(&h16, p + 2 * c, sizeof(h16));
+					x = half_to_float(h16);
+				} else {
+					memcpy(&x, p + 4 * c, sizeof(x));
+				}
+				mn[c] = v == 0 || x < mn[c] ? x : mn[c];
+				mx[c] = v == 0 || x > mx[c] ? x : mx[c];
 			}
 		}
 		if (buf != 0) {
 			ds_unmap(GL_ARRAY_BUFFER, old);
 		}
-		sweetdrm_say("7.7 drawstate fb %d   a%u size %d stride %d buf %d vertices %d..%d: %.3f..%.3f %.3f..%.3f "
-		    "%.3f..%.3f %.3f..%.3f", fb, a, size, stride, buf, lo, hi, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3],
-		    mx[3]);
+		sweetdrm_say("7.7 drawstate fb %d   a%u size %d%s stride %d buf %d vertices %d..%d: %.3f..%.3f %.3f..%.3f "
+		    "%.3f..%.3f %.3f..%.3f", fb, a, size, half ? " half" : "", stride, buf, lo, hi, mn[0], mx[0], mn[1], mx[1],
+		    mn[2], mx[2], mn[3], mx[3]);
 	}
 }
 
@@ -881,7 +951,8 @@ fb_before_draw(void)
  * texcoords are in texels. Positions go through the last pixel-to-clip
  * matrix CA uploaded while that framebuffer was bound (its matrices are
  * ortho with a per-target offset), or one made from the viewport.
- * SWEETEAGL_FALLBACK=0 turns it off.
+ * G9b: off unless SWEETEAGL_FALLBACK=1, since nearly all those draws are
+ * full-screen with blend off and covered the screen white.
  */
 #define FALLBACK_FBS            32u
 #define FALLBACK_CTXS           4u
@@ -931,9 +1002,9 @@ fallback_on(void)
 	static int on = -1;
 	if (on < 0) {
 		const char *v = getenv("SWEETEAGL_FALLBACK");
-		on = !(v && v[0] == '0');
+		on = v && v[0] == '1';  /* G9b: off by default, its draws covered the screen */
 		sweetdrm_say("7.7 fallback: draws CA's GL renderer has no shader for use ours: %s",
-		    on ? "on" : "off (SWEETEAGL_FALLBACK=0)");
+		    on ? "on (SWEETEAGL_FALLBACK=1)" : "off");
 	}
 	return on;
 }
